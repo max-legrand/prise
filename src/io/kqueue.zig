@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
-const root = @import("../loop.zig");
+const root = @import("../io.zig");
 
 pub const Loop = struct {
     allocator: std.mem.Allocator,

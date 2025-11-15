@@ -3,8 +3,8 @@ const builtin = @import("builtin");
 const posix = std.posix;
 
 const backend = switch (builtin.os.tag) {
-    .linux => @import("loop/io_uring.zig"),
-    .macos => @import("loop/kqueue.zig"),
+    .linux => @import("io/io_uring.zig"),
+    .macos => @import("io/kqueue.zig"),
     else => @compileError("unsupported platform"),
 };
 

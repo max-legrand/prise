@@ -1,5 +1,5 @@
 const std = @import("std");
-const loop = @import("loop.zig");
+const io = @import("io.zig");
 const server = @import("server.zig");
 const posix = std.posix;
 
@@ -56,15 +56,15 @@ pub fn main() !void {
 
     std.debug.print("Connecting to server at {s}\n", .{socket_path});
 
-    var rt = try loop.Loop.init(allocator);
-    defer rt.deinit();
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
 
     const App = struct {
         connected: bool = false,
         connection_refused: bool = false,
         fd: posix.fd_t = undefined,
 
-        fn onConnected(_: *loop.Loop, completion: loop.Completion) anyerror!void {
+        fn onConnected(_: *io.Loop, completion: io.Completion) anyerror!void {
             const app = completion.userdataCast(@This());
 
             switch (completion.result) {
@@ -88,12 +88,12 @@ pub fn main() !void {
     var app: App = .{};
 
     _ = try connectUnixSocket(
-        &rt,
+        &loop,
         socket_path,
         .{ .ptr = &app, .cb = App.onConnected },
     );
 
-    try rt.run(.until_done);
+    try loop.run(.until_done);
 
     if (app.connection_refused) {
         // Stale socket - remove it and fork server
@@ -135,14 +135,14 @@ pub fn main() !void {
             }
 
             // Retry connection
-            rt = try loop.Loop.init(allocator);
+            loop = try io.Loop.init(allocator);
             app = .{};
             _ = try connectUnixSocket(
-                &rt,
+                &loop,
                 socket_path,
                 .{ .ptr = &app, .cb = App.onConnected },
             );
-            try rt.run(.until_done);
+            try loop.run(.until_done);
         }
     }
 
@@ -155,7 +155,7 @@ pub fn main() !void {
 const UnixSocketClient = struct {
     allocator: std.mem.Allocator,
     fd: ?posix.fd_t = null,
-    ctx: loop.Context,
+    ctx: io.Context,
     addr: posix.sockaddr.un,
 
     const Msg = enum {
@@ -163,7 +163,7 @@ const UnixSocketClient = struct {
         connect,
     };
 
-    fn handleMsg(rt: *loop.Loop, completion: loop.Completion) anyerror!void {
+    fn handleMsg(loop: *io.Loop, completion: io.Completion) anyerror!void {
         const self = completion.userdataCast(UnixSocketClient);
 
         switch (completion.msgToEnum(Msg)) {
@@ -171,7 +171,7 @@ const UnixSocketClient = struct {
                 switch (completion.result) {
                     .socket => |fd| {
                         self.fd = fd;
-                        _ = try rt.connect(
+                        _ = try loop.connect(
                             fd,
                             @ptrCast(&self.addr),
                             @sizeOf(posix.sockaddr.un),
@@ -184,7 +184,7 @@ const UnixSocketClient = struct {
                     },
                     .err => |err| {
                         defer self.allocator.destroy(self);
-                        try self.ctx.cb(rt, .{
+                        try self.ctx.cb(loop, .{
                             .userdata = self.ctx.ptr,
                             .msg = self.ctx.msg,
                             .callback = self.ctx.cb,
@@ -200,7 +200,7 @@ const UnixSocketClient = struct {
 
                 switch (completion.result) {
                     .connect => {
-                        try self.ctx.cb(rt, .{
+                        try self.ctx.cb(loop, .{
                             .userdata = self.ctx.ptr,
                             .msg = self.ctx.msg,
                             .callback = self.ctx.cb,
@@ -208,17 +208,17 @@ const UnixSocketClient = struct {
                         });
                     },
                     .err => |err| {
-                        try self.ctx.cb(rt, .{
+                        try self.ctx.cb(loop, .{
                             .userdata = self.ctx.ptr,
                             .msg = self.ctx.msg,
                             .callback = self.ctx.cb,
                             .result = .{ .err = err },
                         });
                         if (self.fd) |fd| {
-                            _ = try rt.close(fd, .{
+                            _ = try loop.close(fd, .{
                                 .ptr = null,
                                 .cb = struct {
-                                    fn noop(_: *loop.Loop, _: loop.Completion) anyerror!void {}
+                                    fn noop(_: *io.Loop, _: io.Completion) anyerror!void {}
                                 }.noop,
                             });
                         }
@@ -231,12 +231,12 @@ const UnixSocketClient = struct {
 };
 
 fn connectUnixSocket(
-    rt: *loop.Loop,
+    loop: *io.Loop,
     socket_path: []const u8,
-    ctx: loop.Context,
+    ctx: io.Context,
 ) !*UnixSocketClient {
-    const client = try rt.allocator.create(UnixSocketClient);
-    errdefer rt.allocator.destroy(client);
+    const client = try loop.allocator.create(UnixSocketClient);
+    errdefer loop.allocator.destroy(client);
 
     var addr: posix.sockaddr.un = undefined;
     addr.family = posix.AF.UNIX;
@@ -244,13 +244,13 @@ fn connectUnixSocket(
     addr.path[socket_path.len] = 0;
 
     client.* = .{
-        .allocator = rt.allocator,
+        .allocator = loop.allocator,
         .ctx = ctx,
         .addr = addr,
         .fd = null,
     };
 
-    _ = try rt.socket(
+    _ = try loop.socket(
         posix.AF.UNIX,
         posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
         0,

@@ -1,5 +1,5 @@
 const std = @import("std");
-const loop = @import("loop.zig");
+const io = @import("io.zig");
 const posix = std.posix;
 
 const Client = struct {
@@ -7,7 +7,7 @@ const Client = struct {
     server: *Server,
     recv_buffer: [4096]u8 = undefined,
 
-    fn onRecv(rt: *loop.Loop, completion: loop.Completion) anyerror!void {
+    fn onRecv(loop: *io.Loop, completion: io.Completion) anyerror!void {
         const client = completion.userdataCast(Client);
 
         switch (completion.result) {
@@ -17,7 +17,7 @@ const Client = struct {
                     client.server.removeClient(client);
                 } else {
                     // Got data, ignore for now and keep receiving
-                    _ = try rt.recv(client.fd, &client.recv_buffer, .{
+                    _ = try loop.recv(client.fd, &client.recv_buffer, .{
                         .ptr = client,
                         .cb = onRecv,
                     });
@@ -34,13 +34,13 @@ const Client = struct {
 
 const Server = struct {
     allocator: std.mem.Allocator,
-    rt: *loop.Loop,
+    loop: *io.Loop,
     listen_fd: posix.fd_t,
     socket_path: []const u8,
     clients: std.ArrayList(*Client),
     pty_count: usize = 0,
     accepting: bool = true,
-    accept_task: ?loop.Task = null,
+    accept_task: ?io.Task = null,
 
     fn shouldExit(self: *Server) bool {
         return self.clients.items.len == 0 and self.pty_count == 0;
@@ -50,13 +50,13 @@ const Server = struct {
         if (self.shouldExit() and self.accepting) {
             self.accepting = false;
             if (self.accept_task) |*task| {
-                try task.cancel(self.rt);
+                try task.cancel(self.loop);
                 self.accept_task = null;
             }
         }
     }
 
-    fn onAccept(rt: *loop.Loop, completion: loop.Completion) anyerror!void {
+    fn onAccept(loop: *io.Loop, completion: io.Completion) anyerror!void {
         const self = completion.userdataCast(Server);
 
         switch (completion.result) {
@@ -69,14 +69,14 @@ const Server = struct {
                 try self.clients.append(self.allocator, client);
 
                 // Start recv to detect disconnect
-                _ = try rt.recv(client_fd, &client.recv_buffer, .{
+                _ = try loop.recv(client_fd, &client.recv_buffer, .{
                     .ptr = client,
                     .cb = Client.onRecv,
                 });
 
                 // Queue next accept if still accepting
                 if (self.accepting) {
-                    self.accept_task = try rt.accept(self.listen_fd, .{
+                    self.accept_task = try loop.accept(self.listen_fd, .{
                         .ptr = self,
                         .cb = onAccept,
                     });
@@ -103,8 +103,8 @@ const Server = struct {
 };
 
 pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void {
-    var rt = try loop.Loop.init(allocator);
-    defer rt.deinit();
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
 
     // Create socket
     const listen_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
@@ -123,7 +123,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
 
     var server: Server = .{
         .allocator = allocator,
-        .rt = &rt,
+        .loop = &loop,
         .listen_fd = listen_fd,
         .socket_path = socket_path,
         .clients = std.ArrayList(*Client).empty,
@@ -137,13 +137,13 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
     }
 
     // Start accepting connections
-    server.accept_task = try rt.accept(listen_fd, .{
+    server.accept_task = try loop.accept(listen_fd, .{
         .ptr = &server,
         .cb = Server.onAccept,
     });
 
     // Run until server decides to exit
-    try rt.run(.until_done);
+    try loop.run(.until_done);
 
     // Cleanup
     posix.close(listen_fd);
