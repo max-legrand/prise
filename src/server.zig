@@ -151,6 +151,72 @@ const Pty = struct {
     }
 };
 
+/// Convert ghostty style to Neovim HlAttrs format
+fn convertStyle(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal, style_id: u16) !@import("redraw.zig").UIEvent.HlAttrDefine.HlAttrs {
+    _ = allocator;
+    const redraw = @import("redraw.zig");
+
+    if (style_id == 0) {
+        // Default style - return empty attrs
+        return .{};
+    }
+
+    const screen = terminal.screens.active;
+    const page = &screen.cursor.page_pin.node.data;
+    const style = page.styles.get(page.memory, style_id);
+
+    var attrs: redraw.UIEvent.HlAttrDefine.HlAttrs = .{};
+
+    // Convert foreground color
+    switch (style.fg_color) {
+        .none => {},
+        .palette => |idx| {
+            // Send palette index directly
+            attrs.foreground = idx;
+        },
+        .rgb => |rgb| {
+            attrs.foreground = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+        },
+    }
+
+    // Convert background color
+    switch (style.bg_color) {
+        .none => {},
+        .palette => |idx| {
+            attrs.background = idx;
+        },
+        .rgb => |rgb| {
+            attrs.background = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+        },
+    }
+
+    // Convert underline color
+    switch (style.underline_color) {
+        .none => {},
+        .palette => |idx| {
+            _ = idx;
+        },
+        .rgb => |rgb| {
+            attrs.special = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
+        },
+    }
+
+    // Convert flags
+    attrs.bold = style.flags.bold;
+    attrs.italic = style.flags.italic;
+    attrs.reverse = style.flags.inverse;
+    attrs.strikethrough = style.flags.strikethrough;
+
+    // Handle underline variants
+    attrs.underline = switch (style.flags.underline) {
+        .none => false,
+        .single => true,
+        else => true, // double, curly, dotted, dashed all map to underline=true
+    };
+
+    return attrs;
+}
+
 /// Captured screen state for building redraw notifications
 const ScreenState = struct {
     rows: usize,
@@ -158,6 +224,7 @@ const ScreenState = struct {
     cursor_x: usize,
     cursor_y: usize,
     rows_data: []DirtyRow,
+    styles: std.AutoHashMap(u16, @import("redraw.zig").UIEvent.HlAttrDefine.HlAttrs),
     allocator: std.mem.Allocator,
 
     pub const RenderMode = enum { full, incremental };
@@ -182,6 +249,9 @@ const ScreenState = struct {
 
         const rows = page.size.rows;
         const cols = page.size.cols;
+
+        var styles = std.AutoHashMap(u16, @import("redraw.zig").UIEvent.HlAttrDefine.HlAttrs).init(allocator);
+        errdefer styles.deinit();
 
         var rows_data = std.ArrayList(DirtyRow).empty;
         errdefer {
@@ -312,17 +382,29 @@ const ScreenState = struct {
             ds.unsetAll();
         }
 
+        // Populate styles
+        for (rows_data.items) |row| {
+            for (row.cells) |cell| {
+                if (cell.style_id != 0 and !styles.contains(cell.style_id)) {
+                    const attrs = try convertStyle(allocator, terminal, cell.style_id);
+                    try styles.put(cell.style_id, attrs);
+                }
+            }
+        }
+
         return .{
             .rows = rows,
             .cols = cols,
             .cursor_x = screen.cursor.x,
             .cursor_y = screen.cursor.y,
             .rows_data = try rows_data.toOwnedSlice(allocator),
+            .styles = styles,
             .allocator = allocator,
         };
     }
 
     fn deinit(self: *ScreenState) void {
+        self.styles.deinit();
         for (self.rows_data) |row| {
             for (row.cells) |cell| {
                 self.allocator.free(cell.text);
@@ -918,72 +1000,6 @@ const Server = struct {
         self.checkExit() catch {};
     }
 
-    /// Convert ghostty style to Neovim HlAttrs format
-    fn convertStyle(allocator: std.mem.Allocator, terminal: *ghostty_vt.Terminal, style_id: u16) !@import("redraw.zig").UIEvent.HlAttrDefine.HlAttrs {
-        _ = allocator;
-        const redraw = @import("redraw.zig");
-
-        if (style_id == 0) {
-            // Default style - return empty attrs
-            return .{};
-        }
-
-        const screen = terminal.screens.active;
-        const page = &screen.cursor.page_pin.node.data;
-        const style = page.styles.get(page.memory, style_id);
-
-        var attrs: redraw.UIEvent.HlAttrDefine.HlAttrs = .{};
-
-        // Convert foreground color
-        switch (style.fg_color) {
-            .none => {},
-            .palette => |idx| {
-                // Send palette index directly
-                attrs.foreground = idx;
-            },
-            .rgb => |rgb| {
-                attrs.foreground = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
-            },
-        }
-
-        // Convert background color
-        switch (style.bg_color) {
-            .none => {},
-            .palette => |idx| {
-                attrs.background = idx;
-            },
-            .rgb => |rgb| {
-                attrs.background = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
-            },
-        }
-
-        // Convert underline color
-        switch (style.underline_color) {
-            .none => {},
-            .palette => |idx| {
-                _ = idx;
-            },
-            .rgb => |rgb| {
-                attrs.special = (@as(u32, rgb.r) << 16) | (@as(u32, rgb.g) << 8) | @as(u32, rgb.b);
-            },
-        }
-
-        // Convert flags
-        attrs.bold = style.flags.bold;
-        attrs.italic = style.flags.italic;
-        attrs.reverse = style.flags.inverse;
-        attrs.strikethrough = style.flags.strikethrough;
-
-        // Handle underline variants
-        attrs.underline = switch (style.flags.underline) {
-            .none => false,
-            .single => true,
-            else => true, // double, curly, dotted, dashed all map to underline=true
-        };
-
-        return attrs;
-    }
-
     /// Build and send redraw notification for a session to attached clients
     fn sendRedraw(self: *Server, loop: *io.Loop, pty_instance: *Pty, state: *ScreenState, target_client: ?*Client, mode: ScreenState.RenderMode) !void {
         const redraw = @import("redraw.zig");
@@ -1038,11 +1054,9 @@ const Server = struct {
 
             // Define new styles
             for (styles_to_define.items) |style_id| {
-                pty_instance.terminal_mutex.lock();
-                const attrs = try convertStyle(self.allocator, &pty_instance.terminal, style_id);
-                pty_instance.terminal_mutex.unlock();
-
-                try builder.hlAttrDefine(style_id, attrs, attrs);
+                if (state.styles.get(style_id)) |attrs| {
+                    try builder.hlAttrDefine(style_id, attrs, attrs);
+                }
             }
 
             // Build grid_line events for each dirty row
