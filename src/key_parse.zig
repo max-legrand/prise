@@ -1,5 +1,6 @@
 const std = @import("std");
 const ghostty = @import("ghostty-vt");
+const msgpack = @import("msgpack.zig");
 
 const KeyEvent = ghostty.input.KeyEvent;
 const Key = ghostty.input.Key;
@@ -16,120 +17,81 @@ const Mods = packed struct(u16) {
     _padding: u6 = 0,
 };
 
-// Static buffers for special characters
-const lt_char = "<";
-const gt_char = ">";
+/// Parse key from msgpack map to ghostty KeyEvent
+/// Expected format: { "key": "a", "shiftKey": false, "ctrlKey": false, "altKey": false, "metaKey": false }
+pub fn parseKeyMap(map: msgpack.Value) !KeyEvent {
+    if (map != .map) return error.InvalidKeyFormat;
 
-/// Parse key notation to ghostty KeyEvent
-/// Examples: "<C-a>", "x", "<CR>", "<S-Tab>"
-pub fn parseKeyNotation(notation: []const u8) !KeyEvent {
-    if (notation.len == 0) return error.EmptyKey;
+    var key_str: ?[]const u8 = null;
+    var mods: Mods = .{};
 
-    // Simple single character - notation is already valid UTF-8
-    if (notation.len == 1) {
-        return .{
-            .key = .unidentified,
-            .utf8 = notation, // Use the input string directly
-            .mods = .{},
-        };
+    for (map.map) |entry| {
+        if (entry.key != .string) continue;
+        const field = entry.key.string;
+
+        if (std.mem.eql(u8, field, "key")) {
+            if (entry.value == .string) {
+                key_str = entry.value.string;
+            }
+        } else if (std.mem.eql(u8, field, "shiftKey")) {
+            if (entry.value == .boolean) mods.shift = entry.value.boolean;
+        } else if (std.mem.eql(u8, field, "ctrlKey")) {
+            if (entry.value == .boolean) mods.ctrl = entry.value.boolean;
+        } else if (std.mem.eql(u8, field, "altKey")) {
+            if (entry.value == .boolean) mods.alt = entry.value.boolean;
+        } else if (std.mem.eql(u8, field, "metaKey")) {
+            if (entry.value == .boolean) mods.super = entry.value.boolean;
+        }
     }
 
-    // Check for angle bracket notation
-    if (notation[0] == '<' and notation[notation.len - 1] == '>') {
-        const inner = notation[1 .. notation.len - 1];
-        return parseAngleBracketKey(inner);
-    }
+    if (key_str == null) return error.MissingKey;
+    const key = key_str.?;
 
-    // Multi-byte UTF-8 character
+    // Map key string to ghostty Key enum
+    const key_enum = mapKeyString(key);
+
     return .{
-        .key = .unidentified,
-        .utf8 = notation,
-        .mods = .{},
+        .key = key_enum,
+        .utf8 = if (key_enum == .unidentified) key else "",
+        .mods = @bitCast(mods),
     };
 }
 
-fn parseAngleBracketKey(inner: []const u8) !KeyEvent {
-    var mods: Mods = .{};
-    var key_str = inner;
+fn mapKeyString(key: []const u8) Key {
+    // Single character -> unidentified (use utf8)
+    if (key.len == 1) return .unidentified;
 
-    // Parse modifiers
-    while (true) {
-        if (std.mem.startsWith(u8, key_str, "C-")) {
-            mods.ctrl = true;
-            key_str = key_str[2..];
-        } else if (std.mem.startsWith(u8, key_str, "A-") or std.mem.startsWith(u8, key_str, "M-")) {
-            mods.alt = true;
-            key_str = key_str[2..];
-        } else if (std.mem.startsWith(u8, key_str, "S-")) {
-            mods.shift = true;
-            key_str = key_str[2..];
-        } else {
-            break;
-        }
-    }
+    // Named keys
+    if (std.mem.eql(u8, key, "Enter")) return .enter;
+    if (std.mem.eql(u8, key, "Tab")) return .tab;
+    if (std.mem.eql(u8, key, "Backspace")) return .backspace;
+    if (std.mem.eql(u8, key, "Escape")) return .escape;
+    if (std.mem.eql(u8, key, " ")) return .space;
+    if (std.mem.eql(u8, key, "Delete")) return .delete;
+    if (std.mem.eql(u8, key, "Insert")) return .insert;
+    if (std.mem.eql(u8, key, "Home")) return .home;
+    if (std.mem.eql(u8, key, "End")) return .end;
+    if (std.mem.eql(u8, key, "PageUp")) return .page_up;
+    if (std.mem.eql(u8, key, "PageDown")) return .page_down;
+    if (std.mem.eql(u8, key, "ArrowUp")) return .arrow_up;
+    if (std.mem.eql(u8, key, "ArrowDown")) return .arrow_down;
+    if (std.mem.eql(u8, key, "ArrowLeft")) return .arrow_left;
+    if (std.mem.eql(u8, key, "ArrowRight")) return .arrow_right;
 
-    const m = @as(u16, @bitCast(mods));
+    // Function keys
+    if (std.mem.eql(u8, key, "F1")) return .f1;
+    if (std.mem.eql(u8, key, "F2")) return .f2;
+    if (std.mem.eql(u8, key, "F3")) return .f3;
+    if (std.mem.eql(u8, key, "F4")) return .f4;
+    if (std.mem.eql(u8, key, "F5")) return .f5;
+    if (std.mem.eql(u8, key, "F6")) return .f6;
+    if (std.mem.eql(u8, key, "F7")) return .f7;
+    if (std.mem.eql(u8, key, "F8")) return .f8;
+    if (std.mem.eql(u8, key, "F9")) return .f9;
+    if (std.mem.eql(u8, key, "F10")) return .f10;
+    if (std.mem.eql(u8, key, "F11")) return .f11;
+    if (std.mem.eql(u8, key, "F12")) return .f12;
 
-    // Parse the key itself
-    if (std.mem.eql(u8, key_str, "CR") or std.mem.eql(u8, key_str, "Return") or std.mem.eql(u8, key_str, "Enter")) {
-        return .{ .key = .enter, .mods = @bitCast(mods) };
-    } else if (std.mem.eql(u8, key_str, "Tab")) {
-        return .{ .key = .tab, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "BS") or std.mem.eql(u8, key_str, "Backspace")) {
-        return .{ .key = .backspace, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Esc") or std.mem.eql(u8, key_str, "Escape")) {
-        return .{ .key = .escape, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Space")) {
-        return .{ .key = .space, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "lt")) {
-        return .{ .key = .unidentified, .utf8 = lt_char, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "gt")) {
-        return .{ .key = .unidentified, .utf8 = gt_char, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Del") or std.mem.eql(u8, key_str, "Delete")) {
-        return .{ .key = .delete, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Insert")) {
-        return .{ .key = .insert, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Home")) {
-        return .{ .key = .home, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "End")) {
-        return .{ .key = .end, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "PageUp")) {
-        return .{ .key = .page_up, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "PageDown")) {
-        return .{ .key = .page_down, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Up")) {
-        return .{ .key = .arrow_up, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Down")) {
-        return .{ .key = .arrow_down, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Left")) {
-        return .{ .key = .arrow_left, .mods = @bitCast(m) };
-    } else if (std.mem.eql(u8, key_str, "Right")) {
-        return .{ .key = .arrow_right, .mods = @bitCast(m) };
-    } else if (key_str.len >= 2 and key_str[0] == 'F') {
-        // Function keys F1-F12
-        const num = std.fmt.parseInt(u8, key_str[1..], 10) catch return error.InvalidKey;
-        if (num >= 1 and num <= 12) {
-            const key_enum: Key = switch (num) {
-                1 => .f1,
-                2 => .f2,
-                3 => .f3,
-                4 => .f4,
-                5 => .f5,
-                6 => .f6,
-                7 => .f7,
-                8 => .f8,
-                9 => .f9,
-                10 => .f10,
-                11 => .f11,
-                12 => .f12,
-                else => unreachable,
-            };
-            return .{ .key = key_enum, .mods = @bitCast(m) };
-        }
-    } else if (key_str.len == 1) {
-        // Single character with modifiers - key_str points to the original notation
-        return .{ .key = .unidentified, .utf8 = key_str, .mods = @bitCast(m) };
-    }
-
-    return error.InvalidKey;
+    // Multi-byte UTF-8 or unknown -> use utf8 field
+    return .unidentified;
 }

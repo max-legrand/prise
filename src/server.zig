@@ -594,24 +594,20 @@ const Client = struct {
                                 return;
                             },
                         };
-                        const notation = if (notif.params.array[1] == .string)
-                            notif.params.array[1].string
-                        else {
-                            std.log.warn("key_input notification: invalid notation type", .{});
-                            return;
-                        };
+                        const key_map = notif.params.array[1];
 
-                        std.log.debug("Received key_input: session={} notation='{s}'", .{ session_id, notation });
+                        std.log.debug("Received key_input: session={}", .{session_id});
 
                         if (self.server.ptys.get(session_id)) |pty_instance| {
-                            // Parse key notation to ghostty key
-                            const key = key_parse.parseKeyNotation(notation) catch |err| {
-                                std.log.err("Failed to parse key notation '{s}': {}", .{ notation, err });
+                            // Parse key map to ghostty key
+                            const key = key_parse.parseKeyMap(key_map) catch |err| {
+                                std.log.err("Failed to parse key map: {}", .{err});
                                 return;
                             };
 
-                            std.log.debug("Parsed key: key={} mods=(shift={} ctrl={} alt={})", .{
+                            std.log.debug("Parsed key: key={} utf8='{s}' mods=(shift={} ctrl={} alt={})", .{
                                 key.key,
+                                key.utf8,
                                 key.mods.shift,
                                 key.mods.ctrl,
                                 key.mods.alt,
