@@ -252,7 +252,6 @@ pub const ClientLogic = struct {
                 .integer => |i| @as(u16, @intCast(i)),
                 else => return .none,
             };
-            std.log.info("processPipeMessage: resize {}x{}", .{ rows, cols });
             return PipeAction{ .send_resize = .{ .rows = rows, .cols = cols } };
         } else if (std.mem.eql(u8, msg_type.string, "quit")) {
             state.should_quit = true;
@@ -305,7 +304,6 @@ pub const ClientLogic = struct {
                 return result;
             },
             .winsize => |ws| {
-                std.log.debug("resize", .{});
                 return try msgpack.encode(allocator, .{ "resize", ws.rows, ws.cols });
             },
             else => return null,
@@ -448,11 +446,8 @@ pub const App = struct {
         self.ui.deinit();
         self.state.should_quit = true;
 
-        std.log.debug("deinit: recv_task={} io_loop={}", .{ self.recv_task != null, self.io_loop != null });
-
         // Cancel pending recv task
         if (self.recv_task) |*task| {
-            std.log.debug("deinit: cancelling recv task id={}", .{task.id});
             if (self.io_loop) |loop| {
                 task.cancel(loop) catch |err| {
                     std.log.warn("Failed to cancel recv task: {}", .{err});
@@ -461,8 +456,6 @@ pub const App = struct {
                 std.log.warn("deinit: io_loop is null, cannot cancel recv task", .{});
             }
             self.recv_task = null;
-        } else {
-            std.log.debug("deinit: no recv_task to cancel", .{});
         }
 
         // Close the socket
@@ -908,7 +901,6 @@ pub const App = struct {
                     const result = rpc.decodeMessageWithSize(arena, app.msg_buffer.items) catch |err| {
                         if (err == error.UnexpectedEndOfInput) {
                             // Partial message, wait for more data
-                            std.log.debug("Partial message, waiting for more data ({} bytes buffered)", .{app.msg_buffer.items.len});
                             break;
                         }
                         return err;
@@ -931,7 +923,6 @@ pub const App = struct {
                             });
                         },
                         .redraw => |params| {
-                            std.log.debug("Handling redraw notification", .{});
                             app.handleRedraw(params) catch |err| {
                                 std.log.err("Failed to handle redraw: {}", .{err});
                             };

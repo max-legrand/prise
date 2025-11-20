@@ -60,11 +60,7 @@ pub fn resize(self: *Surface, rows: u16, cols: u16) !void {
 }
 
 pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
-    const start_time = std.time.nanoTimestamp();
-
     if (params != .array) return error.InvalidRedrawParams;
-
-    std.log.debug("applyRedraw: received params with {} events", .{params.array.len});
 
     var rows_updated = std.ArrayList(usize).empty;
     defer rows_updated.deinit(self.allocator);
@@ -99,7 +95,6 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
 
             // Only resize if dimensions actually changed
             if (rows != self.rows or cols != self.cols) {
-                std.log.debug("resize: resizing from {}x{} to {}x{}", .{ self.cols, self.rows, cols, rows });
                 try self.resize(rows, cols);
             }
         } else if (std.mem.eql(u8, event_name.string, "cursor_pos")) {
@@ -314,7 +309,6 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
         } else if (std.mem.eql(u8, event_name.string, "flush")) {
             // Flush marks the end of a frame - copy back to front now
 
-            std.log.debug("flush: copying back→front", .{});
             for (0..self.rows) |row| {
                 for (0..self.cols) |col| {
                     if (self.back.readCell(@intCast(col), @intCast(row))) |cell| {
@@ -329,24 +323,12 @@ pub fn applyRedraw(self: *Surface, params: msgpack.Value) !void {
             // Reset cursor visibility for the next frame. If we don't receive a cursor_pos
             // event in the next frame, we assume the cursor is hidden.
             self.back.cursor_vis = false;
-
-            // Debug: check what got copied to front at (0,0)
-            if (self.front.readCell(0, 0)) |cell| {
-                std.log.debug("flush: front(0,0) after copy = '{s}'", .{cell.char.grapheme});
-            }
         }
     }
-
-    const end_time = std.time.nanoTimestamp();
-    const deserialize_us = @divTrunc(end_time - start_time, std.time.ns_per_us);
-
-    std.log.info("applyRedraw: updated {} rows deserialize={}us", .{ rows_updated.items.len, deserialize_us });
 }
 
 pub fn render(self: *Surface, win: vaxis.Window) void {
     if (!self.dirty) return;
-
-    std.log.debug("render: copying front→vaxis window (win={}x{}, surface={}x{})", .{ win.width, win.height, self.cols, self.rows });
 
     var cells_written: usize = 0;
     // Copy front buffer to vaxis window
@@ -355,17 +337,11 @@ pub fn render(self: *Surface, win: vaxis.Window) void {
             if (col < win.width and row < win.height) {
                 const cell = self.front.readCell(@intCast(col), @intCast(row)) orelse continue;
 
-                // Debug: log what we write to (0,0)
-                if (row == 0 and col == 0) {
-                    std.log.debug("render: writing to (0,0): '{s}'", .{cell.char.grapheme});
-                }
-
                 win.writeCell(@intCast(col), @intCast(row), cell);
                 cells_written += 1;
             }
         }
     }
-    std.log.debug("render: wrote {} cells to vaxis window", .{cells_written});
 
     // Copy cursor state to window
     if (self.front.cursor_vis and

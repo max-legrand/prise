@@ -300,11 +300,8 @@ pub const Loop = struct {
 
     pub fn cancel(self: *Loop, id: usize) !void {
         const op = self.pending.get(id) orelse {
-            std.log.debug("cancel: id={} not found in pending", .{id});
             return;
         };
-
-        std.log.debug("cancel: id={} kind={} fd={}", .{ id, op.kind, op.fd });
 
         // Try to remove from kqueue by sending EV_DELETE
         // Note: may fail if event was ONESHOT and already fired
@@ -323,8 +320,7 @@ pub const Loop = struct {
         }};
 
         _ = posix.kevent(self.kq, &changes, &[_]posix.Kevent{}, null) catch {};
-        const removed = self.pending.remove(id);
-        std.log.debug("cancel: id={} removed={}", .{ id, removed });
+        _ = self.pending.remove(id);
     }
 
     pub fn cancelByFd(self: *Loop, fd: posix.socket_t) void {
@@ -351,13 +347,7 @@ pub const Loop = struct {
                 break;
             }
 
-            if (mode == .until_done and self.pending.count() > 0) {
-                std.log.debug("loop.run: {} pending tasks", .{self.pending.count()});
-                var it = self.pending.iterator();
-                while (it.next()) |entry| {
-                    std.log.debug("  - id={} kind={} fd={}", .{ entry.key_ptr.*, entry.value_ptr.kind, entry.value_ptr.fd });
-                }
-            }
+            if (mode == .until_done and self.pending.count() > 0) {}
 
             const wait_timeout: ?*const posix.timespec = if (mode == .once) &.{ .sec = 0, .nsec = 0 } else null;
             const n = posix.kevent(self.kq, &[_]posix.Kevent{}, events[0..], wait_timeout) catch |err| {
