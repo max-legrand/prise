@@ -10,9 +10,17 @@ pub const Event = union(enum) {
         id: u32,
         surface: *Surface,
         app: *anyopaque,
-        send_fn: *const fn (app: *anyopaque, data: []const u8) anyerror!void,
+        send_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     },
     init: void,
+};
+
+pub const KeyData = struct {
+    key: []const u8,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    super: bool,
 };
 
 pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
@@ -112,7 +120,7 @@ const PtyHandle = struct {
     id: u32,
     surface: *Surface,
     app: *anyopaque,
-    send_fn: *const fn (app: *anyopaque, data: []const u8) anyerror!void,
+    send_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
 };
 
 fn ptyIndex(lua: *ziglua.Lua) i32 {
@@ -123,6 +131,10 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
     }
     if (std.mem.eql(u8, key, "id")) {
         lua.pushFunction(ziglua.wrap(ptyId));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "send_key")) {
+        lua.pushFunction(ziglua.wrap(ptySendKey));
         return 1;
     }
     return 0;
@@ -139,6 +151,44 @@ fn ptyId(lua: *ziglua.Lua) i32 {
     const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
     lua.pushInteger(@intCast(pty.id));
     return 1;
+}
+
+fn ptySendKey(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    lua.checkType(2, .table);
+
+    _ = lua.getField(2, "key");
+    const key_str = lua.toString(-1) catch "";
+    lua.pop(1);
+
+    _ = lua.getField(2, "ctrl");
+    const ctrl = lua.toBoolean(-1);
+    lua.pop(1);
+
+    _ = lua.getField(2, "alt");
+    const alt = lua.toBoolean(-1);
+    lua.pop(1);
+
+    _ = lua.getField(2, "shift");
+    const shift = lua.toBoolean(-1);
+    lua.pop(1);
+
+    _ = lua.getField(2, "super");
+    const super = lua.toBoolean(-1);
+    lua.pop(1);
+
+    const key = KeyData{
+        .key = key_str,
+        .ctrl = ctrl,
+        .alt = alt,
+        .shift = shift,
+        .super = super,
+    };
+
+    pty.send_fn(pty.app, pty.id, key) catch |err| {
+        lua.raiseErrorStr("Failed to send key: %s", .{@errorName(err).ptr});
+    };
+    return 0;
 }
 
 pub fn luaToMsgpack(lua: *ziglua.Lua, index: i32, allocator: std.mem.Allocator) !msgpack.Value {

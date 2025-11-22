@@ -655,49 +655,11 @@ pub const App = struct {
                     }
                     return;
                 }
-
-                if (self.state.pty_id) |pty_id| {
-                    // Send key_input notification
-                    // We need the msgpack map for the key.
-                    // vaxisKeyToString is now pub.
-                    const key_str = try ClientLogic.vaxisKeyToString(self.allocator, key);
-                    defer self.allocator.free(key_str);
-
-                    var key_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 5);
-                    key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key_str } };
-                    key_map_kv[1] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.mods.shift } };
-                    key_map_kv[2] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.mods.ctrl } };
-                    key_map_kv[3] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.mods.alt } };
-                    key_map_kv[4] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.mods.super } };
-
-                    const key_map_val = msgpack.Value{ .map = key_map_kv };
-
-                    var params = try self.allocator.alloc(msgpack.Value, 2);
-                    params[0] = .{ .unsigned = @intCast(pty_id) };
-                    params[1] = key_map_val;
-
-                    var arr = try self.allocator.alloc(msgpack.Value, 3);
-                    arr[0] = .{ .unsigned = 2 }; // notification
-                    arr[1] = .{ .string = "key_input" };
-                    arr[2] = .{ .array = params };
-
-                    const msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
-                    defer self.allocator.free(msg);
-
-                    // Clean up msgpack structures
-                    self.allocator.free(arr);
-                    self.allocator.free(params);
-                    self.allocator.free(key_map_kv);
-
-                    try self.sendDirect(msg);
-                }
             },
             .winsize => |ws| {
                 // Reuse performResize logic or call it
                 const rows = ws.rows;
                 const cols = ws.cols;
-
-                self.vx.state.in_band_resize = true;
 
                 // Copied from handlePipeMessage .send_resize logic
                 if (!self.first_resize_done) {
@@ -1105,17 +1067,46 @@ pub const App = struct {
 
                                 if (app.surface) |*surface| {
                                     // Send pty_attach event to Lua UI
-                                    app.ui.update(.{ .pty_attach = .{
-                                        .id = @intCast(pty_id),
-                                        .surface = surface,
-                                        .app = app,
-                                        .send_fn = struct {
-                                            fn appSendDirect(ctx: *anyopaque, data: []const u8) anyerror!void {
-                                                const self: *App = @ptrCast(@alignCast(ctx));
-                                                try self.sendDirect(data);
-                                            }
-                                        }.appSendDirect,
-                                    } }) catch |err| {
+                                    app.ui.update(.{
+                                        .pty_attach = .{
+                                            .id = @intCast(pty_id),
+                                            .surface = surface,
+                                            .app = app,
+                                            .send_fn = struct {
+                                                fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
+                                                    const self: *App = @ptrCast(@alignCast(ctx));
+
+                                                    var key_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 5);
+                                                    key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key.key } };
+                                                    key_map_kv[1] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.shift } };
+                                                    key_map_kv[2] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.ctrl } };
+                                                    key_map_kv[3] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.alt } };
+                                                    key_map_kv[4] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.super } };
+
+                                                    const key_map_val = msgpack.Value{ .map = key_map_kv };
+
+                                                    var params = try self.allocator.alloc(msgpack.Value, 2);
+                                                    params[0] = .{ .unsigned = @intCast(id) };
+                                                    params[1] = key_map_val;
+
+                                                    var arr = try self.allocator.alloc(msgpack.Value, 3);
+                                                    arr[0] = .{ .unsigned = 2 }; // notification
+                                                    arr[1] = .{ .string = "key_input" };
+                                                    arr[2] = .{ .array = params };
+
+                                                    const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+                                                    defer self.allocator.free(encoded_msg);
+
+                                                    // Clean up msgpack structures
+                                                    self.allocator.free(arr);
+                                                    self.allocator.free(params);
+                                                    self.allocator.free(key_map_kv);
+
+                                                    try self.sendDirect(encoded_msg);
+                                                }
+                                            }.appSendDirect,
+                                        },
+                                    }) catch |err| {
                                         std.log.err("Failed to update UI with pty_attach: {}", .{err});
                                     };
 

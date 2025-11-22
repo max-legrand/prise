@@ -50,16 +50,16 @@
    - Paints the screen to the local terminal (`stdout`).
    - Parses input from the pipe and sends events to the Server Socket.
 
-2. **TTY Thread (Input & Signal Handler)**:
+2. **TTY Thread (Input Handler)**:
    - **Loop**: Performs blocking reads on the local TTY (Input).
-   - Forwards raw input to the Main Thread via pipe.
-   - Handles `SIGWINCH` by serializing resize into in-band-resize notation
-   and sending it through the pipe.
+   - Forwards raw input (keystrokes and escape sequences) to the Main Thread via pipe.
+   - Does not handle signals directly; relies on in-band events from the terminal
+     or Vaxis handling.
 
 3. **Synchronization Flow**:
    - **Resize**: 
-     1. TTY Thread detects `SIGWINCH` -> Serializes to in-band-resize -> Sends to pipe.
-     2. Main Thread receives from pipe -> Sends resize request to Server.
+     1. Terminal sends resize sequence (or Vaxis generates it) -> TTY Thread forwards raw bytes -> Pipe.
+     2. Main Thread parses bytes -> Detects `.winsize` event -> Sends resize request to Server.
      3. Server resizes internal PTY -> Sends resize event to Client.
      4. Main Thread receives event -> Updates renderer state -> Repaints.
    - **Shutdown**:

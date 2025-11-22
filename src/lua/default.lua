@@ -11,6 +11,9 @@ function M.update(event)
     if event.type == "pty_attach" then
         state.pty = event.data.pty
     elseif event.type == "key_press" then
+        if state.pty then
+            state.pty:send_key(event.data)
+        end
         if event.data.key == "b" and event.data.ctrl then
             state.status_bg = "magenta"
             prise.request_frame()
