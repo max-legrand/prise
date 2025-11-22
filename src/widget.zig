@@ -38,6 +38,12 @@ pub const Widget = struct {
                 }
                 allocator.free(c.children);
             },
+            .row => |*r| {
+                for (r.children) |*child| {
+                    child.deinit(allocator);
+                }
+                allocator.free(r.children);
+            },
         }
     }
 
@@ -160,6 +166,116 @@ pub const Widget = struct {
                     .height = height,
                 };
             },
+            .row => |*row| blk: {
+                var width: u16 = 0;
+                var height: u16 = 0;
+                var total_flex: u32 = 0;
+
+                // Pass 1: Measure non-flex children and count total flex
+                for (row.children) |*child| {
+                    if (child.flex == 0) {
+                        const remaining_width = if (constraints.max_width) |max|
+                            if (max > width) max - width else 0
+                        else
+                            null;
+
+                        const child_constraints = BoxConstraints{
+                            .min_width = 0,
+                            .max_width = remaining_width,
+                            .min_height = 0,
+                            .max_height = constraints.max_height,
+                        };
+
+                        const child_size = child.layout(child_constraints);
+                        child.height = child_size.height;
+                        child.width = child_size.width;
+                        width += child_size.width;
+                        if (child_size.height > height) height = child_size.height;
+                    } else {
+                        total_flex += child.flex;
+                    }
+                }
+
+                // Pass 2: Measure flex children
+                if (total_flex > 0) {
+                    const available_width = if (constraints.max_width) |max|
+                        if (max > width) max - width else 0
+                    else
+                        0;
+
+                    if (available_width > 0) {
+                        var remaining_flex_width = available_width;
+                        var remaining_flex = total_flex;
+
+                        for (row.children) |*child| {
+                            if (child.flex > 0) {
+                                // Calculate share
+                                const share: u16 = @intCast((@as(u32, remaining_flex_width) * @as(u32, child.flex)) / remaining_flex);
+                                remaining_flex_width -= share;
+                                remaining_flex -= child.flex;
+
+                                const child_constraints = BoxConstraints{
+                                    .min_width = share,
+                                    .max_width = share,
+                                    .min_height = 0,
+                                    .max_height = constraints.max_height,
+                                };
+
+                                const child_size = child.layout(child_constraints);
+                                child.height = child_size.height;
+                                child.width = child_size.width;
+                                width += child_size.width;
+                                if (child_size.height > height) height = child_size.height;
+                            }
+                        }
+                    } else {
+                        // No space left for flex children
+                        for (row.children) |*child| {
+                            if (child.flex > 0) {
+                                child.height = 0;
+                                child.width = 0;
+                            }
+                        }
+                    }
+                }
+
+                // Final pass: Position children
+                var current_x: u16 = 0;
+                for (row.children) |*child| {
+                    child.x = current_x;
+
+                    switch (row.cross_axis_align) {
+                        .start => {
+                            child.y = 0;
+                        },
+                        .center => {
+                            if (height > child.height) {
+                                child.y = (height - child.height) / 2;
+                            } else {
+                                child.y = 0;
+                            }
+                        },
+                        .end => {
+                            if (height > child.height) {
+                                child.y = height - child.height;
+                            } else {
+                                child.y = 0;
+                            }
+                        },
+                        .stretch => {
+                            child.y = 0;
+                            child.height = height;
+                        },
+                    }
+
+                    current_x += child.width;
+                }
+
+                break :blk Size{
+                    .width = width,
+                    .height = height,
+                };
+            },
             .text => |*text| blk: {
                 // For layout, we need to iterate to calculate height.
                 // But iterator allocates. Since layout is called often, we should probably
@@ -210,6 +326,11 @@ pub const Widget = struct {
                     try child.paint();
                 }
             },
+            .row => |*row| {
+                for (row.children) |*child| {
+                    try child.paint();
+                }
+            },
         }
     }
 };
@@ -218,6 +339,7 @@ pub const WidgetKind = union(enum) {
     surface: Surface,
     text: Text,
     column: Column,
+    row: Row,
 };
 
 pub const CrossAxisAlignment = enum {
@@ -228,6 +350,11 @@ pub const CrossAxisAlignment = enum {
 };
 
 pub const Column = struct {
+    children: []Widget,
+    cross_axis_align: CrossAxisAlignment = .center,
+};
+
+pub const Row = struct {
     children: []Widget,
     cross_axis_align: CrossAxisAlignment = .center,
 };
@@ -502,6 +629,44 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
         lua.pop(1);
 
         return .{ .flex = flex, .kind = .{ .column = .{
+            .children = try children.toOwnedSlice(allocator),
+            .cross_axis_align = cross_align,
+        } } };
+    } else if (std.mem.eql(u8, widget_type, "row")) {
+        _ = lua.getField(index, "children");
+        if (lua.typeOf(-1) != .table) {
+            lua.pop(1);
+            return error.MissingRowChildren;
+        }
+
+        var children = std.ArrayList(Widget).empty;
+        errdefer {
+            for (children.items) |*c| c.deinit(allocator);
+            children.deinit(allocator);
+        }
+
+        const len = lua.rawLen(-1);
+        for (1..len + 1) |i| {
+            _ = lua.getIndex(-1, @intCast(i));
+            // recursive call
+            const child = try parseWidget(lua, allocator, -1);
+            try children.append(allocator, child);
+            lua.pop(1);
+        }
+        lua.pop(1); // children
+
+        var cross_align: CrossAxisAlignment = .center;
+        _ = lua.getField(index, "cross_axis_align");
+        if (lua.typeOf(-1) == .string) {
+            const s = try lua.toString(-1);
+            if (std.mem.eql(u8, s, "start")) cross_align = .start;
+            if (std.mem.eql(u8, s, "center")) cross_align = .center;
+            if (std.mem.eql(u8, s, "end")) cross_align = .end;
+            if (std.mem.eql(u8, s, "stretch")) cross_align = .stretch;
+        }
+        lua.pop(1);
+
+        return .{ .flex = flex, .kind = .{ .row = .{
             .children = try children.toOwnedSlice(allocator),
             .cross_axis_align = cross_align,
         } } };

@@ -4,6 +4,7 @@ function M.Terminal(opts)
     return {
         type = "terminal",
         pty = opts.pty,
+        flex = opts.flex,
     }
 end
 
@@ -48,6 +49,23 @@ function M.Column(opts)
 
     return {
         type = "column",
+        children = opts.children or opts,
+        flex = opts.flex,
+        cross_axis_align = opts.cross_axis_align,
+    }
+end
+
+function M.Row(opts)
+    -- If opts is an array (has numeric keys), it's just the children
+    if opts[1] then
+        return {
+            type = "row",
+            children = opts,
+        }
+    end
+
+    return {
+        type = "row",
         children = opts.children or opts,
         flex = opts.flex,
         cross_axis_align = opts.cross_axis_align,

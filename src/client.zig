@@ -134,9 +134,23 @@ pub const ClientState = struct {
     should_quit: bool = false,
     connection_refused: bool = false,
     next_msgid: u32 = 1,
+    pending_requests: std.AutoHashMap(u32, RequestInfo),
+    allocator: std.mem.Allocator,
 
-    pub fn init() ClientState {
-        return .{};
+    pub const RequestInfo = union(enum) {
+        spawn,
+        attach: i64,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) ClientState {
+        return .{
+            .allocator = allocator,
+            .pending_requests = std.AutoHashMap(u32, RequestInfo).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ClientState) void {
+        self.pending_requests.deinit();
     }
 };
 
@@ -144,7 +158,7 @@ pub const ServerAction = union(enum) {
     none,
     send_attach: i64,
     redraw: msgpack.Value,
-    attached,
+    attached: i64,
 };
 
 pub const PipeAction = union(enum) {
@@ -159,43 +173,68 @@ pub const ClientLogic = struct {
         switch (msg) {
             .response => |resp| {
                 state.response_received = true;
+
+                std.log.info("processServerMessage: response msgid={}", .{resp.msgid});
+                const request_info = state.pending_requests.fetchRemove(resp.msgid);
+
                 if (resp.err) |err_val| {
                     _ = err_val;
                     std.log.err("Error in response", .{});
                     return .none;
                 } else {
-                    switch (resp.result) {
-                        .integer => |i| {
-                            if (state.pty_id == null) {
-                                state.pty_id = i;
-                                return ServerAction{ .send_attach = i };
-                            } else if (!state.attached) {
+                    if (request_info) |entry| {
+                        std.log.info("processServerMessage: found pending request: {s}", .{@tagName(entry.value)});
+                        switch (entry.value) {
+                            .spawn => {
+                                const id: i64 = switch (resp.result) {
+                                    .integer => |i| i,
+                                    .unsigned => |u| @intCast(u),
+                                    else => -1,
+                                };
+                                std.log.info("processServerMessage: spawn result id={}", .{id});
+                                if (id >= 0) {
+                                    state.pty_id = id; // Last attached
+                                    state.attached = true;
+                                    return ServerAction{ .attached = id };
+                                }
+                            },
+                            .attach => |id| {
+                                state.pty_id = id;
                                 state.attached = true;
-                                std.log.info("Attached to session", .{});
-                                return .attached;
-                            }
-                        },
-                        .unsigned => |u| {
-                            if (state.pty_id == null) {
-                                state.pty_id = @intCast(u);
-                                // We spawned with attach=true, so we're already attached
-                                state.attached = true;
-                                std.log.info("Spawned and attached to session {}", .{u});
-                                return .attached;
-                            } else if (!state.attached) {
-                                state.attached = true;
-                                std.log.info("Attached to session", .{});
-                                return .attached;
-                            }
-                        },
-                        .string => |s| {
-                            std.log.info("{s}", .{s});
-                            return .none;
-                        },
-                        else => {
-                            std.log.info("Unknown result type", .{});
-                            return .none;
-                        },
+                                return ServerAction{ .attached = id };
+                            },
+                        }
+                    } else {
+                        switch (resp.result) {
+                            .integer => |i| {
+                                // Legacy fallback or unsolicited?
+                                if (state.pty_id == null) {
+                                    state.pty_id = i;
+                                    return ServerAction{ .send_attach = i };
+                                } else if (!state.attached) {
+                                    state.attached = true;
+                                    return ServerAction{ .attached = i };
+                                }
+                            },
+                            .unsigned => |u| {
+                                if (state.pty_id == null) {
+                                    state.pty_id = @intCast(u);
+                                    state.attached = true;
+                                    return ServerAction{ .attached = @intCast(u) };
+                                } else if (!state.attached) {
+                                    state.attached = true;
+                                    return ServerAction{ .attached = @intCast(u) };
+                                }
+                            },
+                            .string => |s| {
+                                std.log.info("{s}", .{s});
+                                return .none;
+                            },
+                            else => {
+                                std.log.info("Unknown result type", .{});
+                                return .none;
+                            },
+                        }
                     }
                 }
             },
@@ -355,8 +394,8 @@ pub const App = struct {
     tty_thread: ?std.Thread = null,
     io_loop: ?*io.Loop = null,
     tty_buffer: [4096]u8 = undefined,
-    surface: ?Surface = null,
-    state: ClientState = ClientState.init(),
+    surfaces: std.AutoHashMap(u32, *Surface),
+    state: ClientState,
     ui: UI = undefined,
     first_resize_done: bool = false,
     socket_path: []const u8 = undefined,
@@ -382,6 +421,8 @@ pub const App = struct {
             .msg_buffer = .empty,
             .msg_arena = std.heap.ArenaAllocator.init(allocator),
             .pipe_buf = .empty,
+            .surfaces = std.AutoHashMap(u32, *Surface).init(allocator),
+            .state = ClientState.init(allocator),
         };
         app.tty = try vaxis.Tty.init(&app.tty_buffer);
         // parser doesn't need init? assuming default init is fine or init(&allocator)
@@ -440,9 +481,13 @@ pub const App = struct {
         if (self.tty_thread) |thread| {
             thread.join();
         }
-        if (self.surface) |*surface| {
-            surface.deinit();
+        var surface_it = self.surfaces.valueIterator();
+        while (surface_it.next()) |surface| {
+            surface.*.deinit();
+            self.allocator.destroy(surface.*);
         }
+        self.surfaces.deinit();
+
         self.pipe_buf.deinit(self.allocator);
         self.msg_buffer.deinit(self.allocator);
         self.msg_arena.deinit();
@@ -719,13 +764,24 @@ pub const App = struct {
         std.log.info("Updating surface size to {}x{}", .{ cols, rows });
 
         // Create or resize surface
-        if (self.surface) |*surface| {
+        if (self.surfaces.get(pty_id)) |surface| {
             surface.resize(rows, cols) catch |err| {
                 std.log.err("Failed to resize surface: {}", .{err});
             };
         } else {
-            self.surface = Surface.init(self.allocator, pty_id, rows, cols) catch |err| {
+            const surface = self.allocator.create(Surface) catch |err| {
+                std.log.err("Failed to allocate surface: {}", .{err});
+                return;
+            };
+            surface.* = Surface.init(self.allocator, pty_id, rows, cols) catch |err| {
                 std.log.err("Failed to create surface: {}", .{err});
+                self.allocator.destroy(surface);
+                return;
+            };
+            self.surfaces.put(pty_id, surface) catch |err| {
+                std.log.err("Failed to store surface: {}", .{err});
+                surface.deinit();
+                self.allocator.destroy(surface);
                 return;
             };
             std.log.info("Surface initialized: {}x{}", .{ cols, rows });
@@ -734,12 +790,8 @@ pub const App = struct {
 
     pub fn sendResize(self: *App, pty_id: u32, rows: u16, cols: u16) !void {
         // Check if surface is already at correct size
-        if (self.surface) |*surface| {
+        if (self.surfaces.get(pty_id)) |surface| {
             // Only check if this is the active surface
-            // Since we currently only have one surface, we assume it corresponds to the pty being resized?
-            // Actually, we can't rely on self.surface unless we know pty_id matches.
-            // But surface doesn't store pty_id (except indirectly via widget).
-            // However, updateSurfaceSize relies on self.surface.
             if (surface.rows == rows and surface.cols == cols) return;
 
             // Update surface immediately
@@ -761,39 +813,55 @@ pub const App = struct {
 
     pub fn handleRedraw(self: *App, params: msgpack.Value) !void {
         std.log.debug("handleRedraw: received redraw params", .{});
-        if (self.surface) |*surface| {
-            try surface.applyRedraw(params);
+        if (params != .array) return;
 
-            // Check if we got a flush event - if so, swap and render
-            if (params == .array) {
+        // Find PTY ID from events
+        var pty_id: ?u32 = null;
+        for (params.array) |event| {
+            if (event != .array or event.array.len < 2) continue;
+            const name = event.array[0];
+            if (name != .string) continue;
+            if (std.mem.eql(u8, name.string, "style")) continue;
+            if (std.mem.eql(u8, name.string, "flush")) continue;
+
+            const args = event.array[1];
+            if (args != .array or args.array.len < 1) continue;
+
+            switch (args.array[0]) {
+                .integer => |i| pty_id = @intCast(i),
+                .unsigned => |u| pty_id = @intCast(u),
+                else => {},
+            }
+            if (pty_id) |_| break;
+        }
+
+        if (pty_id) |pid| {
+            if (self.surfaces.get(pid)) |surface| {
+                try surface.applyRedraw(params);
+
+                // Check if we got a flush event - if so, swap and render
                 const should_flush = ClientLogic.shouldFlush(params);
-                std.log.debug("handleRedraw: params is array, shouldFlush={}", .{should_flush});
                 if (should_flush) {
-                    std.log.info("handleRedraw: flush event received, rendering", .{});
+                    std.log.debug("handleRedraw: flush event received for pty {}, rendering", .{pid});
                     try self.scheduleRender();
-                    return;
-                } else {
-                    std.log.debug("handleRedraw: no flush event, not rendering yet", .{});
                 }
             } else {
-                std.log.debug("handleRedraw: params is not array", .{});
+                std.log.warn("handleRedraw: no surface for pty {}, ignoring redraw", .{pid});
             }
         } else {
-            std.log.warn("handleRedraw: no surface, ignoring redraw", .{});
+            std.log.debug("handleRedraw: could not determine pty_id from events", .{});
         }
     }
 
     fn renderWidget(self: *App, w: widget.Widget, win: vaxis.Window) !void {
         switch (w.kind) {
             .surface => |surf| {
-                if (self.surface) |*surface| {
+                if (self.surfaces.get(surf.pty_id)) |surface| {
                     // Check if we need to resize the PTY
-                    if (surface.pty_id == surf.pty_id) {
-                        if (w.width != surface.cols or w.height != surface.rows) {
-                            self.sendResize(surf.pty_id, w.height, w.width) catch |err| {
-                                std.log.err("Failed to send resize: {}", .{err});
-                            };
-                        }
+                    if (w.width != surface.cols or w.height != surface.rows) {
+                        self.sendResize(surf.pty_id, w.height, w.width) catch |err| {
+                            std.log.err("Failed to send resize: {}", .{err});
+                        };
                     }
                     surface.render(win);
                 }
@@ -847,6 +915,17 @@ pub const App = struct {
             },
             .column => |col| {
                 for (col.children) |child| {
+                    const child_win = win.child(.{
+                        .x_off = child.x,
+                        .y_off = child.y,
+                        .width = child.width,
+                        .height = child.height,
+                    });
+                    try self.renderWidget(child, child_win);
+                }
+            },
+            .row => |row| {
+                for (row.children) |child| {
                     const child_win = win.child(.{
                         .x_off = child.x,
                         .y_off = child.y,
@@ -915,8 +994,11 @@ pub const App = struct {
         try self.renderWidget(w, win);
 
         std.log.debug("render: calling vx.render()", .{});
-        if (self.surface) |*surface| {
-            self.vx.setTitle(self.tty.writer(), surface.getTitle()) catch {};
+        if (self.state.pty_id) |pid_i64| {
+            const pid = @as(u32, @intCast(pid_i64));
+            if (self.surfaces.get(pid)) |surface| {
+                self.vx.setTitle(self.tty.writer(), surface.getTitle()) catch {};
+            }
         }
         try self.vx.render(self.tty.writer());
         std.log.debug("render: flushing tty", .{});
@@ -945,6 +1027,10 @@ pub const App = struct {
                     // Vaxis and surface are already initialized from first winsize event
                     const ws = try vaxis.Tty.getWinsize(app.tty.fd);
 
+                    const msgid = app.state.next_msgid;
+                    app.state.next_msgid += 1;
+                    try app.state.pending_requests.put(msgid, .spawn);
+
                     var params_kv = try app.allocator.alloc(msgpack.Value.KeyValue, 3);
                     defer app.allocator.free(params_kv);
                     std.log.info("Sending spawn_pty: rows={} cols={}", .{ ws.rows, ws.cols });
@@ -955,7 +1041,7 @@ pub const App = struct {
                     var arr = try app.allocator.alloc(msgpack.Value, 4);
                     defer app.allocator.free(arr);
                     arr[0] = .{ .unsigned = 0 };
-                    arr[1] = .{ .unsigned = @intFromEnum(MsgId.spawn_pty) };
+                    arr[1] = .{ .unsigned = msgid };
                     arr[2] = .{ .string = "spawn_pty" };
                     arr[3] = params_val;
                     app.send_buffer = try msgpack.encodeFromValue(app.allocator, msgpack.Value{ .array = arr });
@@ -1042,76 +1128,87 @@ pub const App = struct {
                                 std.log.err("Failed to handle redraw: {}", .{err});
                             };
                         },
-                        .attached => {
+                        .attached => |id_i64| {
                             std.log.info("Attached to session, checking for resize", .{});
+                            const pty_id = @as(u32, @intCast(id_i64));
 
-                            if (app.state.pty_id) |pty_id| {
-                                // Ensure surface exists
-                                if (app.surface == null) {
-                                    const ws = try vaxis.Tty.getWinsize(app.tty.fd);
-                                    std.log.info("Creating surface for attached session: {}x{}", .{ ws.rows, ws.cols });
-                                    app.surface = Surface.init(app.allocator, @intCast(pty_id), ws.rows, ws.cols) catch |err| {
-                                        std.log.err("Failed to create surface: {}", .{err});
-                                        return error.SurfaceInitFailed;
-                                    };
-                                }
+                            // Ensure surface exists
+                            if (!app.surfaces.contains(pty_id)) {
+                                const ws = try vaxis.Tty.getWinsize(app.tty.fd);
+                                std.log.info("Creating surface for attached session {}: {}x{}", .{ pty_id, ws.rows, ws.cols });
+                                const surface = app.allocator.create(Surface) catch |err| {
+                                    std.log.err("Failed to allocate surface: {}", .{err});
+                                    return error.SurfaceInitFailed;
+                                };
+                                surface.* = Surface.init(app.allocator, pty_id, ws.rows, ws.cols) catch |err| {
+                                    std.log.err("Failed to create surface: {}", .{err});
+                                    app.allocator.destroy(surface);
+                                    return error.SurfaceInitFailed;
+                                };
+                                app.surfaces.put(pty_id, surface) catch |err| {
+                                    std.log.err("Failed to store surface: {}", .{err});
+                                    surface.deinit();
+                                    app.allocator.destroy(surface);
+                                    return error.SurfaceInitFailed;
+                                };
+                            }
 
-                                if (app.surface) |*surface| {
-                                    // Send pty_attach event to Lua UI
-                                    app.ui.update(.{
-                                        .pty_attach = .{
-                                            .id = @intCast(pty_id),
-                                            .surface = surface,
-                                            .app = app,
-                                            .send_fn = struct {
-                                                fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
-                                                    const self: *App = @ptrCast(@alignCast(ctx));
+                            if (app.surfaces.get(pty_id)) |surface| {
+                                std.log.info("Updating UI with pty_attach for {}", .{pty_id});
+                                // Send pty_attach event to Lua UI
+                                app.ui.update(.{
+                                    .pty_attach = .{
+                                        .id = pty_id,
+                                        .surface = surface,
+                                        .app = app,
+                                        .send_fn = struct {
+                                            fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
+                                                const self: *App = @ptrCast(@alignCast(ctx));
 
-                                                    var key_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 5);
-                                                    key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key.key } };
-                                                    key_map_kv[1] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.shift } };
-                                                    key_map_kv[2] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.ctrl } };
-                                                    key_map_kv[3] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.alt } };
-                                                    key_map_kv[4] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.super } };
+                                                var key_map_kv = try self.allocator.alloc(msgpack.Value.KeyValue, 5);
+                                                key_map_kv[0] = .{ .key = .{ .string = "key" }, .value = .{ .string = key.key } };
+                                                key_map_kv[1] = .{ .key = .{ .string = "shiftKey" }, .value = .{ .boolean = key.shift } };
+                                                key_map_kv[2] = .{ .key = .{ .string = "ctrlKey" }, .value = .{ .boolean = key.ctrl } };
+                                                key_map_kv[3] = .{ .key = .{ .string = "altKey" }, .value = .{ .boolean = key.alt } };
+                                                key_map_kv[4] = .{ .key = .{ .string = "metaKey" }, .value = .{ .boolean = key.super } };
 
-                                                    const key_map_val = msgpack.Value{ .map = key_map_kv };
+                                                const key_map_val = msgpack.Value{ .map = key_map_kv };
 
-                                                    var params = try self.allocator.alloc(msgpack.Value, 2);
-                                                    params[0] = .{ .unsigned = @intCast(id) };
-                                                    params[1] = key_map_val;
+                                                var params = try self.allocator.alloc(msgpack.Value, 2);
+                                                params[0] = .{ .unsigned = @intCast(id) };
+                                                params[1] = key_map_val;
 
-                                                    var arr = try self.allocator.alloc(msgpack.Value, 3);
-                                                    arr[0] = .{ .unsigned = 2 }; // notification
-                                                    arr[1] = .{ .string = "key_input" };
-                                                    arr[2] = .{ .array = params };
+                                                var arr = try self.allocator.alloc(msgpack.Value, 3);
+                                                arr[0] = .{ .unsigned = 2 }; // notification
+                                                arr[1] = .{ .string = "key_input" };
+                                                arr[2] = .{ .array = params };
 
-                                                    const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
-                                                    defer self.allocator.free(encoded_msg);
+                                                const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+                                                defer self.allocator.free(encoded_msg);
 
-                                                    // Clean up msgpack structures
-                                                    self.allocator.free(arr);
-                                                    self.allocator.free(params);
-                                                    self.allocator.free(key_map_kv);
+                                                // Clean up msgpack structures
+                                                self.allocator.free(arr);
+                                                self.allocator.free(params);
+                                                self.allocator.free(key_map_kv);
 
-                                                    try self.sendDirect(encoded_msg);
-                                                }
-                                            }.appSendDirect,
-                                        },
-                                    }) catch |err| {
-                                        std.log.err("Failed to update UI with pty_attach: {}", .{err});
-                                    };
+                                                try self.sendDirect(encoded_msg);
+                                            }
+                                        }.appSendDirect,
+                                    },
+                                }) catch |err| {
+                                    std.log.err("Failed to update UI with pty_attach: {}", .{err});
+                                };
 
-                                    std.log.info("Sending initial resize: {}x{}", .{ surface.rows, surface.cols });
-                                    const width_px = @as(u16, surface.cols) * app.cell_width_px;
-                                    const height_px = @as(u16, surface.rows) * app.cell_height_px;
-                                    const resize_msg = try msgpack.encode(app.allocator, .{
-                                        2, // notification
-                                        "resize_pty",
-                                        .{ pty_id, surface.rows, surface.cols, width_px, height_px },
-                                    });
-                                    defer app.allocator.free(resize_msg);
-                                    try app.sendDirect(resize_msg);
-                                }
+                                std.log.info("Sending initial resize: {}x{}", .{ surface.rows, surface.cols });
+                                const width_px = @as(u16, surface.cols) * app.cell_width_px;
+                                const height_px = @as(u16, surface.rows) * app.cell_height_px;
+                                const resize_msg = try msgpack.encode(app.allocator, .{
+                                    2, // notification
+                                    "resize_pty",
+                                    .{ pty_id, surface.rows, surface.cols, width_px, height_px },
+                                });
+                                defer app.allocator.free(resize_msg);
+                                try app.sendDirect(resize_msg);
                             }
                         },
                         .none => {},
@@ -1151,6 +1248,9 @@ pub const App = struct {
     pub fn spawnPty(self: *App, opts: UI.SpawnOptions) !void {
         const msgid = self.state.next_msgid;
         self.state.next_msgid += 1;
+
+        std.log.info("spawnPty: sending request msgid={}", .{msgid});
+        try self.state.pending_requests.put(msgid, .spawn);
 
         // Manually construct map for spawn params
         var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 3);
@@ -1241,7 +1341,11 @@ test "ClientLogic - processServerMessage" {
 
     // Test PTY spawn response (integer)
     {
-        var state = ClientState.init();
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+        // Manually add a pending spawn request
+        try state.pending_requests.put(1, .spawn);
+
         const msg = rpc.Message{
             .response = .{
                 .msgid = 1,
@@ -1253,30 +1357,34 @@ test "ClientLogic - processServerMessage" {
         const action = try ClientLogic.processServerMessage(&state, msg);
         try testing.expect(state.response_received);
         try testing.expectEqual(123, state.pty_id.?);
-        try testing.expectEqual(std.meta.Tag(ServerAction).send_attach, std.meta.activeTag(action));
-        try testing.expectEqual(123, action.send_attach);
+        try testing.expectEqual(std.meta.Tag(ServerAction).attached, std.meta.activeTag(action));
+        try testing.expectEqual(123, action.attached);
     }
 
     // Test Attach response (already have pty_id)
     {
-        var state = ClientState.init();
-        state.pty_id = 123;
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
+        try state.pending_requests.put(2, .{ .attach = 123 });
+
         const msg = rpc.Message{
             .response = .{
                 .msgid = 2,
                 .err = null,
-                .result = .{ .integer = 123 }, // Result of attach is typically success/pty_id
+                .result = .{ .integer = 0 }, // Result of attach is typically success/pty_id
             },
         };
 
         const action = try ClientLogic.processServerMessage(&state, msg);
         try testing.expect(state.attached);
         try testing.expectEqual(std.meta.Tag(ServerAction).attached, std.meta.activeTag(action));
+        try testing.expectEqual(123, action.attached);
     }
 
     // Test Redraw Notification
     {
-        var state = ClientState.init();
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
         // Params: [events...]
         const params = msgpack.Value{ .array = &[_]msgpack.Value{} };
         const msg = rpc.Message{
@@ -1297,7 +1405,8 @@ test "ClientLogic - processPipeMessage" {
 
     // Test Quit
     {
-        var state = ClientState.init();
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
         const encoded = try msgpack.encode(allocator, .{"quit"});
         defer allocator.free(encoded);
 
@@ -1311,7 +1420,8 @@ test "ClientLogic - processPipeMessage" {
 
     // Test Key Input
     {
-        var state = ClientState.init();
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
         state.attached = true;
         state.pty_id = 123;
 
@@ -1342,7 +1452,8 @@ test "ClientLogic - processPipeMessage" {
 
     // Test Resize
     {
-        var state = ClientState.init();
+        var state = ClientState.init(testing.allocator);
+        defer state.deinit();
 
         const encoded = try msgpack.encode(allocator, .{ "resize", 24, 80 });
         defer allocator.free(encoded);

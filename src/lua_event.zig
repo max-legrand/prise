@@ -23,6 +23,15 @@ pub const KeyData = struct {
     super: bool,
 };
 
+pub fn registerMetatable(lua: *ziglua.Lua) !void {
+    _ = try lua.newMetatable("PrisePty");
+    // Metatable is at -1
+    _ = lua.pushString("__index");
+    lua.pushFunction(ziglua.wrap(ptyIndex));
+    lua.setTable(-3);
+    lua.pop(1);
+}
+
 pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
     lua.createTable(0, 2);
 
@@ -32,16 +41,11 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
             lua.setField(-2, "type");
         },
         .pty_attach => |info| {
+            std.log.info("pushEvent: pty_attach id={}", .{info.id});
             _ = lua.pushString("pty_attach");
             lua.setField(-2, "type");
 
             lua.createTable(0, 1);
-
-            try lua.newMetatable("PrisePty");
-            _ = lua.pushString("__index");
-            lua.pushFunction(ziglua.wrap(ptyIndex));
-            lua.setTable(-3);
-            lua.pop(1);
 
             const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
             pty.* = .{
@@ -57,6 +61,7 @@ pub fn pushEvent(lua: *ziglua.Lua, event: Event) !void {
             lua.setField(-2, "pty");
 
             lua.setField(-2, "data");
+            std.log.info("pushEvent: pty_attach done", .{});
         },
 
         .vaxis => |vaxis_event| switch (vaxis_event) {

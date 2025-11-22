@@ -79,6 +79,12 @@ pub const UI = struct {
         // Store the UI table in registry
         lua.setField(ziglua.registry_index, "prise_ui");
 
+        // Initialize PrisePty metatable
+        lua_event.registerMetatable(lua) catch |err| {
+            std.log.err("Failed to register metatable: {}", .{err});
+            return err;
+        };
+
         return .{
             .allocator = allocator,
             .lua = lua,
@@ -314,7 +320,12 @@ pub const UI = struct {
 
         try lua_event.pushEvent(self.lua, event);
 
-        self.lua.call(.{ .args = 1, .results = 0 });
+        self.lua.protectedCall(.{ .args = 1, .results = 0, .msg_handler = 0 }) catch |err| {
+            const msg = self.lua.toString(-1) catch "Unknown Lua error";
+            std.log.err("Lua update error: {s}", .{msg});
+            self.lua.pop(1); // pop error message
+            return err;
+        };
     }
 
     pub fn view(self: *UI) !widget.Widget {
