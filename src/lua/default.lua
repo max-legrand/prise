@@ -5,6 +5,7 @@ local state = {
     focused_index = 1,
     status_bg = "white",
     pending_command = false,
+    timer = nil,
 }
 
 local M = {}
@@ -38,6 +39,10 @@ function M.update(event)
             end
 
             if handled then
+                if state.timer then
+                    state.timer:cancel()
+                    state.timer = nil
+                end
                 state.pending_command = false
                 state.status_bg = "white"
                 prise.request_frame()
@@ -45,6 +50,17 @@ function M.update(event)
             end
 
             -- Swallow other keys but keep command mode active (until timeout)
+            if state.timer then
+                state.timer:cancel()
+            end
+            state.timer = prise.set_timeout(1000, function()
+                if state.pending_command then
+                    state.pending_command = false
+                    state.status_bg = "white"
+                    state.timer = nil
+                    prise.request_frame()
+                end
+            end)
             return
         end
 
@@ -53,10 +69,11 @@ function M.update(event)
             state.pending_command = true
             state.status_bg = "magenta"
             prise.request_frame()
-            prise.set_timeout(1000, function()
+            state.timer = prise.set_timeout(1000, function()
                 if state.pending_command then
                     state.pending_command = false
                     state.status_bg = "white"
+                    state.timer = nil
                     prise.request_frame()
                 end
             end)
