@@ -14,6 +14,15 @@ const redraw = @import("redraw.zig");
 var signal_write_fd: posix.fd_t = undefined;
 
 fn signalHandler(sig: c_int) callconv(std.builtin.CallingConvention.c) void {
+    // Ignore further signals
+    const ignore: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &ignore, null);
+    posix.sigaction(posix.SIG.TERM, &ignore, null);
+
     _ = sig;
     _ = posix.write(signal_write_fd, "s") catch {};
 }
@@ -73,18 +82,14 @@ const Pty = struct {
         return instance;
     }
 
-    fn deinit(self: *Pty, allocator: std.mem.Allocator, loop: *io.Loop) void {
+    /// Signal the PTY to stop and cancel pending I/O (non-blocking)
+    fn stopAndCancelIO(self: *Pty, loop: *io.Loop) void {
         self.running.store(false, .seq_cst);
         // Signal read thread to exit
         _ = posix.write(self.exit_pipe_fds[1], "q") catch {};
 
         // Kill the PTY process
         _ = posix.kill(self.process.pid, posix.SIG.HUP) catch {};
-
-        if (self.read_thread) |thread| {
-            thread.join();
-        }
-        self.process.close();
 
         // Cancel any pending render timer
         if (self.render_timer) |*task| {
@@ -94,6 +99,14 @@ const Pty = struct {
 
         // Cancel pending read on dirty signal pipe
         loop.cancelByFd(self.pipe_fds[0]);
+    }
+
+    /// Join read thread and free resources (call after event loop exits)
+    fn joinAndFree(self: *Pty, allocator: std.mem.Allocator) void {
+        if (self.read_thread) |thread| {
+            thread.join();
+        }
+        self.process.close();
 
         posix.close(self.pipe_fds[0]);
         posix.close(self.pipe_fds[1]);
@@ -104,6 +117,11 @@ const Pty = struct {
         self.clients.deinit(allocator);
         self.title.deinit(allocator);
         allocator.destroy(self);
+    }
+
+    fn deinit(self: *Pty, allocator: std.mem.Allocator, loop: *io.Loop) void {
+        self.stopAndCancelIO(loop);
+        self.joinAndFree(allocator);
     }
 
     fn addClient(self: *Pty, allocator: std.mem.Allocator, client: *Client) !void {
@@ -1245,9 +1263,11 @@ const Server = struct {
         }
 
         for (to_remove.items) |session_id| {
-            if (self.ptys.fetchRemove(session_id)) |kv| {
+            if (self.ptys.getPtr(session_id)) |pty_ptr| {
                 std.log.info("Killing session {} (no clients, not keep_alive)", .{session_id});
-                kv.value.deinit(self.allocator, self.loop);
+                // Signal PTY to stop and cancel I/O, but don't join thread yet
+                // Thread join happens in startServer defer block after event loop exits
+                pty_ptr.*.stopAndCancelIO(self.loop);
             }
         }
     }
@@ -1432,6 +1452,13 @@ const Server = struct {
 
         // Cancel signal watcher
         self.loop.cancelByFd(self.signal_pipe_fds[0]);
+
+        // Signal all PTYs to stop and cancel their pending I/O
+        // (thread joins happen after event loop exits in startServer defer)
+        var it = self.ptys.valueIterator();
+        while (it.next()) |pty_instance| {
+            pty_instance.*.stopAndCancelIO(self.loop);
+        }
     }
 
     fn onSignal(loop: *io.Loop, completion: io.Completion) anyerror!void {
@@ -1609,10 +1636,6 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
             allocator.destroy(client);
         }
         server.clients.deinit(allocator);
-        var it = server.ptys.valueIterator();
-        while (it.next()) |pty_instance| {
-            pty_instance.*.deinit(allocator, &loop);
-        }
         server.ptys.deinit();
     }
 
@@ -1630,6 +1653,19 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
 
     // Run until server decides to exit
     try loop.run(.until_done);
+
+    // Block signals during thread cleanup to prevent EINTR interrupting joins
+    var block_mask = posix.sigemptyset();
+    posix.sigaddset(&block_mask, posix.SIG.INT);
+    posix.sigaddset(&block_mask, posix.SIG.TERM);
+    posix.sigprocmask(posix.SIG.BLOCK, &block_mask, null);
+
+    // Join all PTY threads before exiting
+    var it = server.ptys.valueIterator();
+    while (it.next()) |pty_instance| {
+        pty_instance.*.joinAndFree(allocator);
+    }
+    server.ptys.clearRetainingCapacity();
 
     // Cleanup
     posix.close(listen_fd);
