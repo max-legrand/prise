@@ -481,8 +481,8 @@ function M.update(event)
             return
         end
 
-        -- Ctrl+b to enter command mode
-        if event.data.key == "b" and event.data.ctrl then
+        -- Super+; to enter command mode
+        if event.data.key == ";" and event.data.super then
             state.pending_command = true
             state.status_bg = "magenta"
             prise.request_frame()
