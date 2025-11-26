@@ -6,6 +6,7 @@ const lua_event = @import("lua_event.zig");
 const io = @import("io.zig");
 const msgpack = @import("msgpack.zig");
 const Surface = @import("Surface.zig");
+const TextInput = @import("TextInput.zig");
 
 const logger = std.log.scoped(.lua);
 
@@ -69,6 +70,8 @@ pub const UI = struct {
     redraw_ctx: *anyopaque = undefined,
     detach_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
     detach_ctx: *anyopaque = undefined,
+    text_inputs: std.AutoHashMap(u32, *TextInput),
+    next_text_input_id: u32 = 1,
 
     pub const SpawnOptions = struct {
         rows: u16,
@@ -128,9 +131,13 @@ pub const UI = struct {
             return err;
         };
 
+        // Initialize TextInput metatable
+        registerTextInputMetatable(lua);
+
         return .{
             .allocator = allocator,
             .lua = lua,
+            .text_inputs = std.AutoHashMap(u32, *TextInput).init(allocator),
         };
     }
 
@@ -186,6 +193,10 @@ pub const UI = struct {
         // Register detach
         lua.pushFunction(ziglua.wrap(detach));
         lua.setField(-2, "detach");
+
+        // Register create_text_input
+        lua.pushFunction(ziglua.wrap(createTextInput));
+        lua.setField(-2, "create_text_input");
 
         // Register log
         lua.createTable(0, 4);
@@ -418,6 +429,12 @@ pub const UI = struct {
     }
 
     pub fn deinit(self: *UI) void {
+        var it = self.text_inputs.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.text_inputs.deinit();
         self.lua.deinit();
     }
 
@@ -651,4 +668,184 @@ fn pushJsonValue(lua: *ziglua.Lua, value: std.json.Value) !void {
         },
         .number_string => |s| _ = lua.pushString(s),
     }
+}
+
+const TextInputHandle = struct {
+    id: u32,
+};
+
+fn registerTextInputMetatable(lua: *ziglua.Lua) void {
+    lua.newMetatable("PriseTextInput") catch return;
+    _ = lua.pushString("__index");
+    lua.pushFunction(ziglua.wrap(textInputIndex));
+    lua.setTable(-3);
+    lua.pop(1);
+}
+
+fn textInputIndex(lua: *ziglua.Lua) i32 {
+    const key = lua.toString(2) catch return 0;
+
+    if (std.mem.eql(u8, key, "id")) {
+        lua.pushFunction(ziglua.wrap(textInputId));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "text")) {
+        lua.pushFunction(ziglua.wrap(textInputText));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "insert")) {
+        lua.pushFunction(ziglua.wrap(textInputInsert));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "delete_backward")) {
+        lua.pushFunction(ziglua.wrap(textInputDeleteBackward));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "delete_forward")) {
+        lua.pushFunction(ziglua.wrap(textInputDeleteForward));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "move_left")) {
+        lua.pushFunction(ziglua.wrap(textInputMoveLeft));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "move_right")) {
+        lua.pushFunction(ziglua.wrap(textInputMoveRight));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "move_to_start")) {
+        lua.pushFunction(ziglua.wrap(textInputMoveToStart));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "move_to_end")) {
+        lua.pushFunction(ziglua.wrap(textInputMoveToEnd));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "clear")) {
+        lua.pushFunction(ziglua.wrap(textInputClear));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "destroy")) {
+        lua.pushFunction(ziglua.wrap(textInputDestroy));
+        return 1;
+    }
+    return 0;
+}
+
+fn getTextInput(lua: *ziglua.Lua) ?*TextInput {
+    const handle = lua.checkUserdata(TextInputHandle, 1, "PriseTextInput");
+    _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+    const ui = lua.toUserdata(UI, -1) catch return null;
+    lua.pop(1);
+    return ui.text_inputs.get(handle.id);
+}
+
+fn textInputId(lua: *ziglua.Lua) i32 {
+    const handle = lua.checkUserdata(TextInputHandle, 1, "PriseTextInput");
+    lua.pushInteger(@intCast(handle.id));
+    return 1;
+}
+
+fn textInputText(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse {
+        lua.pushNil();
+        return 1;
+    };
+    _ = lua.pushString(input.text());
+    return 1;
+}
+
+fn textInputInsert(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse return 0;
+    const str = lua.toString(2) catch return 0;
+    input.insertSlice(str) catch return 0;
+    return 0;
+}
+
+fn textInputDeleteBackward(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse return 0;
+    input.deleteBackward();
+    return 0;
+}
+
+fn textInputDeleteForward(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse return 0;
+    input.deleteForward();
+    return 0;
+}
+
+fn textInputMoveLeft(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse return 0;
+    input.moveLeft();
+    return 0;
+}
+
+fn textInputMoveRight(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse return 0;
+    input.moveRight();
+    return 0;
+}
+
+fn textInputMoveToStart(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse return 0;
+    input.moveToStart();
+    return 0;
+}
+
+fn textInputMoveToEnd(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse return 0;
+    input.moveToEnd();
+    return 0;
+}
+
+fn textInputClear(lua: *ziglua.Lua) i32 {
+    const input = getTextInput(lua) orelse return 0;
+    input.clear();
+    return 0;
+}
+
+fn textInputDestroy(lua: *ziglua.Lua) i32 {
+    const handle = lua.checkUserdata(TextInputHandle, 1, "PriseTextInput");
+    _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+    const ui = lua.toUserdata(UI, -1) catch return 0;
+    lua.pop(1);
+
+    if (ui.text_inputs.fetchRemove(handle.id)) |entry| {
+        entry.value.deinit();
+        ui.allocator.destroy(entry.value);
+    }
+    return 0;
+}
+
+fn createTextInput(lua: *ziglua.Lua) i32 {
+    _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+    const ui = lua.toUserdata(UI, -1) catch {
+        lua.pushNil();
+        return 1;
+    };
+    lua.pop(1);
+
+    const input = ui.allocator.create(TextInput) catch {
+        lua.pushNil();
+        return 1;
+    };
+    input.* = TextInput.init(ui.allocator);
+
+    const id = ui.next_text_input_id;
+    ui.next_text_input_id += 1;
+
+    ui.text_inputs.put(id, input) catch {
+        input.deinit();
+        ui.allocator.destroy(input);
+        lua.pushNil();
+        return 1;
+    };
+
+    const handle = lua.newUserdata(TextInputHandle, @sizeOf(TextInputHandle));
+    handle.* = .{ .id = id };
+
+    _ = lua.getMetatableRegistry("PriseTextInput");
+    lua.setMetatable(-2);
+
+    return 1;
 }

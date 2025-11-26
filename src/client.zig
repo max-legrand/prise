@@ -1165,6 +1165,65 @@ pub const App = struct {
                     row += 1;
                 }
             },
+            .text_input => |ti| {
+                if (self.ui.text_inputs.get(ti.input_id)) |input| {
+                    input.updateScrollOffset(@intCast(win.width));
+                    input.render(win, ti.style);
+                }
+            },
+            .list => |list| {
+                const visible_rows = w.height;
+                const start = list.scroll_offset;
+                const end = @min(start + visible_rows, list.items.len);
+
+                for (start..end) |i| {
+                    const row: u16 = @intCast(i - start);
+                    const item = list.items[i];
+                    const is_selected = list.selected != null and list.selected.? == i;
+
+                    const item_style = if (is_selected)
+                        list.selected_style
+                    else
+                        item.style orelse list.style;
+
+                    for (0..win.width) |col| {
+                        const char: u8 = if (col < item.text.len) item.text[col] else ' ';
+                        win.writeCell(@intCast(col), row, .{
+                            .char = .{ .grapheme = &[_]u8{char}, .width = 1 },
+                            .style = item_style,
+                        });
+                    }
+                }
+            },
+            .box => |b| {
+                const chars = b.borderChars();
+                const style = b.style;
+
+                if (b.border != .none) {
+                    win.writeCell(0, 0, .{ .char = .{ .grapheme = chars.tl, .width = 1 }, .style = style });
+                    win.writeCell(win.width -| 1, 0, .{ .char = .{ .grapheme = chars.tr, .width = 1 }, .style = style });
+                    win.writeCell(0, win.height -| 1, .{ .char = .{ .grapheme = chars.bl, .width = 1 }, .style = style });
+                    win.writeCell(win.width -| 1, win.height -| 1, .{ .char = .{ .grapheme = chars.br, .width = 1 }, .style = style });
+
+                    for (1..win.width -| 1) |col| {
+                        win.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                        win.writeCell(@intCast(col), win.height -| 1, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                    }
+
+                    for (1..win.height -| 1) |row| {
+                        win.writeCell(0, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                        win.writeCell(win.width -| 1, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                    }
+                }
+
+                const child_win = win.child(.{
+                    .x_off = b.child.x,
+                    .y_off = b.child.y,
+                    .width = b.child.width,
+                    .height = b.child.height,
+                });
+                try self.renderWidget(b.child.*, child_win);
+            },
             .column => |col| {
                 for (col.children) |child| {
                     const child_win = win.child(.{

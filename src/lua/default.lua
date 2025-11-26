@@ -1,9 +1,37 @@
 local prise = require("prise")
 
+-- Powerline symbols
+local PL = {
+    right_solid = "", -- \ue0c0 (fire)
+    right_thin = "", -- \ue0c1
+    left_solid = "", -- \ue0c2
+    left_thin = "", -- \ue0c3
+}
+
+-- Color theme (Catppuccin Mocha inspired)
+local theme = {
+    -- Status bar backgrounds (left to right gradient)
+    mode_normal = "#89b4fa", -- Blue - normal mode
+    mode_command = "#f38ba8", -- Pink - command mode
+    bg1 = "#1e1e2e", -- Darkest (mode section)
+    bg2 = "#313244", -- Dark (title section)
+    bg3 = "#45475a", -- Medium (info section)
+    bg4 = "#585b70", -- Lighter (right sections)
+
+    -- Text colors
+    fg_bright = "#cdd6f4", -- Main text
+    fg_dim = "#a6adc8", -- Secondary text
+    fg_dark = "#1e1e2e", -- Dark text on light bg
+
+    -- Accent colors
+    accent = "#89b4fa", -- Blue accent
+    green = "#a6e3a1", -- Success/connected
+    yellow = "#f9e2af", -- Warning
+}
+
 local state = {
     root = nil,
     focused_id = nil,
-    status_bg = "white",
     pending_command = false,
     timer = nil,
     pending_split = nil,
@@ -177,6 +205,50 @@ local function get_focused_pty()
         return path[#path].pty
     end
     return nil
+end
+
+-- Count all panes in the tree
+local function count_panes(node)
+    if not node then
+        return 0
+    end
+    if is_pane(node) then
+        return 1
+    end
+    if is_split(node) then
+        local count = 0
+        for _, child in ipairs(node.children) do
+            count = count + count_panes(child)
+        end
+        return count
+    end
+    return 0
+end
+
+-- Get index of focused pane (1-based) and total count
+local function get_pane_position()
+    if not state.root or not state.focused_id then
+        return 1, 1
+    end
+
+    local index = 0
+    local found_index = 1
+
+    local function walk(node)
+        if is_pane(node) then
+            index = index + 1
+            if node.id == state.focused_id then
+                found_index = index
+            end
+        elseif is_split(node) then
+            for _, child in ipairs(node.children) do
+                walk(child)
+            end
+        end
+    end
+
+    walk(state.root)
+    return found_index, index
 end
 
 -- Serialize a node tree to a table with pty_ids instead of userdata
@@ -453,6 +525,20 @@ function M.update(event)
                 -- Quit
                 prise.quit()
                 handled = true
+            elseif k == "Enter" or k == "\r" or k == "\n" then
+                local pty = get_focused_pty()
+                if pty then
+                    local size = pty:size()
+                    -- Account for cell aspect ratio (roughly 1:2)
+                    -- Split along the longest visual axis
+                    if size.cols > (size.rows * 2.2) then
+                        state.pending_split = { direction = "row" }
+                    else
+                        state.pending_split = { direction = "col" }
+                    end
+                    prise.spawn({})
+                    handled = true
+                end
             end
 
             if handled then
@@ -461,7 +547,6 @@ function M.update(event)
                     state.timer = nil
                 end
                 state.pending_command = false
-                state.status_bg = "white"
                 prise.request_frame()
                 return
             end
@@ -473,7 +558,6 @@ function M.update(event)
             state.timer = prise.set_timeout(1000, function()
                 if state.pending_command then
                     state.pending_command = false
-                    state.status_bg = "white"
                     state.timer = nil
                     prise.request_frame()
                 end
@@ -484,12 +568,10 @@ function M.update(event)
         -- Super+; to enter command mode
         if event.data.key == ";" and event.data.super then
             state.pending_command = true
-            state.status_bg = "magenta"
             prise.request_frame()
             state.timer = prise.set_timeout(1000, function()
                 if state.pending_command then
                     state.pending_command = false
-                    state.status_bg = "white"
                     state.timer = nil
                     prise.request_frame()
                 end
@@ -629,6 +711,44 @@ local function render_node(node)
     end
 end
 
+-- Build the powerline-style status bar
+local function build_status_bar()
+    local mode_color = state.pending_command and theme.mode_command or theme.mode_normal
+    local mode_text = state.pending_command and " CMD " or " PRISE "
+
+    -- Get pane title
+    local title = "Terminal"
+    if state.focused_id then
+        local path = find_node_path(state.root, state.focused_id)
+        if path then
+            local pane = path[#path]
+            local t = pane.pty:title()
+            if t and #t > 0 then
+                title = t
+            end
+        end
+    end
+
+    -- Get pane position
+    local pane_idx, pane_total = get_pane_position()
+    local pane_info = string.format(" %d/%d ", pane_idx, pane_total)
+
+    -- Build the segments
+    return prise.Text({
+        -- Left side: mode indicator
+        { text = mode_text, style = { bg = mode_color, fg = theme.fg_dark, bold = true } },
+        { text = PL.right_solid, style = { fg = mode_color, bg = theme.bg2 } },
+
+        -- Title section
+        { text = " " .. title .. " ", style = { bg = theme.bg2, fg = theme.fg_bright } },
+        { text = PL.right_solid, style = { fg = theme.bg2, bg = theme.bg3 } },
+
+        -- Pane info
+        { text = pane_info, style = { bg = theme.bg3, fg = theme.fg_dim } },
+        { text = PL.right_solid, style = { fg = theme.bg3, bg = theme.bg1 } },
+    })
+end
+
 function M.view()
     if not state.root then
         return prise.Column({
@@ -638,28 +758,13 @@ function M.view()
     end
 
     local content = render_node(state.root)
-
-    -- Status bar logic
-    local title = " Prise Terminal "
-    if state.focused_id then
-        local path = find_node_path(state.root, state.focused_id)
-        if path then
-            local pane = path[#path]
-            local t = pane.pty:title()
-            if t and #t > 0 then
-                title = " " .. t .. " "
-            end
-        end
-    end
+    local status_bar = build_status_bar()
 
     return prise.Column({
         cross_axis_align = "stretch",
         children = {
             content,
-            prise.Text({
-                text = title,
-                style = { bg = state.status_bg, fg = "black" },
-            }),
+            status_bar,
         },
     })
 end

@@ -1076,10 +1076,10 @@ const Client = struct {
                                 };
                             }
 
-                            // Mark render state as needing full redraw after resize
-                            // Don't send immediate redraw - let the application respond to SIGWINCH first
-                            // The normal PTY dirty handling will send updates after the app redraws
-                            pty_instance.render_state.dirty = .full;
+                            // After resize, reset render_state completely to avoid stale page references
+                            // that could cause assertion failures in render_state.update()
+                            pty_instance.render_state.deinit(pty_instance.allocator);
+                            pty_instance.render_state = .empty;
                             pty_instance.terminal_mutex.unlock();
                             std.log.info("resize_pty: completed for pty={}", .{pty_id});
                         } else {
@@ -1469,8 +1469,10 @@ const Server = struct {
                 };
             }
 
-            // Mark render state as needing full redraw after resize
-            pty_instance.render_state.dirty = .full;
+            // After resize, reset render_state completely to avoid stale page references
+            // that could cause assertion failures in render_state.update()
+            pty_instance.render_state.deinit(pty_instance.allocator);
+            pty_instance.render_state = .empty;
             pty_instance.terminal_mutex.unlock();
 
             std.log.info("Resized PTY {} to {}x{} ({}x{}px)", .{ pty_id, cols, rows, x_pixel, y_pixel });

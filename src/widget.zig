@@ -83,11 +83,22 @@ pub const Widget = struct {
     pub fn deinit(self: *Widget, allocator: std.mem.Allocator) void {
         switch (self.kind) {
             .surface => {},
+            .text_input => {},
             .text => |*t| {
                 for (t.spans) |span| {
                     allocator.free(span.text);
                 }
                 allocator.free(t.spans);
+            },
+            .list => |*l| {
+                for (l.items) |item| {
+                    allocator.free(item.text);
+                }
+                allocator.free(l.items);
+            },
+            .box => |*b| {
+                b.child.deinit(allocator);
+                allocator.destroy(b.child);
             },
             .column => |*c| {
                 for (c.children) |*child| {
@@ -119,6 +130,35 @@ pub const Widget = struct {
             .surface => Size{
                 .width = constraints.max_width.?,
                 .height = constraints.max_height.?,
+            },
+            .text_input => Size{
+                .width = constraints.max_width orelse 20,
+                .height = 1,
+            },
+            .list => |l| Size{
+                .width = constraints.max_width orelse 20,
+                .height = @min(@as(u16, @intCast(l.items.len)), constraints.max_height orelse @as(u16, @intCast(l.items.len))),
+            },
+            .box => |*b| blk: {
+                const border_size: u16 = if (b.border == .none) 0 else 2;
+                const inner_max_w = if (constraints.max_width) |w| (if (w > border_size) w - border_size else 0) else null;
+                const inner_max_h = if (constraints.max_height) |h| (if (h > border_size) h - border_size else 0) else null;
+
+                const child_size = b.child.layout(.{
+                    .min_width = 0,
+                    .max_width = inner_max_w,
+                    .min_height = 0,
+                    .max_height = inner_max_h,
+                });
+                b.child.x = if (b.border == .none) 0 else 1;
+                b.child.y = if (b.border == .none) 0 else 1;
+                b.child.width = child_size.width;
+                b.child.height = child_size.height;
+
+                break :blk Size{
+                    .width = child_size.width + border_size,
+                    .height = child_size.height + border_size,
+                };
             },
             .column => |*col| blk: {
                 const total_height = constraints.max_height orelse 0;
@@ -409,6 +449,11 @@ pub const Widget = struct {
                 // TODO: paint surface at self.x, self.y, self.width, self.height
             },
             .text => {},
+            .text_input => {},
+            .list => {},
+            .box => |*b| {
+                try b.child.paint();
+            },
             .column => |*col| {
                 for (col.children) |*child| {
                     try child.paint();
@@ -464,6 +509,11 @@ pub const Widget = struct {
                 }
             },
             .text => {},
+            .text_input => {},
+            .list => {},
+            .box => |b| {
+                try b.child.collectHitRegionsRecursive(allocator, regions, abs_x, abs_y);
+            },
             .stack => |stack| {
                 for (stack.children) |*child| {
                     try child.collectHitRegionsRecursive(allocator, regions, abs_x, abs_y);
@@ -491,6 +541,11 @@ pub const Widget = struct {
         switch (self.kind) {
             .surface => {},
             .text => {},
+            .text_input => {},
+            .list => {},
+            .box => |b| {
+                try b.child.collectSplitHandlesRecursive(allocator, handles, abs_x, abs_y);
+            },
             .row => |row| {
                 // Horizontal split handles (between children in a row)
                 for (row.children, 0..) |*child, i| {
@@ -579,6 +634,9 @@ pub fn hitTestSplitHandle(handles: []const SplitHandle, x: f64, y: f64) ?*const 
 pub const WidgetKind = union(enum) {
     surface: Surface,
     text: Text,
+    text_input: TextInputWidget,
+    list: List,
+    box: Box,
     column: Column,
     row: Row,
     stack: Stack,
@@ -627,6 +685,46 @@ pub const Positioned = struct {
 
 pub const Surface = struct {
     pty_id: u32,
+};
+
+pub const TextInputWidget = struct {
+    input_id: u32,
+    style: vaxis.Style = .{},
+};
+
+pub const List = struct {
+    items: []Item,
+    selected: ?usize = null,
+    scroll_offset: usize = 0,
+    style: vaxis.Style = .{},
+    selected_style: vaxis.Style = .{},
+
+    pub const Item = struct {
+        text: []const u8,
+        style: ?vaxis.Style = null,
+    };
+};
+
+pub const Box = struct {
+    child: *Widget,
+    border: Border = .single,
+    style: vaxis.Style = .{},
+
+    pub const Border = enum {
+        none,
+        single,
+        double,
+        rounded,
+    };
+
+    pub fn borderChars(self: Box) struct { tl: []const u8, tr: []const u8, bl: []const u8, br: []const u8, h: []const u8, v: []const u8 } {
+        return switch (self.border) {
+            .none => .{ .tl = " ", .tr = " ", .bl = " ", .br = " ", .h = " ", .v = " " },
+            .single => .{ .tl = "┌", .tr = "┐", .bl = "└", .br = "┘", .h = "─", .v = "│" },
+            .double => .{ .tl = "╔", .tr = "╗", .bl = "╚", .br = "╝", .h = "═", .v = "║" },
+            .rounded => .{ .tl = "╭", .tr = "╮", .bl = "╰", .br = "╯", .h = "─", .v = "│" },
+        };
+    }
 };
 
 pub const Text = struct {
@@ -857,6 +955,139 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
         lua.pop(1);
 
         return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .surface = .{ .pty_id = @intCast(pty_id) } } };
+    } else if (std.mem.eql(u8, widget_type, "text_input")) {
+        _ = lua.getField(index, "input");
+
+        const input_id = lua_event.getTextInputId(lua, -1) catch {
+            lua.pop(1);
+            return error.MissingTextInputId;
+        };
+        lua.pop(1);
+
+        var style = vaxis.Style{};
+        _ = lua.getField(index, "style");
+        if (lua.typeOf(-1) == .table) {
+            style = parseStyle(lua, -1) catch .{};
+        }
+        lua.pop(1);
+
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .text_input = .{ .input_id = input_id, .style = style } } };
+    } else if (std.mem.eql(u8, widget_type, "list")) {
+        _ = lua.getField(index, "items");
+        if (lua.typeOf(-1) != .table) {
+            lua.pop(1);
+            return error.MissingListItems;
+        }
+
+        var items = std.ArrayList(List.Item).empty;
+        errdefer {
+            for (items.items) |item| allocator.free(item.text);
+            items.deinit(allocator);
+        }
+
+        const len = lua.rawLen(-1);
+        for (1..len + 1) |i| {
+            _ = lua.getIndex(-1, @intCast(i));
+            if (lua.typeOf(-1) == .string) {
+                const text = try lua.toString(-1);
+                try items.append(allocator, .{
+                    .text = try allocator.dupe(u8, text),
+                    .style = null,
+                });
+            } else if (lua.typeOf(-1) == .table) {
+                _ = lua.getField(-1, "text");
+                const text = lua.toString(-1) catch "";
+                lua.pop(1);
+
+                var item_style: ?vaxis.Style = null;
+                _ = lua.getField(-1, "style");
+                if (lua.typeOf(-1) == .table) {
+                    item_style = parseStyle(lua, -1) catch null;
+                }
+                lua.pop(1);
+
+                try items.append(allocator, .{
+                    .text = try allocator.dupe(u8, text),
+                    .style = item_style,
+                });
+            }
+            lua.pop(1);
+        }
+        lua.pop(1); // items
+
+        var selected: ?usize = null;
+        _ = lua.getField(index, "selected");
+        if (lua.isInteger(-1)) {
+            const sel = lua.toInteger(-1) catch 0;
+            if (sel > 0) selected = @intCast(sel - 1); // Lua 1-indexed
+        }
+        lua.pop(1);
+
+        var scroll_offset: usize = 0;
+        _ = lua.getField(index, "scroll_offset");
+        if (lua.isInteger(-1)) {
+            const off = lua.toInteger(-1) catch 0;
+            if (off > 0) scroll_offset = @intCast(off);
+        }
+        lua.pop(1);
+
+        var style = vaxis.Style{};
+        _ = lua.getField(index, "style");
+        if (lua.typeOf(-1) == .table) {
+            style = parseStyle(lua, -1) catch .{};
+        }
+        lua.pop(1);
+
+        var selected_style = vaxis.Style{};
+        _ = lua.getField(index, "selected_style");
+        if (lua.typeOf(-1) == .table) {
+            selected_style = parseStyle(lua, -1) catch .{};
+        }
+        lua.pop(1);
+
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .list = .{
+            .items = try items.toOwnedSlice(allocator),
+            .selected = selected,
+            .scroll_offset = scroll_offset,
+            .style = style,
+            .selected_style = selected_style,
+        } } };
+    } else if (std.mem.eql(u8, widget_type, "box")) {
+        _ = lua.getField(index, "child");
+        if (lua.typeOf(-1) != .table) {
+            lua.pop(1);
+            return error.MissingBoxChild;
+        }
+        const child_widget = try parseWidget(lua, allocator, -1);
+        lua.pop(1);
+
+        const child = try allocator.create(Widget);
+        errdefer allocator.destroy(child);
+        child.* = child_widget;
+
+        var border: Box.Border = .single;
+        _ = lua.getField(index, "border");
+        if (lua.typeOf(-1) == .string) {
+            const b = lua.toString(-1) catch "";
+            if (std.mem.eql(u8, b, "none")) border = .none;
+            if (std.mem.eql(u8, b, "single")) border = .single;
+            if (std.mem.eql(u8, b, "double")) border = .double;
+            if (std.mem.eql(u8, b, "rounded")) border = .rounded;
+        }
+        lua.pop(1);
+
+        var style = vaxis.Style{};
+        _ = lua.getField(index, "style");
+        if (lua.typeOf(-1) == .table) {
+            style = parseStyle(lua, -1) catch .{};
+        }
+        lua.pop(1);
+
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .box = .{
+            .child = child,
+            .border = border,
+            .style = style,
+        } } };
     } else if (std.mem.eql(u8, widget_type, "column")) {
         _ = lua.getField(index, "children");
         if (lua.typeOf(-1) != .table) {

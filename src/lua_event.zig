@@ -519,6 +519,31 @@ pub fn getPtyId(lua: *ziglua.Lua, index: i32) !u32 {
     return error.InvalidPty;
 }
 
+const TextInputHandle = struct {
+    id: u32,
+};
+
+pub fn getTextInputId(lua: *ziglua.Lua, index: i32) !u32 {
+    if (lua.typeOf(index) == .number) {
+        return @intCast(try lua.toInteger(index));
+    }
+
+    if (lua.isUserdata(index)) {
+        lua.getMetatable(index) catch return error.InvalidTextInput;
+
+        _ = lua.getMetatableRegistry("PriseTextInput");
+        const equal = lua.compare(-1, -2, .eq);
+        lua.pop(2);
+
+        if (equal) {
+            const handle = try lua.toUserdata(TextInputHandle, index);
+            return handle.id;
+        }
+    }
+
+    return error.InvalidTextInput;
+}
+
 pub fn pushPtyUserdata(
     lua: *ziglua.Lua,
     id: u32,
