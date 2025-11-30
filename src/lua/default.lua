@@ -593,6 +593,17 @@ local commands = {
         end,
     },
     {
+        name = "Close Pane",
+        action = function()
+            local path = state.focused_id and find_node_path(state.root, state.focused_id)
+            if path then
+                local pane = path[#path]
+                pane.pty:close()
+                remove_pane_by_id(pane.id)
+            end
+        end,
+    },
+    {
         name = "Detach Session",
         action = function()
             prise.detach("default")
