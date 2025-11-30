@@ -85,6 +85,7 @@ const Pty = struct {
 
     // Synchronization for terminal access
     terminal_mutex: std.Thread.Mutex = .{},
+
     // Dirty signaling
     pipe_fds: [2]posix.fd_t,
     exit_pipe_fds: [2]posix.fd_t,
@@ -306,6 +307,8 @@ const Pty = struct {
                 stream.nextSlice(buffer[0..n]) catch |err| {
                     log.err("Failed to parse VT sequences: {}", .{err});
                 };
+                // Check synchronized_output while still holding the mutex
+                const should_signal = !self.terminal.modes.get(.synchronized_output);
                 self.terminal_mutex.unlock();
 
                 // Notify main thread by writing to pipe
@@ -313,7 +316,7 @@ const Pty = struct {
                 // Skip signaling during synchronized_output mode (DEC mode 2026) because
                 // the application is in the middle of an atomic update. We'll render when
                 // the mode is cleared, avoiding partial/flickering frames.
-                if (!self.terminal.modes.get(.synchronized_output)) {
+                if (should_signal) {
                     _ = posix.write(self.pipe_fds[1], "x") catch |err| {
                         if (err != error.WouldBlock) {
                             log.err("Failed to signal dirty: {}", .{err});
@@ -808,10 +811,25 @@ fn buildRedrawMessageFromPty(
     defer temp_arena.deinit();
     const temp_alloc = temp_arena.allocator();
 
-    pty_instance.terminal_mutex.lock();
-    try pty_instance.render_state.update(pty_instance.allocator, &pty_instance.terminal);
-    const mouse_shape = mapMouseShape(pty_instance.terminal.mouse_shape);
-    pty_instance.terminal_mutex.unlock();
+    const mouse_shape = mouse_shape: {
+        pty_instance.terminal_mutex.lock();
+        defer pty_instance.terminal_mutex.unlock();
+
+        // Skip rendering during synchronized output mode - the application is in the
+        // middle of an atomic update and the terminal state may be inconsistent
+        if (pty_instance.terminal.modes.get(.synchronized_output)) {
+            return error.SynchronizedOutput;
+        }
+
+        pty_instance.render_state.update(pty_instance.allocator, &pty_instance.terminal) catch |err| {
+            // If update fails, reset render state to recover from potentially corrupt state
+            log.warn("render_state.update failed: {}, resetting render state", .{err});
+            pty_instance.render_state.deinit(pty_instance.allocator);
+            pty_instance.render_state = .empty;
+            return err;
+        };
+        break :mouse_shape mapMouseShape(pty_instance.terminal.mouse_shape);
+    };
 
     const rs = &pty_instance.render_state;
 
@@ -1424,10 +1442,6 @@ const Client = struct {
                                 };
                             }
 
-                            // After resize, reset render_state completely to avoid stale page references
-                            // that could cause assertion failures in render_state.update()
-                            pty_instance.render_state.deinit(pty_instance.allocator);
-                            pty_instance.render_state = .empty;
                             pty_instance.terminal_mutex.unlock();
                             log.info("resize_pty: completed for pty={}", .{pty_id});
                         } else {
@@ -1795,6 +1809,9 @@ const Server = struct {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
         };
 
+        // Lock mutex before any terminal state access to avoid race with read thread
+        pty_instance.terminal_mutex.lock();
+
         log.info("resize_pty request: pty={} requested={}x{} ({}x{}px) current={}x{}", .{
             args.id,
             args.cols,
@@ -1815,10 +1832,9 @@ const Server = struct {
         var pty_mut = pty_instance.process;
         pty_mut.setSize(size) catch |err| {
             log.err("Resize PTY failed: {}", .{err});
+            pty_instance.terminal_mutex.unlock();
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "resize failed") };
         };
-
-        pty_instance.terminal_mutex.lock();
         if (pty_instance.terminal.rows != args.rows or pty_instance.terminal.cols != args.cols) {
             log.info("resize_pty request: resizing terminal from {}x{} to {}x{}", .{
                 pty_instance.terminal.cols,
@@ -1850,8 +1866,6 @@ const Server = struct {
             };
         }
 
-        pty_instance.render_state.deinit(pty_instance.allocator);
-        pty_instance.render_state = .empty;
         pty_instance.terminal_mutex.unlock();
 
         log.info("Resized PTY {} to {}x{} ({}x{}px)", .{ args.id, args.cols, args.rows, args.x_pixel, args.y_pixel });
