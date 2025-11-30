@@ -101,9 +101,8 @@ const Pty = struct {
         // Signal read thread to exit
         _ = posix.write(self.exit_pipe_fds[1], "q") catch {};
 
-        // Kill the PTY process
-        // Try SIGTERM first, then SIGKILL if that doesn't work
-        _ = posix.kill(self.process.pid, posix.SIG.TERM) catch {};
+        // Send SIGHUP to the process group (standard behavior when PTY closes)
+        _ = posix.kill(-self.process.pid, posix.SIG.HUP) catch {};
 
         // Cancel any pending render timer
         if (self.render_timer) |*task| {
@@ -252,11 +251,21 @@ const Pty = struct {
         }
         log.info("PTY read thread exiting for PTY {}", .{self.id});
 
-        // Reap the child process
-        const result = posix.waitpid(self.process.pid, 0);
-        log.info("PTY {} process {} exited with status {}", .{ self.id, self.process.pid, result.status });
+        // Reap the child process (use WNOHANG with retries, resending SIGHUP like Ghostty)
+        var status: u32 = 0;
+        while (true) {
+            const result = posix.waitpid(self.process.pid, posix.W.NOHANG);
+            if (result.pid != 0) {
+                status = result.status;
+                log.info("PTY {} process {} exited with status {}", .{ self.id, self.process.pid, status });
+                break;
+            }
+            // Process still alive, resend SIGHUP and wait
+            _ = posix.kill(-self.process.pid, posix.SIG.HUP) catch {};
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
 
-        self.exit_status.store(result.status, .seq_cst);
+        self.exit_status.store(status, .seq_cst);
         self.exited.store(true, .seq_cst);
 
         // Signal main thread about exit
