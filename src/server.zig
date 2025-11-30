@@ -1822,8 +1822,6 @@ const Server = struct {
     }
 
     fn renderFrame(self: *Server, pty_instance: *Pty) void {
-        const start_time = std.time.nanoTimestamp();
-
         const msg = buildRedrawMessageFromPty(
             self.allocator,
             pty_instance,
@@ -1834,18 +1832,10 @@ const Server = struct {
         };
         defer self.allocator.free(msg);
 
-        const build_time = std.time.nanoTimestamp();
-
         // Build and send redraw notifications
         self.sendRedraw(self.loop, pty_instance, msg, null) catch |err| {
             std.log.err("Failed to send redraw for session {}: {}", .{ pty_instance.id, err });
         };
-
-        const send_time = std.time.nanoTimestamp();
-        const build_us = @divTrunc(build_time - start_time, std.time.ns_per_us);
-        const send_us = @divTrunc(send_time - build_time, std.time.ns_per_us);
-
-        std.log.info("renderFrame: build={}us send={}us", .{ build_us, send_us });
 
         // Update timestamp
         pty_instance.last_render_time = std.time.milliTimestamp();
