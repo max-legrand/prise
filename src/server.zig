@@ -209,20 +209,13 @@ const Pty = struct {
     }
 
     fn removeClient(self: *Pty, client: *Client) void {
-        const prev_len = self.clients.items.len;
-        // Precondition: must have at least one client to remove
-        std.debug.assert(prev_len > 0);
-
         for (self.clients.items, 0..) |c, i| {
             if (c == client) {
                 _ = self.clients.swapRemove(i);
-                // Postcondition: client count decreased by exactly one
-                std.debug.assert(self.clients.items.len == prev_len - 1);
                 return;
             }
         }
-        // If we reach here, client was not found - this is a bug
-        unreachable;
+        // Client not found - already removed (e.g., via detach_pty)
     }
 
     fn setTitle(self: *Pty, title: []const u8) !void {
