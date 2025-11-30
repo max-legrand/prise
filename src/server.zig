@@ -660,6 +660,7 @@ const Client = struct {
     server: *Server,
     recv_buffer: [4096]u8 = undefined,
     send_buffer: ?[]u8 = null,
+    send_offset: usize = 0,
     send_queue: std.ArrayList([]u8),
     attached_sessions: std.ArrayList(usize),
     closing: bool = false,
@@ -689,20 +690,32 @@ const Client = struct {
         const client = completion.userdataCast(Client);
         const allocator = client.server.allocator;
 
-        // Free send buffer
-        if (client.send_buffer) |buf| {
-            allocator.free(buf);
-            client.send_buffer = null;
-        }
-
-        // If client is closing, finish cleanup now that in-flight send is done
-        if (client.closing) {
-            client.finishClose(loop);
-            return;
-        }
-
         switch (completion.result) {
-            .send => {
+            .send => |n| {
+                const buf = client.send_buffer orelse return;
+                client.send_offset += n;
+
+                // Check for partial send
+                if (client.send_offset < buf.len) {
+                    // Re-arm for remaining bytes
+                    _ = try loop.send(client.fd, buf[client.send_offset..], .{
+                        .ptr = client,
+                        .cb = onSendComplete,
+                    });
+                    return;
+                }
+
+                // Buffer fully sent, free it
+                allocator.free(buf);
+                client.send_buffer = null;
+                client.send_offset = 0;
+
+                // If client is closing, finish cleanup
+                if (client.closing) {
+                    client.finishClose(loop);
+                    return;
+                }
+
                 // Send next queued message if any
                 if (client.send_queue.items.len > 0) {
                     const next_buf = client.send_queue.orderedRemove(0);
@@ -715,11 +728,21 @@ const Client = struct {
             },
             .err => |err| {
                 log.err("Send failed: {}", .{err});
+                // Free current buffer
+                if (client.send_buffer) |buf| {
+                    allocator.free(buf);
+                    client.send_buffer = null;
+                    client.send_offset = 0;
+                }
                 // Clear queue on error
                 for (client.send_queue.items) |buf| {
                     allocator.free(buf);
                 }
                 client.send_queue.clearRetainingCapacity();
+
+                if (client.closing) {
+                    client.finishClose(loop);
+                }
             },
             else => unreachable,
         }
