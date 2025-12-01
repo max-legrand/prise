@@ -1994,7 +1994,8 @@ pub const App = struct {
                         }
                     }
 
-                    // Try to read more
+                    // Try to read more (but not if we're quitting - fd may be closed)
+                    if (app.state.should_quit) break;
                     const n = posix.recv(app.fd, &app.recv_buffer, 0) catch |err| {
                         if (err == error.WouldBlock) break;
                         return err;
