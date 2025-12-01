@@ -27,6 +27,10 @@ pub const Handler = struct {
     title_fn: ?*const fn (ctx: ?*anyopaque, title: []const u8) anyerror!void = null,
     title_ctx: ?*anyopaque = null,
 
+    /// Optional callback for notifying pwd changes (OSC 7)
+    pwd_fn: ?*const fn (ctx: ?*anyopaque, pwd: []const u8) anyerror!void = null,
+    pwd_ctx: ?*anyopaque = null,
+
     pub fn init(terminal: *Terminal) Handler {
         return .{
             .terminal = terminal,
@@ -55,6 +59,16 @@ pub const Handler = struct {
     ) void {
         self.title_ctx = ctx;
         self.title_fn = title_fn;
+    }
+
+    /// Set the callback for notifying pwd changes (OSC 7)
+    pub fn setPwdCallback(
+        self: *Handler,
+        ctx: ?*anyopaque,
+        pwd_fn: *const fn (ctx: ?*anyopaque, pwd: []const u8) anyerror!void,
+    ) void {
+        self.pwd_ctx = ctx;
+        self.pwd_fn = pwd_fn;
     }
 
     /// Write data back to the PTY (if callback is set)
@@ -243,13 +257,18 @@ pub const Handler = struct {
                 try self.write(resp);
             },
 
+            .report_pwd => {
+                if (self.pwd_fn) |func| {
+                    try func(self.pwd_ctx, self.terminal.pwd.items);
+                }
+            },
+
             // Have no terminal-modifying effect
             .bell,
             .enquiry,
             .size_report,
             .xtversion,
             .device_status,
-            .report_pwd,
             .show_desktop_notification,
             .progress_report,
             .clipboard_contents,

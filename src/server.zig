@@ -31,6 +31,7 @@ pub const LIMITS = struct {
     pub const MESSAGE_SIZE_MAX: usize = 16 * 1024 * 1024; // 16MB
     pub const SEND_QUEUE_MAX: usize = 1024;
     pub const TITLE_LEN_MAX: usize = 4096;
+    pub const PWD_LEN_MAX: usize = 4096; // typical PATH_MAX
 };
 
 var signal_write_fd: posix.fd_t = undefined;
@@ -78,6 +79,10 @@ const Pty = struct {
     // Title of the terminal window
     title: std.ArrayList(u8),
     title_dirty: bool = false,
+
+    // Current working directory (from OSC 7)
+    pwd: std.ArrayList(u8),
+    pwd_dirty: bool = false,
 
     // Exit state
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -137,6 +142,8 @@ const Pty = struct {
             .allocator = allocator,
             .title = std.ArrayList(u8).empty,
             .title_dirty = false,
+            .pwd = std.ArrayList(u8).empty,
+            .pwd_dirty = false,
             .pipe_fds = pipe_fds,
             .exit_pipe_fds = exit_pipe_fds,
             .render_state = .empty,
@@ -190,6 +197,7 @@ const Pty = struct {
         self.render_state.deinit(allocator);
         self.clients.deinit(allocator);
         self.title.deinit(allocator);
+        self.pwd.deinit(allocator);
         allocator.destroy(self);
     }
 
@@ -240,6 +248,15 @@ const Pty = struct {
         self.title_dirty = true;
     }
 
+    fn setPwd(self: *Pty, pwd: []const u8) !void {
+        // Mutex is already held by readThread when this is called via callback
+        const truncated = if (pwd.len > LIMITS.PWD_LEN_MAX) pwd[0..LIMITS.PWD_LEN_MAX] else pwd;
+
+        self.pwd.clearRetainingCapacity();
+        try self.pwd.appendSlice(self.allocator, truncated);
+        self.pwd_dirty = true;
+    }
+
     // Removed broadcast - we'll send msgpack-RPC redraw notifications instead
 
     fn readThread(self: *Pty, server: *Server) void {
@@ -277,6 +294,16 @@ const Pty = struct {
                 };
             }
         }.onTitle);
+
+        // Set up pwd callback (OSC 7)
+        handler.setPwdCallback(self, struct {
+            fn onPwd(ctx: ?*anyopaque, pwd: []const u8) !void {
+                const pty_inst: *Pty = @ptrCast(@alignCast(ctx));
+                pty_inst.setPwd(pwd) catch |err| {
+                    log.err("Failed to set pwd: {}", .{err});
+                };
+            }
+        }.onPwd);
 
         var stream = vt_handler.Stream.initAlloc(self.allocator, handler);
         defer stream.deinit();
@@ -1611,10 +1638,11 @@ const Server = struct {
     signal_pipe_fds: [2]posix.fd_t,
     signal_buf: [1]u8 = undefined,
 
-    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.winsize, attach: bool } {
+    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.winsize, attach: bool, cwd: ?[]const u8 } {
         var rows: u16 = 24;
         var cols: u16 = 80;
         var attach: bool = false;
+        var cwd: ?[]const u8 = null;
 
         if (params == .map) {
             for (params.map) |kv| {
@@ -1625,6 +1653,8 @@ const Server = struct {
                     cols = @intCast(kv.value.unsigned);
                 } else if (std.mem.eql(u8, kv.key.string, "attach") and kv.value == .boolean) {
                     attach = kv.value.boolean;
+                } else if (std.mem.eql(u8, kv.key.string, "cwd") and kv.value == .string) {
+                    cwd = kv.value.string;
                 }
             }
         }
@@ -1637,6 +1667,7 @@ const Server = struct {
                 .ws_ypixel = 0,
             },
             .attach = attach,
+            .cwd = cwd,
         };
     }
 
@@ -1729,9 +1760,10 @@ const Server = struct {
         }
 
         const parsed = parseSpawnPtyParams(params);
-        log.info("spawn_pty: rows={} cols={} attach={}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach });
+        const cwd = parsed.cwd orelse posix.getenv("HOME");
+        log.info("spawn_pty: rows={} cols={} attach={} cwd={?s}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach, cwd });
 
-        const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
+        const shell = posix.getenv("SHELL") orelse "/bin/sh";
 
         var env_map = try std.process.getEnvMap(self.allocator);
         defer env_map.deinit();
@@ -1744,7 +1776,7 @@ const Server = struct {
             env_list.deinit(self.allocator);
         }
 
-        const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items));
+        const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items), cwd);
 
         const pty_id = self.next_pty_id;
         self.next_pty_id += 1;
@@ -2224,6 +2256,14 @@ const Server = struct {
             std.log.err("Failed to send redraw for session {}: {}", .{ pty_instance.id, err });
         };
 
+        // Send pwd_changed notification if pwd is dirty
+        if (pty_instance.pwd_dirty) {
+            pty_instance.pwd_dirty = false;
+            self.sendPwdChanged(pty_instance) catch |err| {
+                std.log.err("Failed to send pwd_changed for pty {}: {}", .{ pty_instance.id, err });
+            };
+        }
+
         // Update timestamp
         pty_instance.last_render_time = std.time.milliTimestamp();
     }
@@ -2238,6 +2278,20 @@ const Server = struct {
 
         // Send to all clients
         for (self.clients.items) |client| {
+            try client.sendData(self.loop, msg_bytes);
+        }
+    }
+
+    fn sendPwdChanged(self: *Server, pty_instance: *Pty) !void {
+        if (pty_instance.pwd.items.len == 0) return;
+
+        const params = .{ pty_instance.id, pty_instance.pwd.items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "pwd_changed", params });
+        defer self.allocator.free(msg_bytes);
+
+        log.info("Sending pwd_changed for pty {}: {s}", .{ pty_instance.id, pty_instance.pwd.items });
+
+        for (pty_instance.clients.items) |client| {
             try client.sendData(self.loop, msg_bytes);
         }
     }
@@ -2405,6 +2459,7 @@ const Server = struct {
         pty_instance.render_state.deinit(self.allocator);
         pty_instance.clients.deinit(self.allocator);
         pty_instance.title.deinit(self.allocator);
+        pty_instance.pwd.deinit(self.allocator);
         self.allocator.destroy(pty_instance);
     }
 };
@@ -2747,6 +2802,7 @@ test "parseSpawnPtyParams" {
     try testing.expectEqual(@as(u16, 24), p1.size.ws_row);
     try testing.expectEqual(@as(u16, 80), p1.size.ws_col);
     try testing.expectEqual(false, p1.attach);
+    try testing.expectEqual(@as(?[]const u8, null), p1.cwd);
 
     // Full params
     var params = [_]msgpack.Value.KeyValue{
@@ -2758,6 +2814,18 @@ test "parseSpawnPtyParams" {
     try testing.expectEqual(@as(u16, 40), p2.size.ws_row);
     try testing.expectEqual(@as(u16, 100), p2.size.ws_col);
     try testing.expectEqual(true, p2.attach);
+    try testing.expectEqual(@as(?[]const u8, null), p2.cwd);
+
+    // With cwd param
+    var params_with_cwd = [_]msgpack.Value.KeyValue{
+        .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = 30 } },
+        .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = 120 } },
+        .{ .key = .{ .string = "cwd" }, .value = .{ .string = "/tmp" } },
+    };
+    const p3 = Server.parseSpawnPtyParams(.{ .map = &params_with_cwd });
+    try testing.expectEqual(@as(u16, 30), p3.size.ws_row);
+    try testing.expectEqual(@as(u16, 120), p3.size.ws_col);
+    try testing.expectEqualStrings("/tmp", p3.cwd.?);
 }
 
 test "prepareSpawnEnv" {
@@ -2866,6 +2934,8 @@ test "buildRedrawMessageFromPty" {
         .allocator = allocator,
         .title = std.ArrayList(u8).empty,
         .title_dirty = false,
+        .pwd = std.ArrayList(u8).empty,
+        .pwd_dirty = false,
         .pipe_fds = undefined,
         .exit_pipe_fds = undefined,
         .render_state = .empty,
@@ -2876,6 +2946,7 @@ test "buildRedrawMessageFromPty" {
         pty_inst.render_state.deinit(allocator);
         pty_inst.clients.deinit(allocator);
         pty_inst.title.deinit(allocator);
+        pty_inst.pwd.deinit(allocator);
     }
 
     const msg = try buildRedrawMessageFromPty(allocator, &pty_inst, .full);
@@ -2901,6 +2972,8 @@ test "style optimization" {
         .allocator = allocator,
         .title = std.ArrayList(u8).empty,
         .title_dirty = false,
+        .pwd = std.ArrayList(u8).empty,
+        .pwd_dirty = false,
         .pipe_fds = undefined,
         .exit_pipe_fds = undefined,
         .render_state = .empty,
@@ -2911,6 +2984,7 @@ test "style optimization" {
         pty_inst.render_state.deinit(allocator);
         pty_inst.clients.deinit(allocator);
         pty_inst.title.deinit(allocator);
+        pty_inst.pwd.deinit(allocator);
     }
 
     const handler = vt_handler.Handler.init(&pty_inst.terminal);
@@ -3044,6 +3118,8 @@ test "server - pty exit notification" {
         .allocator = allocator,
         .title = std.ArrayList(u8).empty,
         .title_dirty = false,
+        .pwd = std.ArrayList(u8).empty,
+        .pwd_dirty = false,
         .pipe_fds = pipe_fds,
         .exit_pipe_fds = exit_pipe_fds,
         .render_state = .empty,

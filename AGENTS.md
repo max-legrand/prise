@@ -45,10 +45,10 @@ const foo = Type{ .field = value };     // Avoid
 Inspired by [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 
 **Assertions:**
-- Target minimum 2 assertions per function for public APIs
-- Assert preconditions (valid state, non-null pointers, bounds)
-- Assert postconditions (result validity, state changes)
-- Pair assertions: check the same property at write and read points
+- Add assertions that catch real bugs, not trivially true statements
+- Focus on API boundaries and state transitions where invariants matter
+- Good: bounds checks, null checks before dereference, state machine transitions
+- Avoid: asserting something immediately after setting it, checking internal function arguments
 
 **Limits:**
 - Put explicit bounds on all collections and resources

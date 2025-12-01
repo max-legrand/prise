@@ -39,6 +39,7 @@ pub const Process = struct {
         SetsidFailed,
         IoctlFailed,
         ExecFailed,
+        ChdirFailed,
     };
 
     pub fn spawn(
@@ -46,6 +47,7 @@ pub const Process = struct {
         size: winsize,
         argv: []const []const u8,
         env: ?[]const []const u8,
+        cwd: ?[]const u8,
     ) OpenError!Process {
         var master_fd: c_int = undefined;
         var slave_fd: c_int = undefined;
@@ -87,7 +89,7 @@ pub const Process = struct {
         };
 
         if (pid == 0) {
-            childProcess(allocator, slave_fd, master_fd, argv, env) catch |err| {
+            childProcess(allocator, slave_fd, master_fd, argv, env, cwd) catch |err| {
                 log.err("child process failed: {}", .{err});
                 posix.exit(1);
             };
@@ -109,6 +111,7 @@ pub const Process = struct {
         master_fd: posix.fd_t,
         argv: []const []const u8,
         env: ?[]const []const u8,
+        cwd: ?[]const u8,
     ) !void {
         var sa: posix.Sigaction = .{
             .handler = .{ .handler = posix.SIG.DFL },
@@ -137,6 +140,10 @@ pub const Process = struct {
 
         if (slave_fd > 2) posix.close(slave_fd);
         posix.close(master_fd);
+
+        if (cwd) |dir| {
+            posix.chdir(dir) catch return error.ChdirFailed;
+        }
 
         const argv_z = try allocator.alloc(?[*:0]const u8, argv.len + 1);
         defer allocator.free(argv_z);
