@@ -175,7 +175,7 @@ pub const ClientState = struct {
 
     pub const RequestInfo = union(enum) {
         spawn,
-        attach: i64,
+        attach: struct { pty_id: i64, cwd: ?[]const u8 = null },
         detach,
     };
 
@@ -200,6 +200,7 @@ pub const ClientState = struct {
 pub const ServerAction = union(enum) {
     none,
     send_attach: i64,
+    spawn_pty_with_cwd: struct { cwd: ?[]const u8 },
     redraw: msgpack.Value,
     attached: i64,
     pty_exited: struct { pty_id: u32, status: u32 },
@@ -223,8 +224,21 @@ pub const ClientLogic = struct {
                 const request_info = state.pending_requests.fetchRemove(resp.msgid);
 
                 if (resp.err) |err_val| {
-                    _ = err_val;
-                    log.err("Error in response", .{});
+                    if (request_info) |entry| {
+                        switch (entry.value) {
+                            .attach => |attach_info| {
+                                // If attach fails with "PTY not found", try spawn_pty with cwd
+                                if (err_val == .string) {
+                                    if (std.mem.eql(u8, err_val.string, "PTY not found")) {
+                                        log.info("PTY {} not found, spawning new PTY with cwd", .{attach_info.pty_id});
+                                        return .{ .spawn_pty_with_cwd = .{ .cwd = attach_info.cwd } };
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    log.err("Error in response: {}", .{err_val});
                     return .none;
                 } else {
                     if (request_info) |entry| {
@@ -243,10 +257,10 @@ pub const ClientLogic = struct {
                                     return .{ .attached = id };
                                 }
                             },
-                            .attach => |id| {
-                                state.pty_id = id;
+                            .attach => |attach_info| {
+                                state.pty_id = attach_info.pty_id;
                                 state.attached = true;
-                                return .{ .attached = id };
+                                return .{ .attached = attach_info.pty_id };
                             },
                             .detach => {
                                 return ServerAction.detached;
@@ -484,6 +498,7 @@ pub const App = struct {
     pending_attach_ids: ?[]u32 = null,
     pending_attach_count: usize = 0,
     session_json: ?[]const u8 = null,
+    pending_attach_cwd: std.AutoHashMap(u32, []const u8) = undefined,
 
     paste_buffer: ?std.ArrayList(u8) = null,
 
@@ -538,6 +553,7 @@ pub const App = struct {
             .pipe_buf = .empty,
             .surfaces = std.AutoHashMap(u32, *Surface).init(allocator),
             .state = ClientState.init(allocator),
+            .pending_attach_cwd = std.AutoHashMap(u32, []const u8).init(allocator),
         };
         app.tty = try vaxis.Tty.init(&app.tty_buffer);
         // parser doesn't need init? assuming default init is fine or init(&allocator)
@@ -607,6 +623,11 @@ pub const App = struct {
         self.msg_buffer.deinit(self.allocator);
         self.msg_arena.deinit();
         self.state.deinit();
+        var cwd_it = self.pending_attach_cwd.valueIterator();
+        while (cwd_it.next()) |cwd| {
+            self.allocator.free(cwd.*);
+        }
+        self.pending_attach_cwd.deinit();
         if (self.hit_regions.len > 0) self.allocator.free(self.hit_regions);
         if (self.split_handles.len > 0) self.allocator.free(self.split_handles);
         self.vx.deinit(self.allocator, self.tty.writer());
@@ -1577,6 +1598,9 @@ pub const App = struct {
             return error.NoSessionsFound;
         }
 
+        // Extract PTY ID + cwd pairs for fallback spawning if attach fails
+        self.pending_attach_cwd = try extractPtyIdCwdPairs(self.allocator, json);
+
         log.info("Attaching to {} PTYs from session {s}", .{ pty_ids.len, session_name });
         self.pending_attach_ids = pty_ids;
         self.pending_attach_count = pty_ids.len;
@@ -1584,7 +1608,8 @@ pub const App = struct {
         for (pty_ids) |pty_id| {
             const msgid = self.state.next_msgid;
             self.state.next_msgid += 1;
-            try self.state.pending_requests.put(msgid, .{ .attach = @intCast(pty_id) });
+            const cwd = self.pending_attach_cwd.get(pty_id);
+            try self.state.pending_requests.put(msgid, .{ .attach = .{ .pty_id = @intCast(pty_id), .cwd = cwd } });
 
             // Server expects params as array: [pty_id]
             var params = try self.allocator.alloc(msgpack.Value, 1);
@@ -1894,6 +1919,35 @@ pub const App = struct {
                                     }
                                 }
                             },
+                            .spawn_pty_with_cwd => |info| {
+                                log.info("Spawning new PTY with cwd: {s}", .{if (info.cwd) |c| c else "default"});
+                                const msgid = app.state.next_msgid;
+                                app.state.next_msgid += 1;
+                                try app.state.pending_requests.put(msgid, .spawn);
+
+                                // Build spawn_pty params with optional cwd
+                                var params = try app.allocator.alloc(msgpack.Value, if (info.cwd != null) 1 else 0);
+                                if (info.cwd) |cwd| {
+                                    if (cwd.len > 0) {
+                                        var kv = try app.allocator.alloc(msgpack.Value.KeyValue, 1);
+                                        kv[0] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+                                        params[0] = .{ .map = kv };
+                                    }
+                                }
+
+                                var arr = try app.allocator.alloc(msgpack.Value, 4);
+                                arr[0] = .{ .unsigned = 0 };
+                                arr[1] = .{ .unsigned = msgid };
+                                arr[2] = .{ .string = "spawn_pty" };
+                                arr[3] = .{ .array = params };
+
+                                const encoded = try msgpack.encodeFromValue(app.allocator, msgpack.Value{ .array = arr });
+                                defer app.allocator.free(encoded);
+                                app.allocator.free(arr);
+                                app.allocator.free(params);
+
+                                try app.sendDirect(encoded);
+                            },
                             .pty_exited => |info| {
                                 log.info("PTY {} exited with status {}", .{ info.pty_id, info.status });
                                 app.ui.update(.{ .pty_exited = .{ .id = info.pty_id, .status = info.status } }) catch |err| {
@@ -2093,6 +2147,56 @@ pub const App = struct {
             .array => |arr| {
                 for (arr.items) |item| {
                     try collectPtyIds(ids, allocator, item);
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn extractPtyIdCwdPairs(allocator: std.mem.Allocator, json: []const u8) !std.AutoHashMap(u32, []const u8) {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+
+        var pairs: std.AutoHashMap(u32, []const u8) = .init(allocator);
+        errdefer {
+            var it = pairs.valueIterator();
+            while (it.next()) |val| {
+                allocator.free(val.*);
+            }
+            pairs.deinit();
+        }
+
+        try collectPtyIdCwd(&pairs, allocator, parsed.value);
+        return pairs;
+    }
+
+    fn collectPtyIdCwd(pairs: *std.AutoHashMap(u32, []const u8), allocator: std.mem.Allocator, value: std.json.Value) !void {
+        switch (value) {
+            .object => |obj| {
+                if (obj.get("type")) |type_val| {
+                    if (type_val == .string and std.mem.eql(u8, type_val.string, "pane")) {
+                        if (obj.get("pty_id")) |pty_id_val| {
+                            if (pty_id_val == .integer) {
+                                const pty_id: u32 = @intCast(pty_id_val.integer);
+                                var cwd: ?[]const u8 = null;
+                                if (obj.get("cwd")) |cwd_val| {
+                                    if (cwd_val == .string) {
+                                        cwd = try allocator.dupe(u8, cwd_val.string);
+                                    }
+                                }
+                                try pairs.put(pty_id, cwd orelse try allocator.dupe(u8, ""));
+                            }
+                        }
+                    }
+                }
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    try collectPtyIdCwd(pairs, allocator, entry.value_ptr.*);
+                }
+            },
+            .array => |arr| {
+                for (arr.items) |item| {
+                    try collectPtyIdCwd(pairs, allocator, item);
                 }
             },
             else => {},
@@ -2333,7 +2437,7 @@ test "ClientLogic - processServerMessage" {
     {
         var state = ClientState.init(testing.allocator);
         defer state.deinit();
-        try state.pending_requests.put(2, .{ .attach = 123 });
+        try state.pending_requests.put(2, .{ .attach = .{ .pty_id = 123, .cwd = null } });
 
         const msg = rpc.Message{
             .response = .{
