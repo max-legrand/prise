@@ -2,10 +2,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const io = @import("io.zig");
 const server = @import("server.zig");
 const client = @import("client.zig");
 const posix = std.posix;
+
+pub const version = build_options.version;
 
 const log = std.log.scoped(.main);
 
@@ -92,7 +95,13 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?(?[]const 
 
     const cmd = args.next() orelse return @as(?[]const u8, null);
 
-    if (std.mem.eql(u8, cmd, "serve")) {
+    if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
+        var buf: [128]u8 = undefined;
+        var stdout = std.fs.File.stdout().writer(&buf);
+        stdout.interface.print("prise {s}\n", .{version}) catch {};
+        stdout.interface.flush() catch {};
+        return null;
+    } else if (std.mem.eql(u8, cmd, "serve")) {
         initLogFile("server.log");
         try server.startServer(allocator, socket_path);
         return null;

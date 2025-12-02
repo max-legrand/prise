@@ -8,6 +8,7 @@ const ghostty_vt = @import("ghostty-vt");
 const io = @import("io.zig");
 const key_encode = @import("key_encode.zig");
 const key_parse = @import("key_parse.zig");
+const main = @import("main.zig");
 const mouse_encode = @import("mouse_encode.zig");
 const msgpack = @import("msgpack.zig");
 const pty = @import("pty.zig");
@@ -2337,9 +2338,20 @@ const Server = struct {
         return msgpack.Value.nil;
     }
 
+    fn handleGetServerInfo(self: *Server) !msgpack.Value {
+        const entries = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
+        entries[0] = .{
+            .key = .{ .string = try self.allocator.dupe(u8, "version") },
+            .value = .{ .string = try self.allocator.dupe(u8, main.version) },
+        };
+        return .{ .map = entries };
+    }
+
     fn handleRequest(self: *Server, client: *Client, method: []const u8, params: msgpack.Value) !msgpack.Value {
         if (std.mem.eql(u8, method, "ping")) {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "pong") };
+        } else if (std.mem.eql(u8, method, "get_server_info")) {
+            return self.handleGetServerInfo();
         } else if (std.mem.eql(u8, method, "spawn_pty")) {
             return self.handleSpawnPty(client, params);
         } else if (std.mem.eql(u8, method, "close_pty")) {

@@ -4,11 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const version = getVersion(b);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
+    exe_mod.addOptions("build_options", options);
 
     if (b.lazyDependency("ghostty", .{
         .target = target,
@@ -173,4 +179,29 @@ pub fn build(b: *std.Build) void {
         enable_service_step.dependOn(&enable_linux.step);
     }
     enable_service_step.dependOn(b.getInstallStep());
+}
+
+const version_base = "0.0.0";
+
+fn getVersion(b: *std.Build) []const u8 {
+    var code: u8 = undefined;
+    const git_describe = b.runAllowFail(&.{ "git", "describe", "--match", "*.*.*", "--tags" }, &code, .Ignore) catch {
+        return getDevVersion(b);
+    };
+    const trimmed = std.mem.trim(u8, git_describe, " \n\r");
+    if (std.mem.eql(u8, trimmed, version_base)) {
+        return version_base;
+    }
+    return getDevVersion(b);
+}
+
+fn getDevVersion(b: *std.Build) []const u8 {
+    var code: u8 = undefined;
+    const commit_count = b.runAllowFail(&.{ "git", "rev-list", "--count", "HEAD" }, &code, .Ignore) catch "0";
+    const commit_hash = b.runAllowFail(&.{ "git", "rev-parse", "--short=7", "HEAD" }, &code, .Ignore) catch "unknown";
+    return b.fmt("{s}-dev.{s}+{s}", .{
+        version_base,
+        std.mem.trim(u8, commit_count, " \n\r"),
+        std.mem.trim(u8, commit_hash, " \n\r"),
+    });
 }
