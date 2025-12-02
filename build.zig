@@ -75,4 +75,27 @@ pub fn build(b: *std.Build) void {
 
     const stylua = b.addSystemCommand(&.{ "stylua", "src/lua" });
     fmt_step.dependOn(&stylua.step);
+
+    const setup_step = b.step("setup", "Setup development environment (install pre-commit hook)");
+
+    const pre_commit_hook =
+        \\#!/bin/sh
+        \\set -e
+        \\zig build fmt
+        \\zig build test
+    ;
+
+    const setup_hook = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        b.fmt("mkdir -p .git/hooks && cat > .git/hooks/pre-commit << 'EOF'\n{s}\nEOF\nchmod +x .git/hooks/pre-commit && echo '✓ Pre-commit hook installed'", .{pre_commit_hook}),
+    });
+    setup_step.dependOn(&setup_hook.step);
+
+    const check_stylua = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        "command -v stylua > /dev/null || { echo '⚠ Warning: stylua not found. Run: brew install stylua'; }",
+    });
+    setup_step.dependOn(&check_stylua.step);
 }

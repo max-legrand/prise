@@ -30,6 +30,14 @@ Prise is a vibe coded project. Contributions are welcome, but preference is give
 *   If you cannot afford paid AI tools, check out [Amp's free mode](https://ampcode.com).
 *   There are also other free options available, such as OpenCode using compatible models.
 
+## Development Setup
+
+To set up your development environment (installs pre-commit hook):
+
+```bash
+zig build setup
+```
+
 ## Build Instructions
 
 To build the project:
