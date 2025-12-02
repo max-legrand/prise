@@ -35,7 +35,7 @@ local prise = require("prise")
 ---@field action fun()
 
 -- Powerline symbols
-local PL = {
+local POWERLINE_SYMBOLS = {
     right_solid = "",
     right_thin = "",
     left_solid = "",
@@ -43,7 +43,7 @@ local PL = {
 }
 
 -- Color theme (Catppuccin Mocha inspired)
-local theme = {
+local THEME = {
     -- Status bar backgrounds (left to right gradient)
     mode_normal = "#89b4fa", -- Blue - normal mode
     mode_command = "#f38ba8", -- Pink - command mode
@@ -1064,9 +1064,9 @@ local function build_palette()
         table.insert(items, cmd.name)
     end
 
-    local palette_style = { bg = theme.bg1, fg = theme.fg_bright }
-    local selected_style = { bg = theme.accent, fg = theme.fg_dark }
-    local input_style = { bg = theme.bg1, fg = theme.fg_bright }
+    local palette_style = { bg = THEME.bg1, fg = THEME.fg_bright }
+    local selected_style = { bg = THEME.accent, fg = THEME.fg_dark }
+    local input_style = { bg = THEME.bg1, fg = THEME.fg_bright }
 
     return prise.Positioned({
         anchor = "top_center",
@@ -1087,7 +1087,7 @@ local function build_palette()
                             input = state.palette.input,
                             style = input_style,
                         }),
-                        prise.Text({ text = string.rep("─", 60), style = { fg = theme.bg3 } }),
+                        prise.Text({ text = string.rep("─", 60), style = { fg = THEME.bg3 } }),
                         prise.List({
                             items = items,
                             selected = state.palette.selected,
@@ -1104,7 +1104,7 @@ end
 ---Build the powerline-style status bar
 ---@return table
 local function build_status_bar()
-    local mode_color = state.pending_command and theme.mode_command or theme.mode_normal
+    local mode_color = state.pending_command and THEME.mode_command or THEME.mode_normal
     local mode_text = state.pending_command and " CMD " or " PRISE "
 
     -- Get pane title
@@ -1127,16 +1127,16 @@ local function build_status_bar()
     -- Build the segments
     return prise.Text({
         -- Left side: mode indicator
-        { text = mode_text, style = { bg = mode_color, fg = theme.fg_dark, bold = true } },
-        { text = PL.right_solid, style = { fg = mode_color, bg = theme.bg2 } },
+        { text = mode_text, style = { bg = mode_color, fg = THEME.fg_dark, bold = true } },
+        { text = POWERLINE_SYMBOLS.right_solid, style = { fg = mode_color, bg = THEME.bg2 } },
 
         -- Title section
-        { text = " " .. title .. " ", style = { bg = theme.bg2, fg = theme.fg_bright } },
-        { text = PL.right_solid, style = { fg = theme.bg2, bg = theme.bg3 } },
+        { text = " " .. title .. " ", style = { bg = THEME.bg2, fg = THEME.fg_bright } },
+        { text = POWERLINE_SYMBOLS.right_solid, style = { fg = THEME.bg2, bg = THEME.bg3 } },
 
         -- Pane info
-        { text = pane_info, style = { bg = theme.bg3, fg = theme.fg_dim } },
-        { text = PL.right_solid, style = { fg = theme.bg3, bg = theme.bg1 } },
+        { text = pane_info, style = { bg = THEME.bg3, fg = THEME.fg_dim } },
+        { text = POWERLINE_SYMBOLS.right_solid, style = { fg = THEME.bg3, bg = THEME.bg1 } },
     })
 end
 
