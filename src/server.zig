@@ -96,6 +96,14 @@ const Pty = struct {
     color_queries_len: usize = 0,
     color_queries_mutex: std.Thread.Mutex = .{},
 
+    // Track color queries sent vs responses received
+    color_queries_sent: usize = 0,
+    color_queries_received: usize = 0,
+
+    // Pending DA1 response - held until color queries are resolved or timeout
+    da1_pending: bool = false,
+    da1_timestamp_ms: i64 = 0,
+
     // Exit state
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     exit_status: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -306,6 +314,16 @@ const Pty = struct {
         self.color_queries_len += 1;
     }
 
+    /// Queue a DA1 response to be sent after color queries are resolved.
+    fn queueDa1(self: *Pty) void {
+        self.color_queries_mutex.lock();
+        defer self.color_queries_mutex.unlock();
+
+        self.da1_pending = true;
+        self.da1_timestamp_ms = std.time.milliTimestamp();
+        log.debug("DA1 queued for PTY {}", .{self.id});
+    }
+
     // Removed broadcast - we'll send msgpack-RPC redraw notifications instead
 
     fn readThread(self: *Pty, server: *Server) void {
@@ -361,6 +379,14 @@ const Pty = struct {
                 pty_inst.queueColorQuery(target);
             }
         }.onColorQuery);
+
+        // Set up DA1 callback - defer response until color queries are resolved
+        handler.setDa1Callback(self, struct {
+            fn onDa1(ctx: ?*anyopaque) !void {
+                const pty_inst: *Pty = @ptrCast(@alignCast(ctx));
+                pty_inst.queueDa1();
+            }
+        }.onDa1);
 
         var stream = vt_handler.Stream.initAlloc(self.allocator, handler);
         defer stream.deinit();
@@ -1140,6 +1166,8 @@ const Client = struct {
             try self.handleDetachPty(notif);
         } else if (std.mem.eql(u8, notif.method, "focus_event")) {
             try self.handleFocusEvent(notif);
+        } else if (std.mem.eql(u8, notif.method, "color_response")) {
+            try self.handleColorResponse(notif);
         }
     }
 
@@ -1627,6 +1655,126 @@ const Client = struct {
         } else {
             log.warn("focus_event notification: PTY {} not found", .{pty_id});
         }
+    }
+
+    /// Handle color_response notification from client.
+    /// Formats and writes OSC color response to the PTY.
+    fn handleColorResponse(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .map) {
+            log.warn("color_response notification: invalid params (expected map)", .{});
+            return;
+        }
+
+        var pty_id: ?usize = null;
+        var r: ?u8 = null;
+        var g: ?u8 = null;
+        var b: ?u8 = null;
+        var index: ?u8 = null;
+        var kind: ?[]const u8 = null;
+
+        for (notif.params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = parsePtyId(kv.value);
+            } else if (std.mem.eql(u8, kv.key.string, "r")) {
+                r = parseU8(kv.value);
+            } else if (std.mem.eql(u8, kv.key.string, "g")) {
+                g = parseU8(kv.value);
+            } else if (std.mem.eql(u8, kv.key.string, "b")) {
+                b = parseU8(kv.value);
+            } else if (std.mem.eql(u8, kv.key.string, "index")) {
+                index = parseU8(kv.value);
+            } else if (std.mem.eql(u8, kv.key.string, "kind")) {
+                kind = if (kv.value == .string) kv.value.string else null;
+            }
+        }
+
+        const pid = pty_id orelse {
+            log.warn("color_response: missing pty_id", .{});
+            return;
+        };
+        const red = r orelse {
+            log.warn("color_response: missing r", .{});
+            return;
+        };
+        const green = g orelse {
+            log.warn("color_response: missing g", .{});
+            return;
+        };
+        const blue = b orelse {
+            log.warn("color_response: missing b", .{});
+            return;
+        };
+
+        const pty_instance = self.server.ptys.get(pid) orelse {
+            log.warn("color_response: PTY {} not found", .{pid});
+            return;
+        };
+
+        // Format OSC response: rgb:RRRR/GGGG/BBBB (16-bit scaled)
+        // Scale 8-bit to 16-bit by duplicating: 0xAB -> 0xABAB
+        const r16 = @as(u16, red) * 0x101;
+        const g16 = @as(u16, green) * 0x101;
+        const b16 = @as(u16, blue) * 0x101;
+
+        var buf: [64]u8 = undefined;
+        const response: []const u8 = if (index) |idx|
+            // OSC 4 response: \x1b]4;INDEX;rgb:RRRR/GGGG/BBBB\x1b\\
+            std.fmt.bufPrint(&buf, "\x1b]4;{};rgb:{x:0>4}/{x:0>4}/{x:0>4}\x1b\\", .{ idx, r16, g16, b16 }) catch return
+        else if (kind) |k|
+            // OSC 10/11/12 response
+            if (std.mem.eql(u8, k, "foreground"))
+                std.fmt.bufPrint(&buf, "\x1b]10;rgb:{x:0>4}/{x:0>4}/{x:0>4}\x1b\\", .{ r16, g16, b16 }) catch return
+            else if (std.mem.eql(u8, k, "background"))
+                std.fmt.bufPrint(&buf, "\x1b]11;rgb:{x:0>4}/{x:0>4}/{x:0>4}\x1b\\", .{ r16, g16, b16 }) catch return
+            else if (std.mem.eql(u8, k, "cursor"))
+                std.fmt.bufPrint(&buf, "\x1b]12;rgb:{x:0>4}/{x:0>4}/{x:0>4}\x1b\\", .{ r16, g16, b16 }) catch return
+            else {
+                log.warn("color_response: unknown kind '{s}'", .{k});
+                return;
+            }
+        else {
+            log.warn("color_response: missing index or kind", .{});
+            return;
+        };
+
+        writeAllFd(pty_instance.process.master, response) catch |err| {
+            log.err("Failed to write color response to PTY: {}", .{err});
+            return;
+        };
+
+        // Track response received and check if DA1 can be sent now
+        {
+            pty_instance.color_queries_mutex.lock();
+            defer pty_instance.color_queries_mutex.unlock();
+
+            pty_instance.color_queries_received += 1;
+
+            // If DA1 is pending and all queries are responded, send it now
+            if (pty_instance.da1_pending and
+                pty_instance.color_queries_received >= pty_instance.color_queries_sent and
+                pty_instance.color_queries_len == 0)
+            {
+                pty_instance.da1_pending = false;
+                pty_instance.color_queries_sent = 0;
+                pty_instance.color_queries_received = 0;
+                writeAllFd(pty_instance.process.master, "\x1b[?1;2c") catch |err| {
+                    log.err("Failed to write DA1 response to PTY: {}", .{err});
+                };
+                log.debug("Sent DA1 response to PTY {} (triggered by color_response)", .{pid});
+            }
+        }
+
+        log.debug("Sent color response to PTY {}: {s}", .{ pid, response });
+    }
+
+    /// Parse u8 from msgpack value, returns null if invalid type.
+    fn parseU8(val: msgpack.Value) ?u8 {
+        return switch (val) {
+            .unsigned => |u| if (u <= 255) @intCast(u) else null,
+            .integer => |i| if (i >= 0 and i <= 255) @intCast(i) else null,
+            else => null,
+        };
     }
 
     /// Parse PTY ID from msgpack value, returns null if invalid type.
@@ -2475,7 +2623,32 @@ const Server = struct {
                 }
             }
 
+            pty_instance.color_queries_sent += 1;
             removeFirst(pty_instance);
+        }
+
+        // Check if we should send pending DA1 response
+        // Send if: all sent queries have been responded to, OR DA1 has timed out
+        if (pty_instance.da1_pending) {
+            const da1_timed_out = now_ms - pty_instance.da1_timestamp_ms > LIMITS.COLOR_QUERY_TIMEOUT_MS;
+            const all_responded = pty_instance.color_queries_received >= pty_instance.color_queries_sent and
+                pty_instance.color_queries_len == 0;
+
+            if (all_responded or da1_timed_out) {
+                pty_instance.da1_pending = false;
+                // Reset counters for next batch
+                pty_instance.color_queries_sent = 0;
+                pty_instance.color_queries_received = 0;
+                // Send DA1 response: ESC [ ? 1 ; 2 c
+                writeAllFd(pty_instance.process.master, "\x1b[?1;2c") catch |err| {
+                    log.err("Failed to write DA1 response to PTY: {}", .{err});
+                };
+                log.debug("Sent DA1 response to PTY {} (all_responded={}, timed_out={})", .{
+                    pty_instance.id,
+                    all_responded,
+                    da1_timed_out,
+                });
+            }
         }
     }
 

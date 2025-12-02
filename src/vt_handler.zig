@@ -39,6 +39,10 @@ pub const Handler = struct {
     color_query_fn: ?*const fn (ctx: ?*anyopaque, target: osc_color.Target) anyerror!void = null,
     color_query_ctx: ?*anyopaque = null,
 
+    /// Optional callback for DA1 (primary device attributes) query
+    da1_fn: ?*const fn (ctx: ?*anyopaque) anyerror!void = null,
+    da1_ctx: ?*anyopaque = null,
+
     pub fn init(terminal: *Terminal) Handler {
         return .{
             .terminal = terminal,
@@ -87,6 +91,16 @@ pub const Handler = struct {
     ) void {
         self.color_query_ctx = ctx;
         self.color_query_fn = color_query_fn;
+    }
+
+    /// Set the callback for DA1 (primary device attributes) query
+    pub fn setDa1Callback(
+        self: *Handler,
+        ctx: ?*anyopaque,
+        da1_fn: *const fn (ctx: ?*anyopaque) anyerror!void,
+    ) void {
+        self.da1_ctx = ctx;
+        self.da1_fn = da1_fn;
     }
 
     /// Write data back to the PTY (if callback is set)
@@ -291,11 +305,14 @@ pub const Handler = struct {
     fn handleDeviceAttributes(self: *Handler, value: anytype) !void {
         switch (value) {
             .primary => {
-                // Primary DA (CSI c) - report as VT100 with advanced video option
-                // ESC [ ? 1 ; 2 c
-                // 1 = 132 columns
-                // 2 = printer port
-                try self.write("\x1b[?1;2c");
+                // Primary DA (CSI c) - if callback is set, defer the response
+                // to allow color queries to be answered first
+                if (self.da1_fn) |func| {
+                    try func(self.da1_ctx);
+                } else {
+                    // No callback, respond immediately
+                    try self.write("\x1b[?1;2c");
+                }
             },
             .secondary => {
                 // Secondary DA (CSI > c) - report terminal type and version

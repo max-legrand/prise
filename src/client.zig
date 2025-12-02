@@ -210,6 +210,19 @@ pub const ServerAction = union(enum) {
     attached: i64,
     pty_exited: struct { pty_id: u32, status: u32 },
     detached,
+    color_query: ColorQueryTarget,
+
+    pub const ColorQueryTarget = struct {
+        pty_id: u32,
+        target: Target,
+
+        pub const Target = union(enum) {
+            palette: u8,
+            foreground,
+            background,
+            cursor,
+        };
+    };
 };
 
 pub const PipeAction = union(enum) {
@@ -328,7 +341,54 @@ pub const ClientLogic = struct {
             return parsePtyExited(notif.params);
         } else if (std.mem.eql(u8, notif.method, "cwd_changed")) {
             try handleCwdChanged(state, notif.params);
+        } else if (std.mem.eql(u8, notif.method, "color_query")) {
+            return parseColorQuery(notif.params);
         }
+        return .none;
+    }
+
+    fn parseColorQuery(params: msgpack.Value) ServerAction {
+        if (params != .map) return .none;
+
+        var pty_id: ?u32 = null;
+        var index: ?u8 = null;
+        var kind: ?[]const u8 = null;
+
+        for (params.map) |kv| {
+            if (kv.key != .string) continue;
+            if (std.mem.eql(u8, kv.key.string, "pty_id")) {
+                pty_id = switch (kv.value) {
+                    .integer => |i| @intCast(i),
+                    .unsigned => |u| @intCast(u),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "index")) {
+                index = switch (kv.value) {
+                    .integer => |i| @intCast(i),
+                    .unsigned => |u| @intCast(u),
+                    else => null,
+                };
+            } else if (std.mem.eql(u8, kv.key.string, "kind")) {
+                kind = if (kv.value == .string) kv.value.string else null;
+            }
+        }
+
+        const pid = pty_id orelse return .none;
+
+        if (index) |idx| {
+            return .{ .color_query = .{ .pty_id = pid, .target = .{ .palette = idx } } };
+        } else if (kind) |k| {
+            const target: ServerAction.ColorQueryTarget.Target = if (std.mem.eql(u8, k, "foreground"))
+                .foreground
+            else if (std.mem.eql(u8, k, "background"))
+                .background
+            else if (std.mem.eql(u8, k, "cursor"))
+                .cursor
+            else
+                return .none;
+            return .{ .color_query = .{ .pty_id = pid, .target = target } };
+        }
+
         return .none;
     }
 
@@ -524,10 +584,19 @@ pub const App = struct {
 
     paste_buffer: ?std.ArrayList(u8) = null,
 
+    // Pending color queries from server (pty_id -> list of targets)
+    pending_color_queries: std.ArrayList(PendingColorQuery) = undefined,
+
+    pub const PendingColorQuery = struct {
+        pty_id: u32,
+        target: ServerAction.ColorQueryTarget.Target,
+    };
+
     pub const TerminalColors = struct {
         fg: ?vaxis.Cell.Color = null,
         bg: ?vaxis.Cell.Color = null,
-        palette: [16]?vaxis.Cell.Color = .{null} ** 16,
+        cursor: ?vaxis.Cell.Color = null,
+        palette: [256]?vaxis.Cell.Color = .{null} ** 256,
 
         pub fn isDark(rgb: [3]u8) bool {
             const r: u32 = rgb[0];
@@ -576,6 +645,7 @@ pub const App = struct {
             .surfaces = std.AutoHashMap(u32, *Surface).init(allocator),
             .state = ClientState.init(allocator),
             .pending_attach_cwd = std.AutoHashMap(u32, []const u8).init(allocator),
+            .pending_color_queries = .empty,
         };
         app.tty = try vaxis.Tty.init(&app.tty_buffer);
         // parser doesn't need init? assuming default init is fine or init(&allocator)
@@ -650,6 +720,7 @@ pub const App = struct {
             self.allocator.free(cwd.*);
         }
         self.pending_attach_cwd.deinit();
+        self.pending_color_queries.deinit(self.allocator);
         if (self.hit_regions.len > 0) self.allocator.free(self.hit_regions);
         if (self.split_handles.len > 0) self.allocator.free(self.split_handles);
         self.vx.deinit(self.allocator, self.tty.writer());
@@ -703,6 +774,7 @@ pub const App = struct {
         // Query colors
         try self.vx.queryColor(self.tty.writer(), .fg);
         try self.vx.queryColor(self.tty.writer(), .bg);
+        try self.vx.queryColor(self.tty.writer(), .cursor);
         for (0..16) |i| {
             try self.vx.queryColor(self.tty.writer(), .{ .index = @intCast(i) });
         }
@@ -1138,11 +1210,11 @@ pub const App = struct {
                 switch (report.kind) {
                     .fg => self.colors.fg = color,
                     .bg => self.colors.bg = color,
-                    .index => |idx| if (idx < 16) {
-                        self.colors.palette[idx] = color;
-                    },
-                    else => {},
+                    .cursor => self.colors.cursor = color,
+                    .index => |idx| self.colors.palette[idx] = color,
                 }
+                // Check if this satisfies a pending color query
+                self.processPendingColorQueries(report.kind);
             },
 
             else => {},
@@ -1198,6 +1270,105 @@ pub const App = struct {
 
         try self.sendDirect(msg);
         log.info("Sent resize request id={} for pty={} to {}x{} ({}x{}px)", .{ msgid, pty_id, cols, rows, width_px, height_px });
+    }
+
+    fn handleColorQuery(self: *App, query: ServerAction.ColorQueryTarget) !void {
+        log.debug("handleColorQuery: pty={} target={any}", .{ query.pty_id, query.target });
+
+        // Check if we have the color cached
+        const cached_color: ?vaxis.Cell.Color = switch (query.target) {
+            .foreground => self.colors.fg,
+            .background => self.colors.bg,
+            .cursor => self.colors.cursor,
+            .palette => |idx| self.colors.palette[idx],
+        };
+
+        if (cached_color) |color| {
+            // Send response immediately
+            try self.sendColorResponse(query.pty_id, query.target, color);
+        } else {
+            // Queue for later when we get the color_report
+            try self.pending_color_queries.append(self.allocator, .{ .pty_id = query.pty_id, .target = query.target });
+
+            // Query the terminal for this color
+            switch (query.target) {
+                .foreground => try self.vx.queryColor(self.tty.writer(), .fg),
+                .background => try self.vx.queryColor(self.tty.writer(), .bg),
+                .cursor => try self.vx.queryColor(self.tty.writer(), .cursor),
+                .palette => |idx| try self.vx.queryColor(self.tty.writer(), .{ .index = idx }),
+            }
+        }
+    }
+
+    fn processPendingColorQueries(self: *App, kind: vaxis.Color.Kind) void {
+        // Find and remove any pending queries that match this color kind
+        var i: usize = 0;
+        while (i < self.pending_color_queries.items.len) {
+            const pending = self.pending_color_queries.items[i];
+            const matches = switch (pending.target) {
+                .foreground => kind == .fg,
+                .background => kind == .bg,
+                .cursor => kind == .cursor,
+                .palette => |idx| if (kind == .index) kind.index == idx else false,
+            };
+
+            if (matches) {
+                // Get the cached color (should be set now)
+                const color: ?vaxis.Cell.Color = switch (pending.target) {
+                    .foreground => self.colors.fg,
+                    .background => self.colors.bg,
+                    .cursor => self.colors.cursor,
+                    .palette => |idx| self.colors.palette[idx],
+                };
+
+                if (color) |c| {
+                    self.sendColorResponse(pending.pty_id, pending.target, c) catch |err| {
+                        log.err("Failed to send color response: {}", .{err});
+                    };
+                }
+
+                _ = self.pending_color_queries.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn sendColorResponse(self: *App, pty_id: u32, target: ServerAction.ColorQueryTarget.Target, color: vaxis.Cell.Color) !void {
+        const rgb = color.rgb;
+        log.debug("sendColorResponse: pty={} target={any} color=#{x:0>2}{x:0>2}{x:0>2}", .{ pty_id, target, rgb[0], rgb[1], rgb[2] });
+
+        // Build the color_response notification
+        // Format: [2, "color_response", {pty_id: N, r: R, g: G, b: B, index: M}] or
+        //         [2, "color_response", {pty_id: N, r: R, g: G, b: B, kind: "foreground"}]
+        var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, 5);
+        defer self.allocator.free(map_items);
+
+        map_items[0] = .{ .key = .{ .string = "pty_id" }, .value = .{ .unsigned = pty_id } };
+        map_items[1] = .{ .key = .{ .string = "r" }, .value = .{ .unsigned = rgb[0] } };
+        map_items[2] = .{ .key = .{ .string = "g" }, .value = .{ .unsigned = rgb[1] } };
+        map_items[3] = .{ .key = .{ .string = "b" }, .value = .{ .unsigned = rgb[2] } };
+
+        switch (target) {
+            .palette => |idx| {
+                map_items[4] = .{ .key = .{ .string = "index" }, .value = .{ .unsigned = idx } };
+            },
+            .foreground => {
+                map_items[4] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "foreground" } };
+            },
+            .background => {
+                map_items[4] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "background" } };
+            },
+            .cursor => {
+                map_items[4] = .{ .key = .{ .string = "kind" }, .value = .{ .string = "cursor" } };
+            },
+        }
+
+        const params = msgpack.Value{ .map = map_items };
+        const msg_bytes = try msgpack.encode(self.allocator, .{ 2, "color_response", params });
+        defer self.allocator.free(msg_bytes);
+
+        try self.sendDirect(msg_bytes);
     }
 
     pub fn handleRedraw(self: *App, params: msgpack.Value) !void {
@@ -2010,6 +2181,9 @@ pub const App = struct {
                                 // Wake up TTY thread so it can exit
                                 app.vx.deviceStatusReport(app.tty.writer()) catch {};
                                 return;
+                            },
+                            .color_query => |query| {
+                                try app.handleColorQuery(query);
                             },
                             .none => {},
                         }
