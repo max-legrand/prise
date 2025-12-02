@@ -1887,6 +1887,8 @@ const Server = struct {
     exit_on_idle: bool = false,
     signal_pipe_fds: [2]posix.fd_t,
     signal_buf: [1]u8 = undefined,
+    /// Timestamp (ms since epoch) when server started - used to detect server restarts
+    start_time_ms: i64 = 0,
 
     fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.Winsize, attach: bool, cwd: ?[]const u8, env: ?[]const msgpack.Value } {
         var rows: u16 = 24;
@@ -2339,10 +2341,14 @@ const Server = struct {
     }
 
     fn handleGetServerInfo(self: *Server) !msgpack.Value {
-        const entries = try self.allocator.alloc(msgpack.Value.KeyValue, 1);
+        const entries = try self.allocator.alloc(msgpack.Value.KeyValue, 2);
         entries[0] = .{
             .key = .{ .string = try self.allocator.dupe(u8, "version") },
             .value = .{ .string = try self.allocator.dupe(u8, main.version) },
+        };
+        entries[1] = .{
+            .key = .{ .string = try self.allocator.dupe(u8, "pty_validity") },
+            .value = .{ .integer = self.start_time_ms },
         };
         return .{ .map = entries };
     }
@@ -2932,6 +2938,7 @@ pub fn startServer(allocator: std.mem.Allocator, socket_path: []const u8) !void 
         .clients = std.ArrayList(*Client).empty,
         .ptys = std.AutoHashMap(usize, *Pty).init(allocator),
         .signal_pipe_fds = signal_pipe_fds,
+        .start_time_ms = std.time.milliTimestamp(),
     };
     defer {
         posix.close(signal_pipe_fds[0]);
