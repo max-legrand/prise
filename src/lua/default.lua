@@ -289,13 +289,16 @@ local function update_pty_focus(old_id, new_id)
     end
 end
 
+---Remove a pane by id
 ---@param id number
+---@return boolean was_last True if this was the last pane (app will quit)
 local function remove_pane_by_id(id)
     local new_root, next_focus = remove_pane_recursive(state.root, id)
     state.root = new_root
 
     if not state.root then
         prise.quit()
+        return true
     else
         if state.focused_id == id then
             local old_id = state.focused_id
@@ -309,8 +312,9 @@ local function remove_pane_by_id(id)
             end
             update_pty_focus(old_id, state.focused_id)
         end
+        prise.request_frame()
+        return false
     end
-    prise.request_frame()
 end
 
 ---Count all panes in the tree
@@ -631,7 +635,10 @@ local commands = {
             if path then
                 local pane = path[#path]
                 pane.pty:close()
-                remove_pane_by_id(pane.id)
+                local was_last = remove_pane_by_id(pane.id)
+                if not was_last then
+                    prise.save()
+                end
             end
         end,
     },
@@ -837,7 +844,10 @@ function M.update(event)
                 if path then
                     local pane = path[#path]
                     pane.pty:close()
-                    remove_pane_by_id(pane.id)
+                    local was_last = remove_pane_by_id(pane.id)
+                    if not was_last then
+                        prise.save()
+                    end
                     handled = true
                 end
             elseif k == "q" then
@@ -935,8 +945,10 @@ function M.update(event)
     elseif event.type == "pty_exited" then
         local id = event.data.id
         prise.log.info("Lua: pty_exited " .. id)
-        remove_pane_by_id(id)
-        prise.save() -- Auto-save on pane removed
+        local was_last = remove_pane_by_id(id)
+        if not was_last then
+            prise.save()
+        end
     elseif event.type == "mouse" then
         local d = event.data
         if d.action == "press" and d.button == "left" then

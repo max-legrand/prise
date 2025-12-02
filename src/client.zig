@@ -777,10 +777,13 @@ pub const App = struct {
         self.ui.setQuitCallback(self, struct {
             fn quit(ctx: *anyopaque) void {
                 const app: *App = @ptrCast(@alignCast(ctx));
-                // Delete session file if no PTYs remain
-                if (app.surfaces.count() == 0) {
-                    app.deleteCurrentSession();
+                // Cancel autosave timer before deleting session
+                if (app.autosave_timer) |*task| {
+                    if (app.io_loop) |l| task.cancel(l) catch {};
+                    app.autosave_timer = null;
                 }
+                // Delete session file - Lua only calls quit when all panes are gone
+                app.deleteCurrentSession();
                 app.state.should_quit = true;
                 if (app.connected) {
                     posix.close(app.fd);
@@ -794,6 +797,8 @@ pub const App = struct {
                     if (app.io_loop) |l| task.cancel(l) catch {};
                     app.render_timer = null;
                 }
+                // Wake up TTY thread so it can exit
+                app.vx.deviceStatusReport(app.tty.writer()) catch {};
             }
         }.quit);
 
@@ -2324,17 +2329,18 @@ pub const App = struct {
                             },
                             .pty_exited => |info| {
                                 log.info("PTY {} exited with status {}", .{ info.pty_id, info.status });
-                                app.ui.update(.{ .pty_exited = .{ .id = info.pty_id, .status = info.status } }) catch |err| {
-                                    log.err("Failed to update UI with pty_exited: {}", .{err});
-                                };
-                                // Clean up the surface for this PTY
+                                // Clean up the surface for this PTY BEFORE updating UI
+                                // so that surfaces.count() is correct when quit callback runs
                                 if (app.surfaces.fetchRemove(info.pty_id)) |entry| {
                                     log.info("Cleaning up surface for exited PTY {}", .{info.pty_id});
                                     entry.value.deinit();
                                     app.allocator.destroy(entry.value);
                                 }
-                                // Delete session file when last PTY exits
-                                if (app.surfaces.count() == 0) {
+                                app.ui.update(.{ .pty_exited = .{ .id = info.pty_id, .status = info.status } }) catch |err| {
+                                    log.err("Failed to update UI with pty_exited: {}", .{err});
+                                };
+                                // Delete session file when last PTY exits (if quit wasn't already called)
+                                if (app.surfaces.count() == 0 and !app.state.should_quit) {
                                     app.deleteCurrentSession();
                                 }
                             },
