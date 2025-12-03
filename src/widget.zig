@@ -277,8 +277,8 @@ pub const Widget = struct {
                     // Recurse first
                     try child.collectSplitHandlesRecursive(allocator, handles, abs_x, abs_y);
 
-                    // Add handle after this child (except for last child)
-                    if (i < row.children.len - 1) {
+                    // Add handle after this child (except for last child), only if resizable
+                    if (row.resizable and i < row.children.len - 1) {
                         try handles.append(allocator, .{
                             .parent_id = self.id,
                             .child_index = @intCast(i),
@@ -298,8 +298,8 @@ pub const Widget = struct {
                     // Recurse first
                     try child.collectSplitHandlesRecursive(allocator, handles, abs_x, abs_y);
 
-                    // Add handle after this child (except for last child)
-                    if (i < col.children.len - 1) {
+                    // Add handle after this child (except for last child), only if resizable
+                    if (col.resizable and i < col.children.len - 1) {
                         try handles.append(allocator, .{
                             .parent_id = self.id,
                             .child_index = @intCast(i),
@@ -382,11 +382,13 @@ pub const CrossAxisAlignment = enum {
 pub const Column = struct {
     children: []Widget,
     cross_axis_align: CrossAxisAlignment = .center,
+    resizable: bool = false,
 };
 
 pub const Row = struct {
     children: []Widget,
     cross_axis_align: CrossAxisAlignment = .center,
+    resizable: bool = false,
 };
 
 pub const Stack = struct {
@@ -931,9 +933,17 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
         }
         lua.pop(1);
 
+        var resizable = false;
+        _ = lua.getField(index, "resizable");
+        if (lua.typeOf(-1) == .boolean) {
+            resizable = lua.toBoolean(-1);
+        }
+        lua.pop(1);
+
         return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .column = .{
             .children = try children.toOwnedSlice(allocator),
             .cross_axis_align = cross_align,
+            .resizable = resizable,
         } } };
     } else if (std.mem.eql(u8, widget_type, "row")) {
         _ = lua.getField(index, "children");
@@ -969,9 +979,17 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
         }
         lua.pop(1);
 
+        var resizable = false;
+        _ = lua.getField(index, "resizable");
+        if (lua.typeOf(-1) == .boolean) {
+            resizable = lua.toBoolean(-1);
+        }
+        lua.pop(1);
+
         return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .row = .{
             .children = try children.toOwnedSlice(allocator),
             .cross_axis_align = cross_align,
+            .resizable = resizable,
         } } };
     } else if (std.mem.eql(u8, widget_type, "text")) {
         _ = lua.getField(index, "content");

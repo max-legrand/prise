@@ -1421,6 +1421,7 @@ local function render_node(node, force_unfocused)
             ratio = node.ratio,
             id = node.split_id,
             cross_axis_align = "stretch",
+            resizable = true,
         }
 
         if node.direction == "row" then

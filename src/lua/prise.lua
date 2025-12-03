@@ -18,6 +18,7 @@
 ---@field ratio? number
 ---@field id? string|number
 ---@field cross_axis_align? string
+---@field resizable? boolean
 ---@field show_cursor? boolean
 
 ---@class PositionedOpts
@@ -123,6 +124,7 @@ function M.Column(opts)
         ratio = opts.ratio,
         id = opts.id,
         cross_axis_align = opts.cross_axis_align,
+        resizable = opts.resizable,
         show_cursor = opts.show_cursor,
     }
 end
@@ -145,6 +147,7 @@ function M.Row(opts)
         ratio = opts.ratio,
         id = opts.id,
         cross_axis_align = opts.cross_axis_align,
+        resizable = opts.resizable,
         show_cursor = opts.show_cursor,
     }
 end
