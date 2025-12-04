@@ -794,20 +794,18 @@ pub const App = struct {
     pub fn setup(self: *App, loop: *io.Loop) !void {
         self.io_loop = loop;
         self.ui.setLoop(loop);
-        self.ui.setQuitCallback(self, struct {
-            fn quit(ctx: *anyopaque) void {
+
+        // Exit callback - for when last PTY exits (delete session, don't save)
+        self.ui.setExitCallback(self, struct {
+            fn exitCb(ctx: *anyopaque) void {
                 const app: *App = @ptrCast(@alignCast(ctx));
-                // Cancel autosave timer before final save
+                // Cancel autosave timer
                 if (app.autosave_timer) |*task| {
                     if (app.io_loop) |l| task.cancel(l) catch {};
                     app.autosave_timer = null;
                 }
-                // Save session on quit; deletion is handled when last PTY exits
-                if (app.current_session_name) |name| {
-                    app.saveSession(name) catch |err| {
-                        log.warn("Failed to save session on quit: {}", .{err});
-                    };
-                }
+                // Delete session (it's empty)
+                app.deleteCurrentSession();
                 app.state.should_quit = true;
                 if (app.connected) {
                     posix.close(app.fd);
@@ -824,7 +822,7 @@ pub const App = struct {
                 // Wake up TTY thread so it can exit
                 app.vx.deviceStatusReport(app.tty.writer()) catch {};
             }
-        }.quit);
+        }.exitCb);
 
         try self.vx.enterAltScreen(self.tty.writer());
 

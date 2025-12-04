@@ -585,7 +585,7 @@ local function remove_pane_by_id(id)
         -- Tab is now empty, remove it
         if #state.tabs == 1 then
             table.remove(state.tabs, tab_idx)
-            prise.quit()
+            prise.exit()
             return true
         else
             local old_focused = state.focused_id
@@ -1037,7 +1037,7 @@ local commands = {
         name = "Quit",
         shortcut = key_prefix .. " q",
         action = function()
-            prise.quit()
+            prise.detach()
         end,
     },
     {

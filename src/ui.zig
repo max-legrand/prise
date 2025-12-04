@@ -68,8 +68,8 @@ pub const UI = struct {
     allocator: std.mem.Allocator,
     lua: *ziglua.Lua,
     loop: ?*io.Loop = null,
-    quit_callback: ?*const fn (ctx: *anyopaque) void = null,
-    quit_ctx: *anyopaque = undefined,
+    exit_callback: ?*const fn (ctx: *anyopaque) void = null,
+    exit_ctx: *anyopaque = undefined,
     spawn_callback: ?*const fn (ctx: *anyopaque, opts: SpawnOptions) anyerror!void = null,
     spawn_ctx: *anyopaque = undefined,
     redraw_callback: ?*const fn (ctx: *anyopaque) void = null,
@@ -199,9 +199,9 @@ pub const UI = struct {
         self.lua.setField(ziglua.registry_index, "prise_ui_ptr");
     }
 
-    pub fn setQuitCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
-        self.quit_ctx = ctx;
-        self.quit_callback = cb;
+    pub fn setExitCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
+        self.exit_ctx = ctx;
+        self.exit_callback = cb;
     }
 
     pub fn setSpawnCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, opts: SpawnOptions) anyerror!void) void {
@@ -314,9 +314,9 @@ pub const UI = struct {
         lua.pushFunction(ziglua.wrap(setTimeout));
         lua.setField(-2, "set_timeout");
 
-        // Register quit
-        lua.pushFunction(ziglua.wrap(quit));
-        lua.setField(-2, "quit");
+        // Register exit (deletes session - for when last PTY exits)
+        lua.pushFunction(ziglua.wrap(exit));
+        lua.setField(-2, "exit");
 
         // Register spawn
         lua.pushFunction(ziglua.wrap(spawn));
@@ -713,7 +713,7 @@ pub const UI = struct {
         return 1;
     }
 
-    fn quit(lua: *ziglua.Lua) i32 {
+    fn exit(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
             lua.pushNil();
@@ -721,8 +721,8 @@ pub const UI = struct {
         };
         lua.pop(1);
 
-        if (ui.quit_callback) |cb| {
-            cb(ui.quit_ctx);
+        if (ui.exit_callback) |cb| {
+            cb(ui.exit_ctx);
         }
         return 0;
     }
