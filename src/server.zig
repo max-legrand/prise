@@ -751,7 +751,13 @@ fn resolveCellText(
             }
             break :blk &[_]u21{};
         },
-        .codepoint_grapheme => grapheme_slice,
+        .codepoint_grapheme => blk: {
+            const base_cp = raw_cell.content.codepoint;
+            const full_cluster = try ctx.temp_alloc.alloc(u21, 1 + grapheme_slice.len);
+            full_cluster[0] = base_cp;
+            @memcpy(full_cluster[1..], grapheme_slice);
+            break :blk full_cluster;
+        },
         else => &[_]u21{' '},
     };
     return try encodeGraphemeToUtf8(ctx.temp_alloc, cluster);
