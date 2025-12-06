@@ -96,7 +96,9 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?(?[]const 
     defer args.deinit();
     _ = args.skip();
 
-    const cmd = args.next() orelse return @as(?[]const u8, null);
+    const cmd = args.next() orelse {
+        return @as(?[]const u8, null);
+    };
 
     if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
         try printVersion();
@@ -185,8 +187,38 @@ fn handleSessionCommand(allocator: std.mem.Allocator, args: *std.process.ArgIter
         try printSessionHelp();
         return null;
     } else if (std.mem.eql(u8, subcmd, "attach")) {
-        const session = args.next() orelse try findMostRecentSession(allocator);
-        return @as(?[]const u8, session);
+        if (args.next()) |requested_name| {
+            // Validate session exists and dup since args will be freed
+            const result = getSessionsDir(allocator) catch |err| {
+                if (err == error.NoSessionsFound) {
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "Session '{s}' not found.\n", .{requested_name}) catch return error.SessionNotFound;
+                    std.fs.File.stderr().writeAll(msg) catch {};
+                    return error.SessionNotFound;
+                }
+                return err;
+            };
+            defer allocator.free(result.path);
+            var dir = result.dir;
+            defer dir.close();
+            
+            var filename_buf: [256]u8 = undefined;
+            const filename = std.fmt.bufPrint(&filename_buf, "{s}.json", .{requested_name}) catch {
+                std.fs.File.stderr().writeAll("Session name too long.\n") catch {};
+                return error.NameTooLong;
+            };
+            
+            dir.access(filename, .{}) catch {
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Session '{s}' not found.\n", .{requested_name}) catch return error.SessionNotFound;
+                std.fs.File.stderr().writeAll(msg) catch {};
+                return error.SessionNotFound;
+            };
+            
+            return try allocator.dupe(u8, requested_name);
+        } else {
+            return try findMostRecentSession(allocator);
+        }
     } else if (std.mem.eql(u8, subcmd, "list")) {
         try listSessions(allocator);
         return null;

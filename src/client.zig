@@ -881,6 +881,7 @@ pub const App = struct {
         self.ui.setDetachCallback(self, struct {
             fn detachCb(ctx: *anyopaque, session_name: []const u8) anyerror!void {
                 const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                log.info("detachCb called with session_name='{s}', current_session_name={?s}", .{ session_name, app_ptr.current_session_name });
                 try app_ptr.saveSession(session_name);
 
                 // Build array of PTY IDs to detach
@@ -1536,7 +1537,7 @@ pub const App = struct {
                         };
                     }
                     // Calculate dim factor based on focus
-                    const dim_factor: f32 = if (w.focus) 0.0 else 0.05; // Dim inactive windows by 5%
+                    const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
                     surface.render(win, w.focus, &self.colors, dim_factor);
                 }
             },
@@ -1866,13 +1867,21 @@ pub const App = struct {
         // After receiving server info, proceed with spawn or session attach
         if (self.attach_session) |session_name| {
             // Use the attached session name
-            log.info("Setting current_session_name to: {s}", .{session_name});
+            log.info("onServerInfoReceived: attaching to session '{s}'", .{session_name});
+            if (self.current_session_name) |old| {
+                log.info("onServerInfoReceived: freeing old current_session_name='{s}'", .{old});
+                self.allocator.free(old);
+            }
             self.current_session_name = try self.allocator.dupe(u8, session_name);
+            log.info("onServerInfoReceived: set current_session_name='{s}'", .{self.current_session_name.?});
             try self.startSessionAttach(session_name);
         } else {
             // Generate a new session name for fresh launch
+            if (self.current_session_name) |old| {
+                self.allocator.free(old);
+            }
             self.current_session_name = try self.ui.getNextSessionName();
-            log.info("Starting new session: {s}", .{self.current_session_name.?});
+            log.info("onServerInfoReceived: generated new session name='{s}'", .{self.current_session_name.?});
             try self.spawnInitialPty();
         }
     }
@@ -2582,6 +2591,7 @@ pub const App = struct {
     }
 
     pub fn saveSession(self: *App, name: []const u8) !void {
+        log.info("saveSession called with name='{s}', current_session_name={?s}", .{ name, self.current_session_name });
         const json = try self.ui.getStateJson(&cwdLookup, self);
         defer self.allocator.free(json);
 

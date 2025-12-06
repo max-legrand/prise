@@ -107,6 +107,7 @@ local POWERLINE_SYMBOLS = {
 ---@field status_bar? PriseStatusBarConfig Status bar options
 ---@field tab_bar? PriseTabBarConfig Tab bar options
 ---@field keybinds? PriseKeybinds Keybind configuration
+---@field dim_factor? number Dimming factor for inactive panes (0.0-1.0, default: 0.025)
 
 -- Default configuration
 ---@type PriseConfig
@@ -146,6 +147,7 @@ local config = {
         leader = { key = "k", super = true },
         palette = { key = "p", super = true },
     },
+    dim_factor = 0.025, -- Dim inactive panes by 2.5%
 }
 
 local merge_config = utils.merge_config
@@ -201,6 +203,24 @@ function M.setup(opts)
     if opts then
         merge_config(config, opts)
     end
+    -- Update dim factor in Zig if configured
+    prise.log.debug(
+        "M.setup: dim_factor="
+            .. tostring(config.dim_factor)
+            .. " prise.set_dim_factor="
+            .. tostring(prise.set_dim_factor)
+    )
+    if config.dim_factor and prise.set_dim_factor then
+        prise.log.info("M.setup: calling prise.set_dim_factor(" .. tostring(config.dim_factor) .. ")")
+        local result = prise.set_dim_factor(config.dim_factor)
+        prise.log.info("M.setup: prise.set_dim_factor returned " .. tostring(result))
+    end
+end
+
+---Get the dimming factor for inactive panes
+---@return number
+function M.get_dim_factor()
+    return config.dim_factor or 0.025
 end
 
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
@@ -999,6 +1019,31 @@ end
 -- Platform-dependent key prefix for shortcuts
 local key_prefix = prise.platform == "macos" and "󰘳 +k" or "Super+k"
 
+local function open_rename()
+    if not state.rename.input then
+        state.rename.input = prise.create_text_input()
+    end
+    local current_name = prise.get_session_name() or ""
+    prise.log.debug("open_rename: current_name=" .. current_name)
+    state.rename.input:clear()
+    state.rename.input:insert(current_name)
+    state.rename.visible = true
+    prise.request_frame()
+end
+
+local function close_rename()
+    state.rename.visible = false
+    prise.request_frame()
+end
+
+local function execute_rename()
+    local new_name = state.rename.input:text()
+    if new_name and new_name ~= "" then
+        prise.rename_session(new_name)
+    end
+    close_rename()
+end
+
 ---Command palette commands
 ---@type Command[]
 local commands = {
@@ -1318,34 +1363,19 @@ end
 
 local function execute_selected()
     local filtered = filter_commands(state.palette.input:text())
-    if filtered[state.palette.selected] then
+    local selected_cmd = filtered[state.palette.selected]
+    prise.log.debug(
+        "execute_selected: filtered_count="
+            .. #filtered
+            .. " selected="
+            .. state.palette.selected
+            .. " cmd="
+            .. (selected_cmd and selected_cmd.name or "nil")
+    )
+    if selected_cmd then
         close_palette()
-        filtered[state.palette.selected].action()
+        selected_cmd.action()
     end
-end
-
-local function open_rename()
-    if not state.rename.input then
-        state.rename.input = prise.create_text_input()
-    end
-    local current_name = prise.get_session_name() or ""
-    state.rename.input:clear()
-    state.rename.input:insert(current_name)
-    state.rename.visible = true
-    prise.request_frame()
-end
-
-local function close_rename()
-    state.rename.visible = false
-    prise.request_frame()
-end
-
-local function execute_rename()
-    local new_name = state.rename.input:text()
-    if new_name and new_name ~= "" then
-        prise.rename_session(new_name)
-    end
-    close_rename()
 end
 
 -- --- Main Functions ---
@@ -1461,6 +1491,12 @@ function M.update(event)
                 prise.request_frame()
                 return
             end
+            return
+        end
+
+        -- Open command palette (even when rename is visible)
+        if matches_keybind(event.data, config.keybinds.palette) then
+            open_palette()
             return
         end
 

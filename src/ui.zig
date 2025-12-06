@@ -82,6 +82,7 @@ pub const UI = struct {
     get_session_name_ctx: *anyopaque = undefined,
     rename_session_callback: ?*const fn (ctx: *anyopaque, new_name: []const u8) anyerror!void = null,
     rename_session_ctx: *anyopaque = undefined,
+    dim_factor: f32 = 0.025,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -97,6 +98,22 @@ pub const UI = struct {
         errdefer lua.deinit();
 
         lua.openLibs();
+
+        // Initialize UI struct and register pointer BEFORE running user Lua code (init.lua).
+        // This pointer will be updated in setLoop() to point to the actual app.ui after init returns.
+        // NOTE: We store &ui (stack pointer) temporarily. During init.lua execution, Lua functions
+        // like prise.set_dim_factor() modify this temporary ui struct. When UI.init() returns,
+        // the ui struct is copied by value (with all modifications), so dim_factor changes survive
+        // the stack unwinding. Then setLoop() updates the registry pointer to &app.ui for subsequent
+        // Lua calls.
+        var ui: UI = .{
+            .allocator = allocator,
+            .lua = lua,
+            .text_inputs = std.AutoHashMap(u32, *TextInput).init(allocator),
+        };
+
+        lua.pushLightUserdata(&ui);
+        lua.setField(ziglua.registry_index, "prise_ui_ptr");
 
         // Add prise lua paths to package.path for runtime loading
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
@@ -186,11 +203,7 @@ pub const UI = struct {
         // Initialize TextInput metatable
         registerTextInputMetatable(lua);
 
-        return .{
-            .allocator = allocator,
-            .lua = lua,
-            .text_inputs = std.AutoHashMap(u32, *TextInput).init(allocator),
-        };
+        return ui;
     }
 
     pub fn setLoop(self: *UI, loop: *io.Loop) void {
@@ -349,6 +362,14 @@ pub const UI = struct {
         lua.pushFunction(ziglua.wrap(getSessionName));
         lua.setField(-2, "get_session_name");
 
+        // Register set_dim_factor
+        lua.pushFunction(ziglua.wrap(setDimFactor));
+        lua.setField(-2, "set_dim_factor");
+
+        // Register get_dim_factor
+        lua.pushFunction(ziglua.wrap(getDimFactor));
+        lua.setField(-2, "get_dim_factor");
+
         // Register rename_session
         lua.pushFunction(ziglua.wrap(renameSession));
         lua.setField(-2, "rename_session");
@@ -465,6 +486,7 @@ pub const UI = struct {
     fn getSessionName(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
+            log.warn("getSessionName: failed to get ui pointer", .{});
             lua.pushNil();
             return 1;
         };
@@ -472,11 +494,45 @@ pub const UI = struct {
 
         if (ui.get_session_name_callback) |cb| {
             if (cb(ui.get_session_name_ctx)) |name| {
+                log.info("getSessionName: returning '{s}'", .{name});
                 _ = lua.pushString(name);
                 return 1;
             }
+            log.warn("getSessionName: callback returned null", .{});
+        } else {
+            log.warn("getSessionName: no callback registered", .{});
         }
         lua.pushNil();
+        return 1;
+    }
+
+    fn getDimFactor(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            lua.pushNumber(0.025);
+            return 1;
+        };
+        lua.pop(1);
+
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+        lua.pushNumber(ui.dim_factor);
+        return 1;
+    }
+
+    fn setDimFactor(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            log.warn("setDimFactor: prise_ui_ptr not found in registry", .{});
+            lua.pushBoolean(false);
+            return 1;
+        };
+        lua.pop(1);
+
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+        const dim = lua.toNumber(1) catch 0.025;
+        ui.dim_factor = @floatCast(dim);
+        log.info("setDimFactor: set to {d}", .{ui.dim_factor});
+        lua.pushBoolean(true);
         return 1;
     }
 
@@ -507,12 +563,17 @@ pub const UI = struct {
     fn detach(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
+            log.warn("detach: failed to get ui pointer", .{});
             lua.pushNil();
             return 1;
         };
         lua.pop(1);
 
-        const session_name = lua.toString(1) catch "default";
+        const session_name = lua.toString(1) catch blk: {
+            log.warn("detach: lua.toString(1) failed, using 'default'", .{});
+            break :blk "default";
+        };
+        log.info("detach: called with session_name='{s}'", .{session_name});
 
         if (ui.detach_callback) |cb| {
             cb(ui.detach_ctx, session_name) catch |err| {
