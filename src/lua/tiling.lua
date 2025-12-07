@@ -1328,6 +1328,27 @@ local commands = {
             return #state.tabs >= 10
         end,
     },
+    {
+        name = "Dump Screen",
+        action = function()
+            local pty = get_focused_pty()
+            if pty then
+                local text = pty:dump_screen()
+                if text then
+                    local tmpfile = os.tmpname()
+                    local f = io.open(tmpfile, "w")
+                    if f then
+                        f:write(text)
+                        f:close()
+                        local editor = os.getenv("EDITOR") or "nvim"
+                        local shell = os.getenv("SHELL") or "/bin/sh"
+                        state.pending_new_tab = true
+                        prise.spawn({ cmd = { shell, "-c", editor .. " " .. tmpfile .. "; rm -f " .. tmpfile } })
+                    end
+                end
+            end
+        end,
+    },
 }
 
 ---@param query string

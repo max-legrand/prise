@@ -1927,12 +1927,13 @@ const Server = struct {
     /// Timestamp (ms since epoch) when server started - used to detect server restarts
     start_time_ms: i64 = 0,
 
-    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.Winsize, attach: bool, cwd: ?[]const u8, env: ?[]const msgpack.Value } {
+    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.Winsize, attach: bool, cwd: ?[]const u8, env: ?[]const msgpack.Value, cmd: ?[]const msgpack.Value } {
         var rows: u16 = 24;
         var cols: u16 = 80;
         var attach: bool = false;
         var cwd: ?[]const u8 = null;
         var env: ?[]const msgpack.Value = null;
+        var cmd: ?[]const msgpack.Value = null;
 
         if (params == .map) {
             for (params.map) |kv| {
@@ -1947,6 +1948,8 @@ const Server = struct {
                     cwd = kv.value.string;
                 } else if (std.mem.eql(u8, kv.key.string, "env") and kv.value == .array) {
                     env = kv.value.array;
+                } else if (std.mem.eql(u8, kv.key.string, "cmd") and kv.value == .array) {
+                    cmd = kv.value.array;
                 }
             }
         }
@@ -1961,6 +1964,7 @@ const Server = struct {
             .attach = attach,
             .cwd = cwd,
             .env = env,
+            .cmd = cmd,
         };
     }
 
@@ -2054,7 +2058,7 @@ const Server = struct {
 
         const parsed = parseSpawnPtyParams(params);
         const cwd = parsed.cwd orelse posix.getenv("HOME");
-        log.info("spawn_pty: rows={} cols={} attach={} cwd={?s} has_client_env={}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach, cwd, parsed.env != null });
+        log.info("spawn_pty: rows={} cols={} attach={} cwd={?s} has_client_env={} has_cmd={}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach, cwd, parsed.env != null, parsed.cmd != null });
 
         var shell: []const u8 = "/bin/sh";
         var env_list = std.ArrayList([]const u8).empty;
@@ -2089,7 +2093,19 @@ const Server = struct {
             }
         }
 
-        const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items), cwd);
+        var cmd_list = std.ArrayList([]const u8).empty;
+        defer cmd_list.deinit(self.allocator);
+
+        if (parsed.cmd) |cmd_array| {
+            for (cmd_array) |val| {
+                if (val == .string) {
+                    try cmd_list.append(self.allocator, val.string);
+                }
+            }
+        }
+
+        const argv: []const []const u8 = if (cmd_list.items.len > 0) cmd_list.items else &.{shell};
+        const process = try pty.Process.spawn(self.allocator, parsed.size, argv, @ptrCast(env_list.items), cwd);
 
         const pty_id = self.next_pty_id;
         self.next_pty_id += 1;

@@ -2155,6 +2155,7 @@ pub const App = struct {
                                                 .id = pty_id,
                                                 .surface = surface,
                                                 .app = app,
+                                                .allocator = app.allocator,
                                                 .send_key_fn = struct {
                                                     fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
                                                         const self: *App = @ptrCast(@alignCast(ctx));
@@ -2537,7 +2538,10 @@ pub const App = struct {
             try env_array.append(self.allocator, .{ .string = env_str });
         }
 
-        const num_params: usize = if (opts.cwd != null) 5 else 4;
+        var num_params: usize = 4;
+        if (opts.cwd != null) num_params += 1;
+        if (opts.cmd != null) num_params += 1;
+
         var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, num_params);
         defer self.allocator.free(map_items);
 
@@ -2545,8 +2549,18 @@ pub const App = struct {
         map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = opts.cols } };
         map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = opts.attach } };
         map_items[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
+
+        var idx: usize = 4;
         if (opts.cwd) |cwd| {
-            map_items[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+            map_items[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+            idx += 1;
+        }
+        if (opts.cmd) |cmd| {
+            var cmd_array = try self.allocator.alloc(msgpack.Value, cmd.len);
+            for (cmd, 0..) |arg, i| {
+                cmd_array[i] = .{ .string = arg };
+            }
+            map_items[idx] = .{ .key = .{ .string = "cmd" }, .value = .{ .array = cmd_array } };
         }
 
         const params = msgpack.Value{ .map = map_items };
@@ -2870,6 +2884,7 @@ pub const App = struct {
         return .{
             .surface = surface,
             .app = self,
+            .allocator = self.allocator,
             .send_key_fn = struct {
                 fn sendKey(app_ctx: *anyopaque, pty_id: u32, key: lua_event.KeyData) anyerror!void {
                     const app: *App = @ptrCast(@alignCast(app_ctx));

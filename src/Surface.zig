@@ -636,6 +636,55 @@ pub fn getTitle(self: *Surface) []const u8 {
     return self.title.items;
 }
 
+pub fn dumpScreen(self: *const Surface, allocator: std.mem.Allocator) !?[]const u8 {
+    log.info("dumpScreen: rows={} cols={}", .{ self.rows, self.cols });
+
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+
+    var total_cells: usize = 0;
+    var non_empty_cells: usize = 0;
+    var non_space_cells: usize = 0;
+
+    for (0..self.rows) |row| {
+        const row_start = result.items.len;
+        var last_non_space: usize = row_start;
+        for (0..self.cols) |col| {
+            total_cells += 1;
+            if (self.front.readCell(@intCast(col), @intCast(row))) |cell| {
+                const grapheme = cell.char.grapheme;
+                if (grapheme.len == 0) {
+                    try result.append(allocator, ' ');
+                } else {
+                    non_empty_cells += 1;
+                    if (!std.mem.eql(u8, grapheme, " ")) {
+                        non_space_cells += 1;
+                        last_non_space = result.items.len + grapheme.len;
+                    }
+                    try result.appendSlice(allocator, grapheme);
+                }
+            } else {
+                try result.append(allocator, ' ');
+            }
+        }
+        result.shrinkRetainingCapacity(last_non_space);
+        try result.append(allocator, '\n');
+    }
+
+    log.info("dumpScreen: total={} non_empty={} non_space={} result_len={}", .{ total_cells, non_empty_cells, non_space_cells, result.items.len });
+
+    while (result.items.len > 0 and result.items[result.items.len - 1] == '\n') {
+        _ = result.pop();
+    }
+
+    if (result.items.len == 0) {
+        result.deinit(allocator);
+        return null;
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
 test "Surface - applyRedraw style handling" {
     const testing = std.testing;
 

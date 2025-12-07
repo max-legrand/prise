@@ -15,6 +15,7 @@ pub const PtyAttachInfo = struct {
     id: u32,
     surface: *Surface,
     app: *anyopaque,
+    allocator: std.mem.Allocator,
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
@@ -123,6 +124,7 @@ fn pushPtyAttachEvent(lua: *ziglua.Lua, info: PtyAttachInfo) void {
         .id = info.id,
         .surface = info.surface,
         .app = info.app,
+        .allocator = info.allocator,
         .send_key_fn = info.send_key_fn,
         .send_mouse_fn = info.send_mouse_fn,
         .send_paste_fn = info.send_paste_fn,
@@ -375,6 +377,7 @@ const PtyHandle = struct {
     id: u32,
     surface: *Surface,
     app: *anyopaque,
+    allocator: std.mem.Allocator,
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
@@ -426,6 +429,10 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
         lua.pushFunction(ziglua.wrap(ptyCopySelection));
         return 1;
     }
+    if (std.mem.eql(u8, key, "dump_screen")) {
+        lua.pushFunction(ziglua.wrap(ptyDumpScreen));
+        return 1;
+    }
     return 0;
 }
 
@@ -468,6 +475,25 @@ fn ptyCopySelection(lua: *ziglua.Lua) i32 {
         log.err("Failed to copy selection: {}", .{err});
     };
     return 0;
+}
+
+fn ptyDumpScreen(lua: *ziglua.Lua) i32 {
+    log.info("ptyDumpScreen called", .{});
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    log.info("ptyDumpScreen: surface rows={} cols={}", .{ pty.surface.rows, pty.surface.cols });
+    const text = pty.surface.dumpScreen(pty.allocator) catch |err| {
+        log.err("Failed to dump screen: {}", .{err});
+        lua.pushNil();
+        return 1;
+    };
+    log.info("ptyDumpScreen: text={?}", .{if (text) |t| t.len else null});
+    if (text) |t| {
+        defer pty.allocator.free(t);
+        _ = lua.pushString(t);
+    } else {
+        lua.pushNil();
+    }
+    return 1;
 }
 
 fn ptySendKey(lua: *ziglua.Lua) i32 {
@@ -694,6 +720,7 @@ pub fn pushPtyUserdata(
     id: u32,
     surface: *Surface,
     app: *anyopaque,
+    allocator: std.mem.Allocator,
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
@@ -707,6 +734,7 @@ pub fn pushPtyUserdata(
         .id = id,
         .surface = surface,
         .app = app,
+        .allocator = allocator,
         .send_key_fn = send_key_fn,
         .send_mouse_fn = send_mouse_fn,
         .send_paste_fn = send_paste_fn,

@@ -91,6 +91,7 @@ pub const UI = struct {
         cols: u16,
         attach: bool,
         cwd: ?[]const u8 = null,
+        cmd: ?[]const []const u8 = null,
     };
 
     pub fn init(allocator: std.mem.Allocator) !UI {
@@ -447,6 +448,25 @@ pub const UI = struct {
 
             _ = lua.getField(1, "cwd");
             if (lua.isString(-1)) opts.cwd = lua.toString(-1) catch null;
+            lua.pop(1);
+
+            _ = lua.getField(1, "cmd");
+            if (lua.typeOf(-1) == .table) {
+                const len = lua.rawLen(-1);
+                if (len > 0) {
+                    var cmd_parts = ui.allocator.alloc([]const u8, len) catch {
+                        lua.pop(1);
+                        lua.raiseErrorStr("Failed to allocate cmd array", .{});
+                    };
+                    var i: usize = 0;
+                    while (i < len) : (i += 1) {
+                        _ = lua.rawGetIndex(-1, @intCast(i + 1));
+                        cmd_parts[i] = lua.toString(-1) catch "";
+                        lua.pop(1);
+                    }
+                    opts.cmd = cmd_parts;
+                }
+            }
             lua.pop(1);
 
             cb(ui.spawn_ctx, opts) catch |err| {
@@ -904,6 +924,7 @@ pub const UI = struct {
     pub const PtyLookupResult = struct {
         surface: *Surface,
         app: *anyopaque,
+        allocator: std.mem.Allocator,
         send_key_fn: *const fn (app: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void,
         send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: lua_event.MouseData) anyerror!void,
         send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
@@ -959,7 +980,7 @@ pub const UI = struct {
         const result = lookup_ctx.lookup_fn(lookup_ctx.ctx, id);
 
         if (result) |r| {
-            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.set_focus_fn, r.close_fn, r.cwd_fn, r.copy_selection_fn) catch {
+            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.allocator, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.set_focus_fn, r.close_fn, r.cwd_fn, r.copy_selection_fn) catch {
                 lua.pushNil();
             };
         } else {
