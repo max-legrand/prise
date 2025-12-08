@@ -217,16 +217,9 @@ function M.setup(opts)
     end
 
     -- Update dim factor in Zig if configured
-    prise.log.debug(
-        "M.setup: dim_factor="
-            .. tostring(config.dim_factor)
-            .. " prise.set_dim_factor="
-            .. tostring(prise.set_dim_factor)
-    )
-    if config.dim_factor and prise.set_dim_factor then
-        prise.log.info("M.setup: calling prise.set_dim_factor(" .. tostring(config.dim_factor) .. ")")
-        local result = prise.set_dim_factor(config.dim_factor)
-        prise.log.info("M.setup: prise.set_dim_factor returned " .. tostring(result))
+    if config.dim_factor ~= nil and prise.set_dim_factor then
+        prise.log.debug("M.setup: calling prise.set_dim_factor(" .. tostring(config.dim_factor) .. ")")
+        prise.set_dim_factor(config.dim_factor)
     end
 end
 

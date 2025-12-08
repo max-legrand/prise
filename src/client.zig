@@ -1606,6 +1606,7 @@ pub const App = struct {
                     }
                     // Calculate dim factor based on focus
                     const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                    log.debug("renderWidget surface: pty={} focus={} dim_factor={d}", .{ surf.pty_id, w.focus, dim_factor });
                     surface.render(win, w.focus, &self.colors, dim_factor);
                 }
             },
@@ -1707,16 +1708,6 @@ pub const App = struct {
                 const style = b.style;
 
                 log.debug("render box: w={} h={}", .{ win.width, win.height });
-
-                // Fill the entire box with background color
-                for (0..win.height) |row| {
-                    for (0..win.width) |col| {
-                        win.writeCell(@intCast(col), @intCast(row), .{
-                            .char = .{ .grapheme = " ", .width = 1 },
-                            .style = style,
-                        });
-                    }
-                }
 
                 if (b.border != .none and win.width >= 2 and win.height >= 2) {
                     win.writeCell(0, 0, .{ .char = .{ .grapheme = chars.tl, .width = 1 }, .style = style });

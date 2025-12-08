@@ -102,10 +102,6 @@ pub const UI = struct {
 
         lua.openLibs();
 
-        // NOTE: We do NOT set prise_ui_ptr here. It will be set in setLoop() after UI.init()
-        // returns and the UI struct is in its final location. Any prise.* functions called
-        // during init.lua that need prise_ui_ptr will gracefully fail.
-
         // Add prise lua paths to package.path for runtime loading
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
         _ = try lua.getGlobal("package");
@@ -206,6 +202,19 @@ pub const UI = struct {
         // Store pointer to self in registry for static functions to use
         self.lua.pushLightUserdata(self);
         self.lua.setField(ziglua.registry_index, "prise_ui_ptr");
+
+        // Apply any pending dim_factor that was set during init.lua
+        _ = self.lua.getField(ziglua.registry_index, "_pending_dim_factor");
+        if (self.lua.typeOf(-1) == .number) {
+            const pending_dim = self.lua.toNumber(-1) catch 0.025;
+            log.debug("setLoop: applying pending dim_factor={d}", .{pending_dim});
+            self.dim_factor = @floatCast(pending_dim);
+            self.lua.pop(1);
+            self.lua.pushNil();
+            self.lua.setField(ziglua.registry_index, "_pending_dim_factor");
+        } else {
+            self.lua.pop(1);
+        }
     }
 
     pub fn setExitCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
@@ -554,20 +563,27 @@ pub const UI = struct {
     }
 
     fn setDimFactor(lua: *ziglua.Lua) i32 {
+        const dim: f64 = lua.toNumber(1) catch 0.025;
+
+        // Try to get the UI pointer and set it directly
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui_ptr = lua.toPointer(-1) catch {
-            log.warn("setDimFactor: prise_ui_ptr not found in registry", .{});
-            lua.pushBoolean(false);
-            return 1;
-        };
+        const ui_ptr_result = lua.toPointer(-1);
         lua.pop(1);
 
-        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
-        const dim = lua.toNumber(1) catch 0.025;
-        ui.dim_factor = @floatCast(dim);
-        log.info("setDimFactor: set to {d}", .{ui.dim_factor});
-        lua.pushBoolean(true);
-        return 1;
+        if (ui_ptr_result) |ui_ptr| {
+            const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+            log.debug("setDimFactor: setting dim_factor to {d}", .{dim});
+            ui.dim_factor = @floatCast(dim);
+            lua.pushBoolean(true);
+            return 1;
+        } else |_| {
+            // UI pointer not available yet (we're in init.lua), store the value for later
+            log.debug("setDimFactor: storing pending dim_factor={d}", .{dim});
+            lua.pushNumber(dim);
+            lua.setField(ziglua.registry_index, "_pending_dim_factor");
+            lua.pushBoolean(true);
+            return 1;
+        }
     }
 
     fn renameSession(lua: *ziglua.Lua) i32 {
