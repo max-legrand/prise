@@ -1586,6 +1586,55 @@ pub const App = struct {
         }
     }
 
+    fn applyDimToStyle(self: *App, style: vaxis.Style, dim_factor: f32) vaxis.Style {
+        if (dim_factor == 0.0) return style;
+
+        var dimmed = style;
+
+        // Apply dimming to foreground color
+        if (dimmed.fg != .default) {
+            const fg_rgb = self.resolveColor(dimmed.fg);
+            if (fg_rgb) |rgb| {
+                dimmed.fg = .{ .rgb = TerminalColors.reduceContrast(rgb, dim_factor * 0.5) };
+            }
+        }
+
+        // Apply dimming to background color
+        if (dimmed.bg != .default) {
+            const bg_rgb = self.resolveColor(dimmed.bg);
+            if (bg_rgb) |rgb| {
+                dimmed.bg = .{ .rgb = TerminalColors.reduceContrast(rgb, dim_factor) };
+            }
+        }
+
+        return dimmed;
+    }
+
+    fn resolveColor(self: *App, color: vaxis.Cell.Color) ?[3]u8 {
+        return switch (color) {
+            .rgb => |rgb| rgb,
+            .index => |idx| blk: {
+                if (idx >= 16) break :blk null;
+                if (self.colors.palette[idx]) |c_val| {
+                    break :blk switch (c_val) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+            .default => blk: {
+                if (self.colors.bg) |bg| {
+                    break :blk switch (bg) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+        };
+    }
+
     fn renderWidget(self: *App, w: widget.Widget, win: vaxis.Window) !void {
         switch (w.kind) {
             .surface => |surf| {
@@ -1705,10 +1754,25 @@ pub const App = struct {
             },
             .box => |b| {
                 const chars = b.borderChars();
-                const style = b.style;
+                // Apply dimming to border style if not focused
+                const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                const style = self.applyDimToStyle(b.style, dim_factor);
 
-                log.debug("render box: w={} h={}", .{ win.width, win.height });
+                log.debug("render box: w={} h={} focus={} dim_factor={d}", .{ win.width, win.height, w.focus, dim_factor });
 
+                // Fill background for the entire box area
+                if (style.bg != .default) {
+                    for (0..win.height) |row| {
+                        for (0..win.width) |col| {
+                            win.writeCell(@intCast(col), @intCast(row), .{
+                                .char = .{ .grapheme = " ", .width = 1 },
+                                .style = style,
+                            });
+                        }
+                    }
+                }
+
+                // Render border if not none
                 if (b.border != .none and win.width >= 2 and win.height >= 2) {
                     win.writeCell(0, 0, .{ .char = .{ .grapheme = chars.tl, .width = 1 }, .style = style });
                     win.writeCell(win.width - 1, 0, .{ .char = .{ .grapheme = chars.tr, .width = 1 }, .style = style });

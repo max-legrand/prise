@@ -17,6 +17,7 @@ const logger = std.log.scoped(.lua);
 
 const prise_module = @embedFile("lua/prise.lua");
 const tiling_ui_module = @embedFile("lua/tiling.lua");
+const utils_module = @embedFile("lua/utils.lua");
 const fallback_init = "return require('prise').tiling()";
 
 const TimerContext = struct {
@@ -124,6 +125,10 @@ pub const UI = struct {
         _ = lua.getField(-1, "preload");
         lua.pushFunction(ziglua.wrap(loadPriseModule));
         lua.setField(-2, "prise");
+
+        // Register utils module (always use embedded)
+        lua.pushFunction(ziglua.wrap(loadUtilsModule));
+        lua.setField(-2, "utils");
 
         // Only register embedded tiling UI if not found on disk
         // (preload takes precedence over path, so we check explicitly)
@@ -323,6 +328,14 @@ pub const UI = struct {
         }
 
         return self.allocator.dupe(u8, AMORY_NAMES[0]);
+    }
+
+    fn loadUtilsModule(lua: *ziglua.Lua) i32 {
+        lua.doString(utils_module) catch {
+            lua.pushNil();
+            return 1;
+        };
+        return 1;
     }
 
     fn loadTilingUiModule(lua: *ziglua.Lua) i32 {

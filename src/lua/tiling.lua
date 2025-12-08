@@ -2213,10 +2213,12 @@ local function build_palette()
     return prise.Positioned({
         anchor = "top_center",
         y = state.palette.palette_y,
+        focus = true,
         child = prise.Box({
             border = "none",
             max_width = PALETTE_WIDTH,
             style = palette_style,
+            focus = true,
             child = prise.Padding({
                 top = 1,
                 bottom = 1,
@@ -2228,6 +2230,7 @@ local function build_palette()
                         prise.TextInput({
                             input = state.palette.input,
                             style = input_style,
+                            focus = true,
                         }),
                         prise.Text({ text = string.rep("─", PALETTE_WIDTH), style = { fg = THEME.bg3 } }),
                         prise.List({
@@ -2257,10 +2260,12 @@ local function build_rename()
     return prise.Positioned({
         anchor = "top_center",
         y = 5,
+        focus = true,
         child = prise.Box({
             border = "none",
             max_width = PALETTE_WIDTH,
             style = palette_style,
+            focus = true,
             child = prise.Padding({
                 top = 1,
                 bottom = 1,
@@ -2273,6 +2278,7 @@ local function build_rename()
                         prise.TextInput({
                             input = state.rename.input,
                             style = input_style,
+                            focus = true,
                         }),
                     },
                 }),
@@ -2294,10 +2300,12 @@ local function build_rename_tab()
     return prise.Positioned({
         anchor = "top_center",
         y = 5,
+        focus = true,
         child = prise.Box({
             border = "none",
             max_width = PALETTE_WIDTH,
             style = palette_style,
+            focus = true,
             child = prise.Padding({
                 top = 1,
                 bottom = 1,
@@ -2310,6 +2318,7 @@ local function build_rename_tab()
                         prise.TextInput({
                             input = state.rename_tab.input,
                             style = input_style,
+                            focus = true,
                         }),
                     },
                 }),
@@ -2367,10 +2376,12 @@ local function build_session_picker()
     return prise.Positioned({
         anchor = "top_center",
         y = 5,
+        focus = true,
         child = prise.Box({
             border = "none",
             max_width = PALETTE_WIDTH,
             style = palette_style,
+            focus = true,
             child = prise.Padding({
                 top = 1,
                 bottom = 1,
@@ -2383,6 +2394,7 @@ local function build_session_picker()
                         prise.TextInput({
                             input = state.session_picker.input,
                             style = input_style,
+                            focus = true,
                         }),
                         prise.Text({ text = string.rep("─", PALETTE_WIDTH), style = { fg = THEME.bg3 } }),
                         prise.List({
