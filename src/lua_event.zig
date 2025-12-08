@@ -436,8 +436,15 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
     return 0;
 }
 
+fn getPtyHandle(lua: *ziglua.Lua) ?*PtyHandle {
+    return lua.toUserdata(PtyHandle, 1) catch {
+        log.err("getPtyHandle: failed to get PtyHandle userdata", .{});
+        return null;
+    };
+}
+
 fn ptySize(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     lua.createTable(0, 2);
     lua.pushInteger(@intCast(pty.surface.rows));
     lua.setField(-2, "rows");
@@ -447,20 +454,20 @@ fn ptySize(lua: *ziglua.Lua) i32 {
 }
 
 fn ptyTitle(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     const title = pty.surface.getTitle();
     _ = lua.pushString(title);
     return 1;
 }
 
 fn ptyId(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     lua.pushInteger(@intCast(pty.id));
     return 1;
 }
 
 fn ptyCwd(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     if (pty.cwd_fn(pty.app, pty.id)) |cwd| {
         _ = lua.pushString(cwd);
     } else {
@@ -470,7 +477,7 @@ fn ptyCwd(lua: *ziglua.Lua) i32 {
 }
 
 fn ptyCopySelection(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     pty.copy_selection_fn(pty.app, pty.id) catch |err| {
         log.err("Failed to copy selection: {}", .{err});
     };
@@ -479,7 +486,7 @@ fn ptyCopySelection(lua: *ziglua.Lua) i32 {
 
 fn ptyDumpScreen(lua: *ziglua.Lua) i32 {
     log.info("ptyDumpScreen called", .{});
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     log.info("ptyDumpScreen: surface rows={} cols={}", .{ pty.surface.rows, pty.surface.cols });
     const text = pty.surface.dumpScreen(pty.allocator) catch |err| {
         log.err("Failed to dump screen: {}", .{err});
@@ -497,7 +504,7 @@ fn ptyDumpScreen(lua: *ziglua.Lua) i32 {
 }
 
 fn ptySendKey(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     lua.checkType(2, .table);
 
     _ = lua.getField(2, "key");
@@ -542,7 +549,7 @@ fn ptySendKey(lua: *ziglua.Lua) i32 {
 }
 
 fn ptySendMouse(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     lua.checkType(2, .table);
 
     _ = lua.getField(2, "x");
@@ -597,7 +604,7 @@ fn ptySendMouse(lua: *ziglua.Lua) i32 {
 }
 
 fn ptySendPaste(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     const data = lua.toString(2) catch {
         lua.raiseErrorStr("Expected string for paste data", .{});
     };
@@ -608,7 +615,7 @@ fn ptySendPaste(lua: *ziglua.Lua) i32 {
 }
 
 fn ptySetFocus(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     const focused = lua.toBoolean(2);
     pty.set_focus_fn(pty.app, pty.id, focused) catch |err| {
         lua.raiseErrorStr("Failed to set focus: %s", .{@errorName(err).ptr});
@@ -617,7 +624,7 @@ fn ptySetFocus(lua: *ziglua.Lua) i32 {
 }
 
 fn ptyClose(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     pty.close_fn(pty.app, pty.id) catch |err| {
         lua.raiseErrorStr("Failed to close pty: %s", .{@errorName(err).ptr});
     };

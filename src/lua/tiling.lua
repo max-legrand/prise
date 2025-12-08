@@ -94,6 +94,9 @@ local POWERLINE_SYMBOLS = {
 ---@class PriseKeybinds
 ---@field leader? PriseKeybind Key to enter command mode (default: super+k)
 ---@field palette? PriseKeybind Key to open command palette (default: super+p)
+---@field rename_session? PriseKeybind Key to rename current session (default: none)
+---@field dump_screen? PriseKeybind Key to dump current pane screen (default: none)
+---@field swap_session? PriseKeybind Key to swap/switch session (default: none)
 
 ---@class PriseBordersConfig
 ---@field enabled? boolean Show pane borders (default: false)
@@ -212,6 +215,7 @@ function M.setup(opts)
     if opts then
         merge_config(config, opts)
     end
+
     -- Update dim factor in Zig if configured
     prise.log.debug(
         "M.setup: dim_factor="
@@ -1244,6 +1248,7 @@ local commands = {
     },
     {
         name = "Rename Session",
+        shortcut = key_prefix .. " R",
         action = function()
             open_rename()
         end,
@@ -1392,20 +1397,24 @@ local commands = {
     },
     {
         name = "Dump Screen",
+        shortcut = key_prefix .. " D",
         action = function()
             local pty = get_focused_pty()
             if pty then
                 local text = pty:dump_screen()
-                if text then
+                if text and text ~= "" then
                     local tmpfile = os.tmpname()
                     local f = io.open(tmpfile, "w")
                     if f then
                         f:write(text)
                         f:close()
                         local editor = os.getenv("EDITOR") or "nvim"
-                        local shell = os.getenv("SHELL") or "/bin/sh"
+                        -- Spawn in new tab with shell that runs editor
                         state.pending_new_tab = true
-                        prise.spawn({ cmd = { shell, "-c", editor .. " " .. tmpfile .. "; rm -f " .. tmpfile } })
+                        prise.spawn({
+                            cmd = { editor, tmpfile },
+                            cwd = pty:cwd(),
+                        })
                     end
                 end
             end
@@ -1431,11 +1440,19 @@ end
 local function open_palette()
     if not state.palette.input then
         state.palette.input = prise.create_text_input()
+        if not state.palette.input then
+            prise.log.error("open_palette: failed to create text input")
+            return
+        end
     end
     state.palette.visible = true
     state.palette.selected = 1
     state.palette.scroll_offset = 0
-    state.palette.input:clear()
+    if state.palette.input then
+        pcall(function()
+            state.palette.input:clear()
+        end)
+    end
     prise.request_frame()
 end
 
@@ -1457,7 +1474,9 @@ local function execute_selected()
     )
     if selected_cmd then
         close_palette()
-        selected_cmd.action()
+        if selected_cmd.action then
+            selected_cmd.action()
+        end
     end
 end
 
@@ -1629,6 +1648,7 @@ function M.update(event)
 
         -- Open command palette
         if matches_keybind(event.data, config.keybinds.palette) then
+            prise.log.info("PALETTE KEYBIND MATCHED")
             open_palette()
             return
         end
@@ -1795,6 +1815,32 @@ function M.update(event)
             elseif k == "S" then
                 -- Switch session
                 open_session_picker()
+                handled = true
+            elseif k == "R" then
+                -- Rename session
+                open_rename()
+                handled = true
+            elseif k == "D" then
+                -- Dump screen
+                local pty = get_focused_pty()
+                if pty then
+                    local text = pty:dump_screen()
+                    if text and text ~= "" then
+                        local tmpfile = os.tmpname()
+                        local f = io.open(tmpfile, "w")
+                        if f then
+                            f:write(text)
+                            f:close()
+                            local editor = os.getenv("EDITOR") or "nvim"
+                            -- Spawn in new tab with shell that runs editor
+                            state.pending_new_tab = true
+                            prise.spawn({
+                                cmd = { editor, tmpfile },
+                                cwd = pty:cwd(),
+                            })
+                        end
+                    end
+                end
                 handled = true
             elseif k == "Enter" or k == "\r" or k == "\n" then
                 local pty = get_focused_pty()
@@ -2124,7 +2170,16 @@ local function build_palette()
         return nil
     end
 
-    local text = state.palette.input:text()
+    local text
+    local ok, result = pcall(function()
+        return state.palette.input:text()
+    end)
+    if not ok or not result then
+        prise.log.error("build_palette: failed to get input text: " .. tostring(result))
+        state.palette.regions = {}
+        return nil
+    end
+    text = result
     prise.log.debug("build_palette: text='" .. text .. "'")
     local filtered = filter_commands(text)
     local has_commands = #filtered > 0

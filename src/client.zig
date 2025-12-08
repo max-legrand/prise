@@ -1806,20 +1806,16 @@ pub const App = struct {
             const now = std.time.milliTimestamp();
             const FRAME_TIME = 8;
 
-            if (now - self.last_render_time >= FRAME_TIME) {
-                try self.render();
-            } else if (self.render_timer == null) {
+            // Always schedule through a timer to avoid reentrancy from Lua callbacks
+            if (self.render_timer == null) {
                 const delay = FRAME_TIME - (now - self.last_render_time);
-                // Make sure delay is positive
+                // Make sure delay is positive (minimum 0ms)
                 const safe_delay = if (delay < 0) 0 else delay;
                 self.render_timer = try loop.timeout(@as(u64, @intCast(safe_delay)) * std.time.ns_per_ms, .{
                     .ptr = self,
                     .cb = onRenderTimer,
                 });
             }
-        } else {
-            // Fallback if no loop (e.g. during tests or init)
-            try self.render();
         }
     }
 
@@ -2771,17 +2767,18 @@ pub const App = struct {
 
         // Build arguments for exec
         const target_z = try self.allocator.dupeZ(u8, target_session);
-        const args = [_:null]?[*:0]const u8{
+        const args = [_]?[*:0]const u8{
             "prise",
             "session",
             "attach",
             target_z,
+            null,
         };
 
         log.info("Exec'ing prise session attach '{s}'", .{target_session});
 
         // Use execvpeZ with current environment
-        const err = posix.execvpeZ("prise", &args, @ptrCast(std.c.environ));
+        const err = posix.execvpeZ("prise", @ptrCast(&args), @ptrCast(std.c.environ));
         log.err("Failed to exec prise: {}", .{err});
     }
 

@@ -102,21 +102,9 @@ pub const UI = struct {
 
         lua.openLibs();
 
-        // Initialize UI struct and register pointer BEFORE running user Lua code (init.lua).
-        // This pointer will be updated in setLoop() to point to the actual app.ui after init returns.
-        // NOTE: We store &ui (stack pointer) temporarily. During init.lua execution, Lua functions
-        // like prise.set_dim_factor() modify this temporary ui struct. When UI.init() returns,
-        // the ui struct is copied by value (with all modifications), so dim_factor changes survive
-        // the stack unwinding. Then setLoop() updates the registry pointer to &app.ui for subsequent
-        // Lua calls.
-        var ui: UI = .{
-            .allocator = allocator,
-            .lua = lua,
-            .text_inputs = std.AutoHashMap(u32, *TextInput).init(allocator),
-        };
-
-        lua.pushLightUserdata(&ui);
-        lua.setField(ziglua.registry_index, "prise_ui_ptr");
+        // NOTE: We do NOT set prise_ui_ptr here. It will be set in setLoop() after UI.init()
+        // returns and the UI struct is in its final location. Any prise.* functions called
+        // during init.lua that need prise_ui_ptr will gracefully fail.
 
         // Add prise lua paths to package.path for runtime loading
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
@@ -206,7 +194,11 @@ pub const UI = struct {
         // Initialize TextInput metatable
         registerTextInputMetatable(lua);
 
-        return ui;
+        return .{
+            .allocator = allocator,
+            .lua = lua,
+            .text_inputs = std.AutoHashMap(u32, *TextInput).init(allocator),
+        };
     }
 
     pub fn setLoop(self: *UI, loop: *io.Loop) void {
@@ -434,11 +426,14 @@ pub const UI = struct {
 
     fn spawn(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
-            lua.pushNil();
-            return 1;
+        const ui_ptr = lua.toPointer(-1) catch {
+            lua.pop(1);
+            lua.raiseErrorStr("Failed to get UI pointer", .{});
+            return 0;
         };
         lua.pop(1); // pop ui ptr
+
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         if (ui.spawn_callback) |cb| {
             lua.checkType(1, .table);
@@ -495,11 +490,13 @@ pub const UI = struct {
 
     fn requestFrame(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
-            lua.pushNil();
-            return 1;
+        const ui_ptr = lua.toPointer(-1) catch {
+            lua.pop(1);
+            return 0;
         };
         lua.pop(1); // pop ui ptr
+
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         if (ui.redraw_callback) |cb| {
             cb(ui.redraw_ctx);
@@ -509,8 +506,9 @@ pub const UI = struct {
 
     fn save(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch return 0;
+        const ui_ptr = lua.toPointer(-1) catch return 0;
         lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         if (ui.save_callback) |cb| {
             cb(ui.save_ctx);
@@ -520,12 +518,13 @@ pub const UI = struct {
 
     fn getSessionName(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
+        const ui_ptr = lua.toPointer(-1) catch {
             log.warn("getSessionName: failed to get ui pointer", .{});
             lua.pushNil();
             return 1;
         };
         lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         if (ui.get_session_name_callback) |cb| {
             if (cb(ui.get_session_name_ctx)) |name| {
@@ -573,11 +572,12 @@ pub const UI = struct {
 
     fn renameSession(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
+        const ui_ptr = lua.toPointer(-1) catch {
             lua.pushBoolean(false);
             return 1;
         };
         lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         const new_name = lua.toString(1) catch {
             lua.pushBoolean(false);
@@ -597,12 +597,13 @@ pub const UI = struct {
 
     fn detach(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
+        const ui_ptr = lua.toPointer(-1) catch {
             log.warn("detach: failed to get ui pointer", .{});
             lua.pushNil();
             return 1;
         };
         lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         const session_name = lua.toString(1) catch blk: {
             log.warn("detach: lua.toString(1) failed, using 'default'", .{});
@@ -622,11 +623,12 @@ pub const UI = struct {
 
     fn listSessions(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
+        const ui_ptr = lua.toPointer(-1) catch {
             lua.createTable(0, 0);
             return 1;
         };
         lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         const home = std.posix.getenv("HOME") orelse {
             lua.createTable(0, 0);
@@ -677,12 +679,13 @@ pub const UI = struct {
 
     fn switchSession(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
+        const ui_ptr = lua.toPointer(-1) catch {
             log.warn("switchSession: failed to get ui pointer", .{});
             lua.pushBoolean(false);
             return 1;
         };
         lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         const target_session = lua.toString(1) catch {
             log.warn("switchSession: failed to get target session name", .{});
@@ -780,11 +783,12 @@ pub const UI = struct {
 
     fn nextSessionName(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
+        const ui_ptr = lua.toPointer(-1) catch {
             _ = lua.pushString(AMORY_NAMES[0]);
             return 1;
         };
         lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         const name = ui.getNextSessionName() catch {
             _ = lua.pushString(AMORY_NAMES[0]);
@@ -830,11 +834,12 @@ pub const UI = struct {
     fn setTimeout(lua: *ziglua.Lua) i32 {
         // Get UI ptr
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
+        const ui_ptr = lua.toPointer(-1) catch {
             lua.pushNil();
             return 1;
         };
         lua.pop(1); // pop ui ptr
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         if (ui.loop == null) {
             lua.raiseErrorStr("Event loop not configured in UI", .{});
@@ -897,11 +902,12 @@ pub const UI = struct {
 
     fn exit(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch {
+        const ui_ptr = lua.toPointer(-1) catch {
             lua.pushNil();
             return 1;
         };
         lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
         if (ui.exit_callback) |cb| {
             cb(ui.exit_ctx);
@@ -1441,11 +1447,25 @@ fn textInputIndex(lua: *ziglua.Lua) i32 {
 }
 
 fn getTextInput(lua: *ziglua.Lua) ?*TextInput {
-    const handle = lua.checkUserdata(TextInputHandle, 1, "PriseTextInput");
+    const handle = lua.toUserdata(TextInputHandle, 1) catch {
+        log.err("getTextInput: failed to convert arg to TextInputHandle", .{});
+        return null;
+    };
+
     _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-    const ui = lua.toUserdata(UI, -1) catch return null;
+    const ui_ptr = lua.toPointer(-1) catch {
+        lua.pop(1);
+        log.err("getTextInput: ui ptr not found in registry", .{});
+        return null;
+    };
     lua.pop(1);
-    return ui.text_inputs.get(handle.id);
+    const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+
+    const input = ui.text_inputs.get(handle.id);
+    if (input == null) {
+        log.err("getTextInput: text input {} not found in map", .{handle.id});
+    }
+    return input;
 }
 
 fn textInputId(lua: *ziglua.Lua) i32 {
@@ -1513,10 +1533,18 @@ fn textInputClear(lua: *ziglua.Lua) i32 {
 }
 
 fn textInputDestroy(lua: *ziglua.Lua) i32 {
-    const handle = lua.checkUserdata(TextInputHandle, 1, "PriseTextInput");
+    const handle = lua.toUserdata(TextInputHandle, 1) catch {
+        log.err("textInputDestroy: failed to get userdata", .{});
+        return 0;
+    };
     _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-    const ui = lua.toUserdata(UI, -1) catch return 0;
+    const ui_ptr = lua.toPointer(-1) catch {
+        lua.pop(1);
+        log.err("textInputDestroy: ui ptr not found", .{});
+        return 0;
+    };
     lua.pop(1);
+    const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
     if (ui.text_inputs.fetchRemove(handle.id)) |entry| {
         entry.value.deinit();
@@ -1527,11 +1555,12 @@ fn textInputDestroy(lua: *ziglua.Lua) i32 {
 
 fn createTextInput(lua: *ziglua.Lua) i32 {
     _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-    const ui = lua.toUserdata(UI, -1) catch {
+    const ui_ptr = lua.toPointer(-1) catch {
         lua.pushNil();
         return 1;
     };
     lua.pop(1);
+    const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
 
     const input = ui.allocator.create(TextInput) catch {
         lua.pushNil();
@@ -1552,7 +1581,12 @@ fn createTextInput(lua: *ziglua.Lua) i32 {
     const handle = lua.newUserdata(TextInputHandle, @sizeOf(TextInputHandle));
     handle.* = .{ .id = id };
 
-    _ = lua.getMetatableRegistry("PriseTextInput");
+    const mt_type = lua.getMetatableRegistry("PriseTextInput");
+    if (mt_type != .table) {
+        log.err("PriseTextInput metatable not found - PriseTextInput userdata not created", .{});
+        lua.pushNil();
+        return 1;
+    }
     lua.setMetatable(-2);
 
     return 1;
