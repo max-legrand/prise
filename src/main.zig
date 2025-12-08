@@ -114,6 +114,8 @@ fn parseArgs(allocator: std.mem.Allocator, socket_path: []const u8) !?(?[]const 
         return try handleSessionCommand(allocator, &args);
     } else if (std.mem.eql(u8, cmd, "pty")) {
         return try handlePtyCommand(allocator, &args, socket_path);
+    } else if (std.mem.eql(u8, cmd, "project")) {
+        return try handleProjectCommand(allocator, &args, socket_path);
     } else {
         log.err("Unknown command: {s}", .{cmd});
         try printHelp();
@@ -142,6 +144,7 @@ fn printHelp() !void {
         \\  serve      Start the server in the foreground
         \\  session    Manage sessions (attach, list, rename, delete)
         \\  pty        Manage PTYs (list, kill)
+        \\  project    Load a project from a Lua config file
         \\
         \\Options:
         \\  -h, --help     Show this help message
@@ -305,6 +308,110 @@ fn handlePtyCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator
         std.fs.File.stderr().writeAll(msg) catch {};
         try printPtyHelpTo(std.fs.File.stderr());
         return error.UnknownCommand;
+    }
+}
+
+fn printProjectHelp() !void {
+    try printProjectHelpTo(std.fs.File.stdout());
+}
+
+fn printProjectHelpTo(file: std.fs.File) !void {
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(&buf);
+    defer writer.interface.flush() catch {};
+    try writer.interface.print(
+        \\prise project - Load a project from a Lua config file
+        \\
+        \\Usage: prise project <name>
+        \\
+        \\The config file is loaded from ~/.config/prise/projects/<name>.lua
+        \\
+        \\Options:
+        \\  -h, --help               Show this help message
+        \\
+    , .{});
+}
+
+fn handleProjectCommand(allocator: std.mem.Allocator, args: *std.process.ArgIterator, socket_path: []const u8) !?(?[]const u8) {
+    const project_name = args.next() orelse {
+        try printProjectHelp();
+        return error.MissingCommand;
+    };
+
+    if (std.mem.eql(u8, project_name, "--help") or std.mem.eql(u8, project_name, "-h")) {
+        try printProjectHelp();
+        return null;
+    }
+
+    const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+    const project_path = try std.fs.path.join(allocator, &.{ home, ".config", "prise", "projects" });
+    defer allocator.free(project_path);
+
+    var project_file_buf: [256]u8 = undefined;
+    const project_file = std.fmt.bufPrint(&project_file_buf, "{s}.lua", .{project_name}) catch {
+        std.fs.File.stderr().writeAll("Project name too long.\n") catch {};
+        return error.NameTooLong;
+    };
+
+    const full_path = try std.fs.path.join(allocator, &.{ project_path, project_file });
+    defer allocator.free(full_path);
+
+    // Verify file exists
+    std.fs.accessAbsolute(full_path, .{}) catch {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Project '{s}' not found at {s}\n", .{ project_name, full_path }) catch return error.ProjectNotFound;
+        std.fs.File.stderr().writeAll(msg) catch {};
+        return error.ProjectNotFound;
+    };
+
+    try runClientWithProject(allocator, socket_path, try allocator.dupe(u8, full_path));
+    return null;
+}
+
+fn runClientWithProject(allocator: std.mem.Allocator, socket_path: []const u8, project_path: []const u8) !void {
+    defer allocator.free(project_path);
+
+    std.fs.accessAbsolute(socket_path, .{}) catch |err| {
+        if (err == error.FileNotFound) {
+            log.err("Server not running. Start it with: prise serve", .{});
+            return error.ServerNotRunning;
+        }
+        return err;
+    };
+
+    initLogFile("client.log");
+    log.info("Loading project from {s}", .{project_path});
+
+    var loop = try io.Loop.init(allocator);
+    defer loop.deinit();
+
+    var app = client.App.init(allocator) catch |err| {
+        var buf: [512]u8 = undefined;
+        var stderr = std.fs.File.stderr().writer(&buf);
+        defer stderr.interface.flush() catch {};
+        switch (err) {
+            error.InitLuaMustReturnTable => stderr.interface.print("error: init.lua must return a UI table\n  example: return require('prise').default()\n", .{}) catch {},
+            error.InitLuaFailed => stderr.interface.print("error: failed to load init.lua (check logs for details)\n", .{}) catch {},
+            error.DefaultUIFailed => stderr.interface.print("error: failed to load default UI\n", .{}) catch {},
+            else => {},
+        }
+        return err;
+    };
+    defer app.deinit();
+
+    app.socket_path = socket_path;
+    app.project_path = project_path;
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    app.initial_cwd = posix.getcwd(&cwd_buf) catch null;
+
+    try app.setup(&loop);
+    try loop.run(.until_done);
+
+    if (app.state.connection_refused) {
+        log.err("Connection refused. Server may have crashed. Start it with: prise serve", .{});
+        posix.unlink(socket_path) catch {};
+        return error.ConnectionRefused;
     }
 }
 

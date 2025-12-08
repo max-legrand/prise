@@ -2060,7 +2060,8 @@ const Server = struct {
         const cwd = parsed.cwd orelse posix.getenv("HOME");
         log.info("spawn_pty: rows={} cols={} attach={} cwd={?s} has_client_env={} has_cmd={}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach, cwd, parsed.env != null, parsed.cmd != null });
 
-        var shell: []const u8 = "/bin/sh";
+        var shell: []const u8 = try self.allocator.dupe(u8, "/bin/sh");
+
         var env_list = std.ArrayList([]const u8).empty;
         defer {
             for (env_list.items) |item| {
@@ -2075,7 +2076,8 @@ const Server = struct {
                     const env_str = try self.allocator.dupe(u8, val.string);
                     try env_list.append(self.allocator, env_str);
                     if (std.mem.startsWith(u8, val.string, "SHELL=")) {
-                        shell = env_str[6..];
+                        self.allocator.free(shell);
+                        shell = try self.allocator.dupe(u8, env_str[6..]);
                     }
                 }
             }
@@ -2089,23 +2091,45 @@ const Server = struct {
             const prepared = try prepareSpawnEnv(self.allocator, &env_map);
             env_list = prepared;
             if (posix.getenv("SHELL")) |s| {
-                shell = s;
+                self.allocator.free(shell);
+                shell = try self.allocator.dupe(u8, s);
             }
         }
 
         var cmd_list = std.ArrayList([]const u8).empty;
         defer cmd_list.deinit(self.allocator);
 
-        if (parsed.cmd) |cmd_array| {
+        var argv_owned: ?[][]const u8 = null;
+        var cmd_str_owned: ?[]u8 = null;
+
+        const argv: []const []const u8 = if (parsed.cmd) |cmd_array| blk: {
             for (cmd_array) |val| {
                 if (val == .string) {
                     try cmd_list.append(self.allocator, val.string);
                 }
             }
-        }
 
-        const argv: []const []const u8 = if (cmd_list.items.len > 0) cmd_list.items else &.{shell};
+            if (cmd_list.items.len > 0) {
+                // Run command through shell: [shell, "-c", "cmd arg1 arg2"]
+                const cmd_str = try std.mem.join(self.allocator, " ", cmd_list.items);
+                cmd_str_owned = cmd_str;
+
+                argv_owned = try self.allocator.alloc([]const u8, 3);
+                argv_owned.?[0] = shell;
+                argv_owned.?[1] = "-c";
+                argv_owned.?[2] = cmd_str;
+                break :blk argv_owned.?;
+            }
+            break :blk &.{shell};
+        } else &.{shell};
         const process = try pty.Process.spawn(self.allocator, parsed.size, argv, @ptrCast(env_list.items), cwd);
+
+        // Now clean up after spawn has completed
+        defer {
+            if (argv_owned) |owned| self.allocator.free(owned);
+            if (cmd_str_owned) |str| self.allocator.free(str);
+            self.allocator.free(shell);
+        }
 
         const pty_id = self.next_pty_id;
         self.next_pty_id += 1;

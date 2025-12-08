@@ -604,6 +604,7 @@ pub const App = struct {
     first_resize_done: bool = false,
     socket_path: []const u8 = undefined,
     attach_session: ?[]const u8 = null,
+    project_path: ?[]const u8 = null,
     initial_cwd: ?[]const u8 = null,
     last_render_time: i64 = 0,
     render_timer: ?io.Task = null,
@@ -885,42 +886,45 @@ pub const App = struct {
                 try app_ptr.saveSession(session_name);
 
                 // Build array of PTY IDs to detach
-                var pty_ids = try app_ptr.allocator.alloc(msgpack.Value, app_ptr.surfaces.count());
-                defer app_ptr.allocator.free(pty_ids);
+                var pty_id_list = try app_ptr.allocator.alloc(u32, app_ptr.surfaces.count());
+                defer app_ptr.allocator.free(pty_id_list);
                 var i: usize = 0;
                 var key_iter = app_ptr.surfaces.keyIterator();
                 while (key_iter.next()) |pty_id| {
-                    pty_ids[i] = .{ .unsigned = pty_id.* };
+                    pty_id_list[i] = pty_id.*;
                     i += 1;
                 }
 
-                // Send single detach_session request with all PTY IDs
+                // Send detach_ptys request with all PTY IDs
                 const msgid = app_ptr.state.next_msgid;
                 app_ptr.state.next_msgid +%= 1;
 
+                // Build the message as: [0, msgid, "detach_ptys", [pty_ids, fd]]
+                var pty_ids_msgpack = try app_ptr.allocator.alloc(msgpack.Value, pty_id_list.len);
+                defer app_ptr.allocator.free(pty_ids_msgpack);
+                for (pty_id_list, 0..) |id, j| {
+                    pty_ids_msgpack[j] = .{ .unsigned = id };
+                }
+
                 var params = try app_ptr.allocator.alloc(msgpack.Value, 2);
-                params[0] = .{ .array = pty_ids };
+                defer app_ptr.allocator.free(params);
+                params[0] = .{ .array = pty_ids_msgpack };
                 params[1] = .{ .unsigned = @intCast(app_ptr.fd) };
 
                 var arr = try app_ptr.allocator.alloc(msgpack.Value, 4);
+                defer app_ptr.allocator.free(arr);
                 arr[0] = .{ .unsigned = 0 }; // request
                 arr[1] = .{ .unsigned = msgid };
                 arr[2] = .{ .string = "detach_ptys" };
                 arr[3] = .{ .array = params };
 
-                const encoded = msgpack.encodeFromValue(app_ptr.allocator, msgpack.Value{ .array = arr }) catch {
-                    app_ptr.allocator.free(arr);
-                    app_ptr.allocator.free(params);
-                    return;
-                };
+                const encoded = try msgpack.encodeFromValue(app_ptr.allocator, msgpack.Value{ .array = arr });
                 defer app_ptr.allocator.free(encoded);
-                app_ptr.allocator.free(arr);
-                app_ptr.allocator.free(params);
 
                 // Track that we're waiting for detach response
                 try app_ptr.state.pending_requests.put(msgid, .detach);
 
-                app_ptr.sendDirect(encoded) catch {};
+                try app_ptr.sendDirect(encoded);
             }
         }.detachCb);
 
@@ -959,6 +963,62 @@ pub const App = struct {
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
         try self.handleVaxisEvent(.{ .winsize = ws });
+    }
+
+    pub fn startProjectSession(self: *App) !void {
+        const project_path = self.project_path orelse return;
+
+        const config = try self.ui.loadProjectConfig(project_path);
+        defer {
+            if (config.name) |name| self.allocator.free(name);
+            if (config.root) |root| self.allocator.free(root);
+            for (config.tabs) |tab| {
+                self.allocator.free(tab.title);
+                for (tab.panes) |pane| {
+                    if (pane.command) |cmd| {
+                        for (cmd) |arg| {
+                            self.allocator.free(arg);
+                        }
+                        self.allocator.free(cmd);
+                    }
+                }
+                self.allocator.free(tab.panes);
+            }
+            self.allocator.free(config.tabs);
+        }
+
+        // Set session name if available
+        if (config.name) |name| {
+            self.current_session_name = try self.allocator.dupe(u8, name);
+        }
+
+        // Determine working directory
+        var working_dir: ?[]const u8 = null;
+        if (config.root) |root| {
+            // Expand ~ in path
+            if (std.mem.startsWith(u8, root, "~")) {
+                const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+                working_dir = try std.fs.path.join(self.allocator, &.{ home, root[1..] });
+            } else {
+                working_dir = try self.allocator.dupe(u8, root);
+            }
+        }
+        defer if (working_dir) |wd| self.allocator.free(wd);
+
+        // Spawn panes from tabs
+        for (config.tabs) |tab| {
+            for (tab.panes) |pane| {
+                const cmd = pane.command orelse &[_][]const u8{};
+                const opts: UI.SpawnOptions = .{
+                    .rows = 24,
+                    .cols = 80,
+                    .attach = true,
+                    .cwd = working_dir,
+                    .cmd = if (cmd.len > 0) cmd else null,
+                };
+                try self.spawnPty(opts);
+            }
+        }
     }
 
     fn ttyThreadFn(self: *App) void {
@@ -1883,6 +1943,10 @@ pub const App = struct {
             self.current_session_name = try self.allocator.dupe(u8, session_name);
             log.info("onServerInfoReceived: set current_session_name='{s}'", .{self.current_session_name.?});
             try self.startSessionAttach(session_name);
+        } else if (self.project_path != null) {
+            // Project mode: load and spawn from project config
+            log.info("onServerInfoReceived: loading project", .{});
+            try self.startProjectSession();
         } else {
             // Generate a new session name for fresh launch
             if (self.current_session_name) |old| {

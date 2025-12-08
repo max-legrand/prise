@@ -1019,6 +1019,160 @@ pub const UI = struct {
         return luaTableToJson(self.lua, self.allocator, -1);
     }
 
+    pub const ProjectPane = struct {
+        command: ?[][]const u8 = null,
+    };
+
+    pub const ProjectTab = struct {
+        title: []const u8,
+        panes: []ProjectPane,
+    };
+
+    pub const ProjectConfig = struct {
+        name: ?[]const u8 = null,
+        root: ?[]const u8 = null,
+        tabs: []ProjectTab,
+    };
+
+    pub fn loadProjectConfig(self: *UI, path: []const u8) !ProjectConfig {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+
+        self.lua.doFile(path_z) catch |err| {
+            log.err("Failed to load project config: {}", .{err});
+            return error.ProjectConfigLoadFailed;
+        };
+
+        // The file should return a table
+        if (self.lua.typeOf(-1) != .table) {
+            log.err("Project config must return a table", .{});
+            self.lua.pop(1);
+            return error.ProjectConfigMustReturnTable;
+        }
+
+        var name: ?[]const u8 = null;
+        var root: ?[]const u8 = null;
+        var tabs: []ProjectTab = &.{};
+
+        // Get name field (optional)
+        _ = self.lua.getField(-1, "name");
+        if (self.lua.typeOf(-1) == .string) {
+            const name_str = self.lua.toString(-1) catch "";
+            name = try self.allocator.dupe(u8, name_str);
+        }
+        self.lua.pop(1);
+
+        // Get root field (optional)
+        _ = self.lua.getField(-1, "root");
+        if (self.lua.typeOf(-1) == .string) {
+            const root_str = self.lua.toString(-1) catch "";
+            root = try self.allocator.dupe(u8, root_str);
+        }
+        self.lua.pop(1);
+
+        // Get tabs array
+        _ = self.lua.getField(-1, "tabs");
+        if (self.lua.typeOf(-1) == .table) {
+            var tab_list: std.ArrayList(ProjectTab) = .empty;
+            defer tab_list.deinit(self.allocator);
+
+            var i: i32 = 1;
+            while (true) {
+                _ = self.lua.rawGetIndex(-1, i);
+                if (self.lua.typeOf(-1) == .nil) {
+                    self.lua.pop(1);
+                    break;
+                }
+
+                if (self.lua.typeOf(-1) == .table) {
+                    // Get tab title
+                    _ = self.lua.getField(-1, "title");
+                    const title = if (self.lua.typeOf(-1) == .string)
+                        try self.allocator.dupe(u8, self.lua.toString(-1) catch "")
+                    else
+                        try self.allocator.dupe(u8, "");
+                    self.lua.pop(1);
+
+                    // Get panes
+                    _ = self.lua.getField(-1, "panes");
+                    var pane_list: std.ArrayList(ProjectPane) = .empty;
+                    defer pane_list.deinit(self.allocator);
+
+                    if (self.lua.typeOf(-1) == .table) {
+                        var j: i32 = 1;
+                        while (true) {
+                            _ = self.lua.rawGetIndex(-1, j);
+                            if (self.lua.typeOf(-1) == .nil) {
+                                self.lua.pop(1);
+                                break;
+                            }
+
+                            if (self.lua.typeOf(-1) == .table) {
+                                // Get command array or string
+                                _ = self.lua.getField(-1, "command");
+                                var cmd: ?[][]const u8 = null;
+
+                                if (self.lua.typeOf(-1) == .string) {
+                                    // Handle command as a single string
+                                    const cmd_str = self.lua.toString(-1) catch "";
+                                    var cmd_list: std.ArrayList([]const u8) = .empty;
+                                    defer cmd_list.deinit(self.allocator);
+                                    try cmd_list.append(self.allocator, try self.allocator.dupe(u8, cmd_str));
+                                    cmd = try cmd_list.toOwnedSlice(self.allocator);
+                                } else if (self.lua.typeOf(-1) == .table) {
+                                    // Handle command as an array of strings
+                                    var cmd_list: std.ArrayList([]const u8) = .empty;
+                                    defer cmd_list.deinit(self.allocator);
+
+                                    var k: i32 = 1;
+                                    while (true) {
+                                        _ = self.lua.rawGetIndex(-1, k);
+                                        if (self.lua.typeOf(-1) == .nil) {
+                                            self.lua.pop(1);
+                                            break;
+                                        }
+                                        if (self.lua.typeOf(-1) == .string) {
+                                            const arg = self.lua.toString(-1) catch "";
+                                            try cmd_list.append(self.allocator, try self.allocator.dupe(u8, arg));
+                                        }
+                                        self.lua.pop(1);
+                                        k += 1;
+                                    }
+                                    if (cmd_list.items.len > 0) {
+                                        cmd = try cmd_list.toOwnedSlice(self.allocator);
+                                    }
+                                }
+                                self.lua.pop(1);
+
+                                try pane_list.append(self.allocator, .{ .command = cmd });
+                            }
+                            self.lua.pop(1);
+                            j += 1;
+                        }
+                    }
+                    self.lua.pop(1);
+
+                    try tab_list.append(self.allocator, .{
+                        .title = title,
+                        .panes = try pane_list.toOwnedSlice(self.allocator),
+                    });
+                }
+                self.lua.pop(1);
+                i += 1;
+            }
+
+            tabs = try tab_list.toOwnedSlice(self.allocator);
+        }
+        self.lua.pop(1);
+        self.lua.pop(1); // Pop the config table
+
+        return .{
+            .name = name,
+            .root = root,
+            .tabs = tabs,
+        };
+    }
+
     pub const PtyLookupResult = struct {
         surface: *Surface,
         app: *anyopaque,
