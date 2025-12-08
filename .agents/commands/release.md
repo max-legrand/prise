@@ -30,7 +30,9 @@ Create a new file at `docs/releases/vX.Y.Z.md` (matching the new version). Use `
 - Any breaking changes or migration notes if applicable
 - Known limitations
 
-To populate the release notes, run `git log --oneline $(git describe --tags --abbrev=0)..HEAD` to see all commits since the last release.
+To populate the release notes, run `git log --format="%h %an %s" $(git describe --tags --abbrev=0)..HEAD` to see all commits since the last release with their authors.
+
+Credit contributors by tagging their GitHub usernames (e.g., @username) next to features, fixes, or sections they contributed. The git author name often matches the GitHub username.
 
 ## 5. Pre-release verification
 
