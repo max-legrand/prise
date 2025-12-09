@@ -1295,12 +1295,25 @@ const Client = struct {
             var writer = std.Io.Writer.fixed(&encode_buf);
 
             pty_instance.terminal_mutex.lock();
+
+            // Reset scroll position to bottom on any key press
+            if (!is_release) {
+                pty_instance.terminal.scrollViewport(.bottom) catch |err| {
+                    log.err("Failed to reset scroll viewport: {}", .{err});
+                };
+            }
+
             key_encode.encode(&writer, key, &pty_instance.terminal) catch |err| {
                 log.err("Failed to encode key: {}", .{err});
                 pty_instance.terminal_mutex.unlock();
                 return;
             };
             pty_instance.terminal_mutex.unlock();
+
+            // Trigger redraw after scroll reset
+            if (!is_release) {
+                _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
+            }
 
             const encoded = writer.buffered();
             if (encoded.len > 0) {
