@@ -658,7 +658,13 @@ local function remove_pane_by_id(id)
                     new_focus_id = first_pane and first_pane.id or nil
                 end
                 state.focused_id = new_focus_id
-                update_pty_focus(old_focused, new_focus_id)
+                -- Don't unfocus old_focused since it was just removed
+                if new_focus_id and state.app_focused then
+                    local path = find_node_path(new_tab.root, new_focus_id)
+                    if path then
+                        path[#path].pty:set_focus(true)
+                    end
+                end
             end
             prise.request_frame()
             return false
@@ -666,7 +672,6 @@ local function remove_pane_by_id(id)
     else
         -- Tab still has panes
         if state.focused_id == id then
-            local old_id = state.focused_id
             if next_focus then
                 state.focused_id = next_focus
             else
@@ -675,7 +680,13 @@ local function remove_pane_by_id(id)
                     state.focused_id = first.id
                 end
             end
-            update_pty_focus(old_id, state.focused_id)
+            -- Don't unfocus old pane (id) since it was just removed
+            if state.focused_id and state.app_focused then
+                local path = find_node_path(tab.root, state.focused_id)
+                if path then
+                    path[#path].pty:set_focus(true)
+                end
+            end
         end
         prise.request_frame()
         return false
@@ -987,6 +998,97 @@ local function move_focus(direction)
     end
 end
 
+---Swap the focused pane with an adjacent pane in the specified direction
+---@param direction "left"|"right"|"up"|"down"
+local function swap_pane(direction)
+    local root = get_active_root()
+    if not state.focused_id or not root then
+        return
+    end
+
+    local path = find_node_path(root, state.focused_id)
+    if not path then
+        return
+    end
+
+    -- "left"/"right" implies moving along "row"
+    -- "up"/"down" implies moving along "col"
+    local target_split_type = (direction == "left" or direction == "right") and "row" or "col"
+    local forward = (direction == "right" or direction == "down")
+
+    local sibling_node = nil
+
+    -- Traverse up the path to find a split of the correct type where we can swap
+    for i = #path - 1, 1, -1 do
+        local node = path[i]
+        local child = path[i + 1]
+
+        if node.type == "split" and node.direction == target_split_type then
+            -- Find index of child
+            local idx = 0
+            for k, c in ipairs(node.children) do
+                if c == child then
+                    idx = k
+                    break
+                end
+            end
+
+            if forward then
+                if idx < #node.children then
+                    sibling_node = node.children[idx + 1]
+                    break
+                end
+            else
+                if idx > 1 then
+                    sibling_node = node.children[idx - 1]
+                    break
+                end
+            end
+        end
+    end
+
+    if sibling_node then
+        -- Found a sibling tree/pane. Find the closest leaf.
+        local target_leaf
+        if forward then
+            target_leaf = get_first_leaf(sibling_node)
+        else
+            target_leaf = get_last_leaf(sibling_node)
+        end
+
+        if target_leaf and target_leaf.id ~= state.focused_id then
+            -- Find both panes
+            local focused_path = find_node_path(root, state.focused_id)
+            local target_path = find_node_path(root, target_leaf.id)
+
+            if focused_path and target_path then
+                local focused_pane = focused_path[#focused_path]
+                local target_pane = target_path[#target_path]
+
+                -- Unfocus the currently focused pane before swapping
+                if state.app_focused then
+                    focused_pane.pty:set_focus(false)
+                end
+
+                -- Swap both the PTY references and the IDs so everything stays consistent
+                focused_pane.pty, target_pane.pty = target_pane.pty, focused_pane.pty
+                focused_pane.id, target_pane.id = target_pane.id, focused_pane.id
+
+                -- Focus stays on the same ID (which now moved to the target position)
+                -- state.focused_id doesn't need to change since we swapped the IDs
+
+                -- Focus the pane that now has our original ID (at target position)
+                if state.app_focused then
+                    target_pane.pty:set_focus(true)
+                end
+
+                prise.request_frame()
+                prise.save()
+            end
+        end
+    end
+end
+
 local function open_rename_tab()
     if not state.rename_tab.input then
         state.rename_tab.input = prise.create_text_input()
@@ -1289,6 +1391,34 @@ local commands = {
         end,
     },
     {
+        name = "Swap Left",
+        shortcut = key_prefix .. " Ctrl+h",
+        action = function()
+            swap_pane("left")
+        end,
+    },
+    {
+        name = "Swap Right",
+        shortcut = key_prefix .. " Ctrl+l",
+        action = function()
+            swap_pane("right")
+        end,
+    },
+    {
+        name = "Swap Up",
+        shortcut = key_prefix .. " Ctrl+k",
+        action = function()
+            swap_pane("up")
+        end,
+    },
+    {
+        name = "Swap Down",
+        shortcut = key_prefix .. " Ctrl+j",
+        action = function()
+            swap_pane("down")
+        end,
+    },
+    {
         name = "Tab 1",
         shortcut = key_prefix .. " 1",
         action = function()
@@ -1386,6 +1516,16 @@ local commands = {
         end,
         visible = function()
             return #state.tabs >= 10
+        end,
+    },
+    {
+        name = "Copy Selection",
+        shortcut = prise.platform == "macos" and "󰘳 +c" or "Ctrl+Shift+c",
+        action = function()
+            local pty = get_focused_pty()
+            if pty then
+                pty:copy_selection()
+            end
         end,
     },
     {
@@ -1699,7 +1839,26 @@ function M.update(event)
             local handled = false
             local k = event.data.key
 
-            if k == "h" then
+            prise.log.debug("pending_command: key=" .. tostring(k) .. " ctrl=" .. tostring(event.data.ctrl or false))
+
+            if k == "h" and event.data.ctrl then
+                -- Swap pane left
+                prise.log.info("Swapping pane left")
+                swap_pane("left")
+                handled = true
+            elseif k == "l" and event.data.ctrl then
+                -- Swap pane right
+                swap_pane("right")
+                handled = true
+            elseif k == "j" and event.data.ctrl then
+                -- Swap pane down
+                swap_pane("down")
+                handled = true
+            elseif k == "k" and event.data.ctrl then
+                -- Swap pane up
+                swap_pane("up")
+                handled = true
+            elseif k == "h" then
                 move_focus("left")
                 handled = true
             elseif k == "l" then
