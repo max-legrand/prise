@@ -1620,13 +1620,13 @@ function M.update(event)
             elseif k == "Enter" then
                 execute_selected()
                 return
-            elseif k == "ArrowUp" or (k == "k" and event.data.ctrl) then
+            elseif k == "ArrowUp" or (k == "p" and event.data.ctrl) then
                 if state.palette.selected > 1 then
                     state.palette.selected = state.palette.selected - 1
                     prise.request_frame()
                 end
                 return
-            elseif k == "ArrowDown" or (k == "j" and event.data.ctrl) then
+            elseif k == "ArrowDown" or (k == "n" and event.data.ctrl) then
                 if state.palette.selected < #filtered then
                     state.palette.selected = state.palette.selected + 1
                     prise.request_frame()
