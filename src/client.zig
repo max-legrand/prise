@@ -301,7 +301,13 @@ pub const ClientLogic = struct {
 
     fn handleCopySelectionResult(result: msgpack.Value) ServerAction {
         if (result == .string) {
+            log.info("handleCopySelectionResult: received selection text ({} bytes)", .{result.string.len});
             return .{ .copy_to_clipboard = result.string };
+        }
+        if (result == .nil) {
+            log.warn("handleCopySelectionResult: no selection (nil result)", .{});
+        } else {
+            log.warn("handleCopySelectionResult: unexpected result type: {s}", .{@tagName(result)});
         }
         return .none;
     }
@@ -1853,6 +1859,94 @@ pub const App = struct {
                 });
                 try self.renderWidget(pos.child.*, child_win);
             },
+            .divider => |d| {
+                const style = self.applyDimToStyle(d.style, if (w.focus) 0.0 else self.ui.dim_factor);
+                const char: []const u8 = if (d.direction == .horizontal) "─" else "│";
+
+                if (d.direction == .horizontal) {
+                    // Draw horizontal line across width
+                    for (0..win.width) |col| {
+                        win.writeCell(@intCast(col), 0, .{
+                            .char = .{ .grapheme = char, .width = 1 },
+                            .style = style,
+                        });
+                    }
+                } else {
+                    // Draw vertical line down height
+                    for (0..win.height) |row| {
+                        win.writeCell(0, @intCast(row), .{
+                            .char = .{ .grapheme = char, .width = 1 },
+                            .style = style,
+                        });
+                    }
+                }
+            },
+            .segmented_divider => |sd| {
+                const char: []const u8 = if (sd.direction == .horizontal) "─" else "│";
+                const default_style = self.applyDimToStyle(sd.default_style, if (w.focus) 0.0 else self.ui.dim_factor);
+                const total_size: u16 = if (sd.direction == .horizontal) win.width else win.height;
+
+                // Guard against zero-size windows
+                if (total_size == 0) return;
+
+                // If no segments, just draw with default style (shouldn't happen but be safe)
+                if (sd.segments.len == 0) {
+                    if (sd.direction == .horizontal) {
+                        for (0..win.width) |col| {
+                            win.writeCell(@intCast(col), 0, .{
+                                .char = .{ .grapheme = char, .width = 1 },
+                                .style = default_style,
+                            });
+                        }
+                    } else {
+                        for (0..win.height) |row| {
+                            win.writeCell(0, @intCast(row), .{
+                                .char = .{ .grapheme = char, .width = 1 },
+                                .style = default_style,
+                            });
+                        }
+                    }
+                    return;
+                }
+
+                if (sd.direction == .horizontal) {
+                    // Draw horizontal line across width with segments
+                    for (0..win.width) |col| {
+                        var segment_style = default_style;
+                        // Check which segment this position belongs to
+                        for (sd.segments) |segment| {
+                            const actual_start: u16 = if (segment.is_ratio) @intFromFloat(@as(f32, @floatFromInt(segment.start)) / 1000.0 * @as(f32, @floatFromInt(total_size))) else segment.start;
+                            const actual_end: u16 = if (segment.is_ratio) @intFromFloat(@as(f32, @floatFromInt(segment.end)) / 1000.0 * @as(f32, @floatFromInt(total_size))) else segment.end;
+                            if (col >= actual_start and col < actual_end) {
+                                segment_style = self.applyDimToStyle(segment.style, if (w.focus) 0.0 else self.ui.dim_factor);
+                                break;
+                            }
+                        }
+                        win.writeCell(@intCast(col), 0, .{
+                            .char = .{ .grapheme = char, .width = 1 },
+                            .style = segment_style,
+                        });
+                    }
+                } else {
+                    // Draw vertical line down height with segments
+                    for (0..win.height) |row| {
+                        var segment_style = default_style;
+                        // Check which segment this position belongs to
+                        for (sd.segments) |segment| {
+                            const actual_start: u16 = if (segment.is_ratio) @intFromFloat(@as(f32, @floatFromInt(segment.start)) / 1000.0 * @as(f32, @floatFromInt(total_size))) else segment.start;
+                            const actual_end: u16 = if (segment.is_ratio) @intFromFloat(@as(f32, @floatFromInt(segment.end)) / 1000.0 * @as(f32, @floatFromInt(total_size))) else segment.end;
+                            if (row >= actual_start and row < actual_end) {
+                                segment_style = self.applyDimToStyle(segment.style, if (w.focus) 0.0 else self.ui.dim_factor);
+                                break;
+                            }
+                        }
+                        win.writeCell(0, @intCast(row), .{
+                            .char = .{ .grapheme = char, .width = 1 },
+                            .style = segment_style,
+                        });
+                    }
+                }
+            },
         }
     }
 
@@ -2715,16 +2809,81 @@ pub const App = struct {
     }
 
     fn copyToClipboard(self: *App, text: []const u8) void {
+        if (text.len == 0) {
+            log.warn("copyToClipboard: empty text, nothing to copy", .{});
+            return;
+        }
+
+        log.info("copyToClipboard: copying {} bytes to clipboard", .{text.len});
+
+        // Try native clipboard utilities first (more reliable than OSC 52)
+        self.copyToClipboardNative(text) catch |err| {
+            log.warn("Native clipboard copy failed: {}, trying OSC 52", .{err});
+            self.copyToClipboardOSC52(text);
+        };
+    }
+
+    fn copyToClipboardNative(self: *App, text: []const u8) !void {
+        const builtin = @import("builtin");
+        const clipboard_cmd = switch (builtin.os.tag) {
+            .macos => "pbcopy",
+            .linux => blk: {
+                // Try to detect which clipboard utility is available
+                // Prefer wl-copy (Wayland) or xclip (X11)
+                const wayland = std.process.hasEnvVar(self.allocator, "WAYLAND_DISPLAY") catch false;
+                break :blk if (wayland) "wl-copy" else "xclip";
+            },
+            else => return error.UnsupportedPlatform,
+        };
+
+        const args = if (std.mem.eql(u8, clipboard_cmd, "xclip"))
+            &[_][]const u8{ clipboard_cmd, "-selection", "clipboard" }
+        else
+            &[_][]const u8{clipboard_cmd};
+
+        var child = std.process.Child.init(args, self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+
+        if (child.stdin) |stdin| {
+            stdin.writeAll(text) catch |err| {
+                log.err("Failed to write to clipboard process: {}", .{err});
+                _ = child.kill() catch {};
+                return err;
+            };
+            stdin.close();
+            child.stdin = null;
+        }
+
+        const result = try child.wait();
+        if (result != .Exited or result.Exited != 0) {
+            log.err("Clipboard process exited with error: {}", .{result});
+            return error.ClipboardProcessFailed;
+        }
+
+        log.info("Successfully copied to clipboard using {s}", .{clipboard_cmd});
+    }
+
+    fn copyToClipboardOSC52(self: *App, text: []const u8) void {
         const encoder = std.base64.standard.Encoder;
         const encoded_len = encoder.calcSize(text.len);
-        const encoded = self.allocator.alloc(u8, encoded_len) catch return;
+        const encoded = self.allocator.alloc(u8, encoded_len) catch |err| {
+            log.err("Failed to allocate memory for OSC 52 encoding: {}", .{err});
+            return;
+        };
         defer self.allocator.free(encoded);
         _ = encoder.encode(encoded, text);
 
         const writer = self.tty.writer();
         writer.print("\x1b]52;c;{s}\x1b\\", .{encoded}) catch |err| {
-            log.err("Failed to write OSC 52: {}", .{err});
+            log.err("Failed to write OSC 52 sequence: {}", .{err});
+            return;
         };
+
+        log.info("OSC 52 sequence written (may not work in all terminals)", .{});
     }
 
     pub fn saveSession(self: *App, name: []const u8) !void {

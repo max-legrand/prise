@@ -58,6 +58,21 @@
 ---@field left? number
 ---@field right? number
 
+---@class DividerOpts
+---@field direction? "horizontal"|"vertical"
+---@field style? table
+---@field focus? boolean
+
+---@class DividerSegment
+---@field start number Starting position (row or col)
+---@field end number Ending position (exclusive)
+---@field style table Style for this segment
+
+---@class SegmentedDividerOpts
+---@field direction? "horizontal"|"vertical"
+---@field segments? DividerSegment[]
+---@field default_style? table
+
 ---@class PriseUI
 ---@field update fun(event: table) Handle an input event
 ---@field view fun(): table Return the widget tree to render
@@ -260,6 +275,30 @@ function M.Padding(opts)
         bottom = opts.bottom,
         left = opts.left,
         right = opts.right,
+    }
+end
+
+---Create a divider widget that draws a line (for tmux-style borders)
+---@param opts DividerOpts
+---@return table Divider widget
+function M.Divider(opts)
+    return {
+        type = "divider",
+        direction = opts.direction or "horizontal",
+        style = opts.style,
+        focus = opts.focus,
+    }
+end
+
+---Create a segmented divider widget that can render different segments with different colors
+---@param opts SegmentedDividerOpts
+---@return table SegmentedDivider widget
+function M.SegmentedDivider(opts)
+    return {
+        type = "segmented_divider",
+        direction = opts.direction or "horizontal",
+        segments = opts.segments or {},
+        default_style = opts.default_style,
     }
 end
 

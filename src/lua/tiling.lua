@@ -13,6 +13,7 @@ local utils = require("utils")
 ---@field direction "row"|"col"
 ---@field ratio? number
 ---@field children (Pane|Split)[]
+---@field last_focused_child_idx? number Index of last focused child (1-based)
 
 ---@alias Node Pane|Split
 
@@ -100,9 +101,12 @@ local POWERLINE_SYMBOLS = {
 
 ---@class PriseBordersConfig
 ---@field enabled? boolean Show pane borders (default: false)
+---@field mode? "around"|"between" Border mode: "around" draws borders around each pane, "between" draws borders between panes (default: "around")
 ---@field style? "none"|"single"|"double"|"rounded" Border style (default: "single")
 ---@field focused_color? string Hex color for focused pane border (default: "#89b4fa")
 ---@field unfocused_color? string Hex color for unfocused borders (default: "#585b70")
+---@field horizontal_spacing? number Horizontal gap between panes (default: 0, deprecated with "between" mode)
+---@field vertical_spacing? number Vertical gap between panes (default: 0, deprecated with "between" mode)
 
 ---@class PriseConfig
 ---@field theme? PriseTheme Color theme options
@@ -136,9 +140,12 @@ local config = {
     },
     borders = {
         enabled = false,
+        mode = "around", -- "around" or "between"
         style = "single",
         focused_color = "#89b4fa", -- Blue (matches default theme.accent)
         unfocused_color = "#585b70", -- Gray (matches default theme.bg4)
+        horizontal_spacing = 0, -- Horizontal gap between panes (deprecated with "between" mode)
+        vertical_spacing = 0, -- Vertical gap between panes (deprecated with "between" mode)
     },
     status_bar = {
         enabled = true,
@@ -658,7 +665,13 @@ local function remove_pane_by_id(id)
                     new_focus_id = first_pane and first_pane.id or nil
                 end
                 state.focused_id = new_focus_id
-                update_pty_focus(old_focused, new_focus_id)
+                -- Don't unfocus old_focused since it was just removed
+                if new_focus_id and state.app_focused then
+                    local path = find_node_path(new_tab.root, new_focus_id)
+                    if path then
+                        path[#path].pty:set_focus(true)
+                    end
+                end
             end
             prise.request_frame()
             return false
@@ -666,7 +679,6 @@ local function remove_pane_by_id(id)
     else
         -- Tab still has panes
         if state.focused_id == id then
-            local old_id = state.focused_id
             if next_focus then
                 state.focused_id = next_focus
             else
@@ -675,7 +687,13 @@ local function remove_pane_by_id(id)
                     state.focused_id = first.id
                 end
             end
-            update_pty_focus(old_id, state.focused_id)
+            -- Don't unfocus old pane (id) since it was just removed
+            if state.focused_id and state.app_focused then
+                local path = find_node_path(tab.root, state.focused_id)
+                if path then
+                    path[#path].pty:set_focus(true)
+                end
+            end
         end
         prise.request_frame()
         return false
@@ -920,6 +938,67 @@ local function resize_pane(dimension, delta_ratio)
     prise.save()
 end
 
+---Update focus history for all splits in the path to the currently focused pane
+---This records which child each split should return to when focus comes back
+local function update_focus_history()
+    local root = get_active_root()
+    if not state.focused_id or not root then
+        return
+    end
+
+    local path = find_node_path(root, state.focused_id)
+    if not path then
+        return
+    end
+
+    -- For each split in the path, record which child contains the focused pane
+    for i = 1, #path - 1 do
+        local node = path[i]
+        local child = path[i + 1]
+
+        if is_split(node) then
+            -- Find index of child in this split
+            for k, c in ipairs(node.children) do
+                if c == child then
+                    node.last_focused_child_idx = k
+                    break
+                end
+            end
+        end
+    end
+end
+
+---Get the preferred leaf in a node based on focus history
+---@param node Node
+---@param forward boolean If true, prefer first leaf; if false, prefer last leaf
+---@return Pane?
+local function get_preferred_leaf(node, forward)
+    if is_pane(node) then
+        return node
+    end
+
+    if is_split(node) then
+        -- If we have focus history, use it
+        if
+            node.last_focused_child_idx
+            and node.last_focused_child_idx >= 1
+            and node.last_focused_child_idx <= #node.children
+        then
+            local preferred_child = node.children[node.last_focused_child_idx]
+            return get_preferred_leaf(preferred_child, forward)
+        end
+
+        -- Otherwise use first or last leaf
+        if forward then
+            return get_first_leaf(node)
+        else
+            return get_last_leaf(node)
+        end
+    end
+
+    return nil
+end
+
 ---@param direction "left"|"right"|"up"|"down"
 local function move_focus(direction)
     local root = get_active_root()
@@ -931,6 +1010,9 @@ local function move_focus(direction)
     if not path then
         return
     end
+
+    -- Update focus history before moving
+    update_focus_history()
 
     -- "left"/"right" implies moving along "row"
     -- "up"/"down" implies moving along "col"
@@ -970,6 +1052,68 @@ local function move_focus(direction)
     end
 
     if sibling_node then
+        -- Found a sibling tree/pane. Use preferred leaf based on history.
+        local target_leaf = get_preferred_leaf(sibling_node, forward)
+
+        if target_leaf and target_leaf.id ~= state.focused_id then
+            local old_id = state.focused_id
+            state.focused_id = target_leaf.id
+            update_pty_focus(old_id, state.focused_id)
+            prise.request_frame()
+        end
+    end
+end
+
+---Swap the focused pane with an adjacent pane in the specified direction
+---@param direction "left"|"right"|"up"|"down"
+local function swap_pane(direction)
+    local root = get_active_root()
+    if not state.focused_id or not root then
+        return
+    end
+
+    local path = find_node_path(root, state.focused_id)
+    if not path then
+        return
+    end
+
+    -- "left"/"right" implies moving along "row"
+    -- "up"/"down" implies moving along "col"
+    local target_split_type = (direction == "left" or direction == "right") and "row" or "col"
+    local forward = (direction == "right" or direction == "down")
+
+    local sibling_node = nil
+
+    -- Traverse up the path to find a split of the correct type where we can swap
+    for i = #path - 1, 1, -1 do
+        local node = path[i]
+        local child = path[i + 1]
+
+        if node.type == "split" and node.direction == target_split_type then
+            -- Find index of child
+            local idx = 0
+            for k, c in ipairs(node.children) do
+                if c == child then
+                    idx = k
+                    break
+                end
+            end
+
+            if forward then
+                if idx < #node.children then
+                    sibling_node = node.children[idx + 1]
+                    break
+                end
+            else
+                if idx > 1 then
+                    sibling_node = node.children[idx - 1]
+                    break
+                end
+            end
+        end
+    end
+
+    if sibling_node then
         -- Found a sibling tree/pane. Find the closest leaf.
         local target_leaf
         if forward then
@@ -979,10 +1123,34 @@ local function move_focus(direction)
         end
 
         if target_leaf and target_leaf.id ~= state.focused_id then
-            local old_id = state.focused_id
-            state.focused_id = target_leaf.id
-            update_pty_focus(old_id, state.focused_id)
-            prise.request_frame()
+            -- Find both panes
+            local focused_path = find_node_path(root, state.focused_id)
+            local target_path = find_node_path(root, target_leaf.id)
+
+            if focused_path and target_path then
+                local focused_pane = focused_path[#focused_path]
+                local target_pane = target_path[#target_path]
+
+                -- Unfocus the currently focused pane before swapping
+                if state.app_focused then
+                    focused_pane.pty:set_focus(false)
+                end
+
+                -- Swap both the PTY references and the IDs so everything stays consistent
+                focused_pane.pty, target_pane.pty = target_pane.pty, focused_pane.pty
+                focused_pane.id, target_pane.id = target_pane.id, focused_pane.id
+
+                -- Focus stays on the same ID (which now moved to the target position)
+                -- state.focused_id doesn't need to change since we swapped the IDs
+
+                -- Focus the pane that now has our original ID (at target position)
+                if state.app_focused then
+                    target_pane.pty:set_focus(true)
+                end
+
+                prise.request_frame()
+                prise.save()
+            end
         end
     end
 end
@@ -1289,6 +1457,34 @@ local commands = {
         end,
     },
     {
+        name = "Swap Left",
+        shortcut = key_prefix .. " Ctrl+h",
+        action = function()
+            swap_pane("left")
+        end,
+    },
+    {
+        name = "Swap Right",
+        shortcut = key_prefix .. " Ctrl+l",
+        action = function()
+            swap_pane("right")
+        end,
+    },
+    {
+        name = "Swap Up",
+        shortcut = key_prefix .. " Ctrl+k",
+        action = function()
+            swap_pane("up")
+        end,
+    },
+    {
+        name = "Swap Down",
+        shortcut = key_prefix .. " Ctrl+j",
+        action = function()
+            swap_pane("down")
+        end,
+    },
+    {
         name = "Tab 1",
         shortcut = key_prefix .. " 1",
         action = function()
@@ -1386,6 +1582,16 @@ local commands = {
         end,
         visible = function()
             return #state.tabs >= 10
+        end,
+    },
+    {
+        name = "Copy Selection",
+        shortcut = prise.platform == "macos" and "󰘳 +c" or "Ctrl+Shift+c",
+        action = function()
+            local pty = get_focused_pty()
+            if pty then
+                pty:copy_selection()
+            end
         end,
     },
     {
@@ -1699,7 +1905,26 @@ function M.update(event)
             local handled = false
             local k = event.data.key
 
-            if k == "h" then
+            prise.log.debug("pending_command: key=" .. tostring(k) .. " ctrl=" .. tostring(event.data.ctrl or false))
+
+            if k == "h" and event.data.ctrl then
+                -- Swap pane left
+                prise.log.info("Swapping pane left")
+                swap_pane("left")
+                handled = true
+            elseif k == "l" and event.data.ctrl then
+                -- Swap pane right
+                swap_pane("right")
+                handled = true
+            elseif k == "j" and event.data.ctrl then
+                -- Swap pane down
+                swap_pane("down")
+                handled = true
+            elseif k == "k" and event.data.ctrl then
+                -- Swap pane up
+                swap_pane("up")
+                handled = true
+            elseif k == "h" then
                 move_focus("left")
                 handled = true
             elseif k == "l" then
@@ -2088,6 +2313,262 @@ function M.update(event)
     end
 end
 
+---Collect all leaf panes in a subtree with their relative ratios
+---@param node Node
+---@param panes table[] Output array
+local function collect_leaf_panes_with_ratios(node, panes)
+    if is_pane(node) then
+        table.insert(panes, { id = node.id, ratio = node.ratio or 1.0 })
+    elseif is_split(node) then
+        for _, child in ipairs(node.children) do
+            collect_leaf_panes_with_ratios(child, panes)
+        end
+    end
+end
+
+---Get the leaf pane at a specific position in the orthogonal direction
+---For a vertical divider (in row split), get the leftmost/rightmost pane at a given y-offset
+---For a horizontal divider (in col split), get the topmost/bottommost pane at a given x-offset
+---@param node Node
+---@param side "left"|"right"|"top"|"bottom"
+---@return number? pane_id
+local function get_edge_pane(node, side)
+    if not node then
+        return nil
+    end
+    if is_pane(node) then
+        return node.id
+    end
+    if is_split(node) and node.children and #node.children > 0 then
+        if side == "left" or side == "top" then
+            return get_edge_pane(node.children[1], side)
+        else -- right or bottom
+            return get_edge_pane(node.children[#node.children], side)
+        end
+    end
+    return nil
+end
+
+---Check if the focused pane is on a specific edge of a subtree
+---@param node Node
+---@param focused_id? number
+---@param side "left"|"right"|"top"|"bottom"
+---@return boolean
+local function focused_on_edge(node, focused_id, side)
+    if not focused_id or not node then
+        return false
+    end
+    local edge_id = get_edge_pane(node, side)
+    return edge_id == focused_id
+end
+
+---Collect all leaf nodes from a split, flattening nested splits in the same direction
+---Returns array of {node, ratio} where ratio is the accumulated ratio
+---@param node Node
+---@param target_direction "row"|"col"
+---@param depth? number Current recursion depth (internal use)
+---@return table[] Array of {node=Node, ratio=number}
+local function collect_leaves_in_direction(node, target_direction, depth)
+    depth = depth or 0
+    local MAX_DEPTH = 20
+
+    -- Prevent stack overflow from deeply nested or cyclic structures
+    if depth > MAX_DEPTH then
+        return { { node = node, ratio = 1.0 } }
+    end
+
+    local leaves = {}
+
+    if is_pane(node) then
+        table.insert(leaves, { node = node, ratio = 1.0 })
+    elseif is_split(node) and node.direction == target_direction and node.children then
+        -- Same direction - flatten by collecting from all children
+        for _, child in ipairs(node.children) do
+            local child_ratio = child.ratio or (1.0 / #node.children)
+            local child_leaves = collect_leaves_in_direction(child, target_direction, depth + 1)
+            for _, leaf in ipairs(child_leaves) do
+                table.insert(leaves, {
+                    node = leaf.node,
+                    ratio = leaf.ratio * child_ratio,
+                })
+            end
+        end
+    else
+        -- Different direction or leaf - treat as single unit
+        table.insert(leaves, { node = node, ratio = 1.0 })
+    end
+
+    return leaves
+end
+
+---Create segments for a divider based on child nodes and which ones are focused
+---For splits perpendicular to the divider, we need to create one segment per leaf pane
+---@param left_child Node
+---@param right_child Node
+---@param direction "horizontal"|"vertical"
+---@param focused_id? number
+---@param focused_color string
+---@param unfocused_color string
+---@return table[] segments
+local function create_divider_segments(left_child, right_child, direction, focused_id, focused_color, unfocused_color)
+    local segments = {}
+
+    -- Safety checks
+    if not left_child or not right_child then
+        return segments
+    end
+
+    if direction == "vertical" then
+        -- Vertical divider between horizontal panes (row split)
+        -- Check which side (or both) has a column split
+        local left_is_col_split = is_split(left_child) and left_child.direction == "col" and left_child.children
+        local right_is_col_split = is_split(right_child) and right_child.direction == "col" and right_child.children
+
+        if left_is_col_split then
+            -- Flatten nested column splits to get all leaf segments
+            local leaves = collect_leaves_in_direction(left_child, "col")
+            local pos = 0
+            for _, leaf in ipairs(leaves) do
+                local color = unfocused_color
+                if focused_id then
+                    local left_edge_focused = false
+                    if is_pane(leaf.node) then
+                        left_edge_focused = (leaf.node.id == focused_id)
+                    else
+                        left_edge_focused = focused_on_edge(leaf.node, focused_id, "right")
+                    end
+
+                    local right_edge_focused = false
+                    if is_pane(right_child) then
+                        right_edge_focused = (right_child.id == focused_id)
+                    else
+                        right_edge_focused = focused_on_edge(right_child, focused_id, "left")
+                    end
+
+                    if left_edge_focused or right_edge_focused then
+                        color = focused_color
+                    end
+                end
+
+                table.insert(segments, {
+                    ratio_start = pos,
+                    ratio_end = pos + leaf.ratio,
+                    style = { fg = color },
+                })
+                pos = pos + leaf.ratio
+            end
+        elseif right_is_col_split then
+            -- Flatten nested column splits to get all leaf segments
+            local leaves = collect_leaves_in_direction(right_child, "col")
+            local pos = 0
+            for _, leaf in ipairs(leaves) do
+                local color = unfocused_color
+                if focused_id then
+                    local left_edge_focused = false
+                    if is_pane(left_child) then
+                        left_edge_focused = (left_child.id == focused_id)
+                    else
+                        left_edge_focused = focused_on_edge(left_child, focused_id, "right")
+                    end
+
+                    local right_edge_focused = false
+                    if is_pane(leaf.node) then
+                        right_edge_focused = (leaf.node.id == focused_id)
+                    else
+                        right_edge_focused = focused_on_edge(leaf.node, focused_id, "left")
+                    end
+
+                    if left_edge_focused or right_edge_focused then
+                        color = focused_color
+                    end
+                end
+
+                table.insert(segments, {
+                    ratio_start = pos,
+                    ratio_end = pos + leaf.ratio,
+                    style = { fg = color },
+                })
+                pos = pos + leaf.ratio
+            end
+        end
+    else
+        -- Horizontal divider between vertical panes (col split)
+        -- Check which side (or both) has a row split
+        local left_is_row_split = is_split(left_child) and left_child.direction == "row" and left_child.children
+        local right_is_row_split = is_split(right_child) and right_child.direction == "row" and right_child.children
+
+        if left_is_row_split then
+            -- Flatten nested row splits to get all leaf segments
+            local leaves = collect_leaves_in_direction(left_child, "row")
+            local pos = 0
+            for _, leaf in ipairs(leaves) do
+                local color = unfocused_color
+                if focused_id then
+                    local top_edge_focused = false
+                    if is_pane(leaf.node) then
+                        top_edge_focused = (leaf.node.id == focused_id)
+                    else
+                        top_edge_focused = focused_on_edge(leaf.node, focused_id, "bottom")
+                    end
+
+                    local bottom_edge_focused = false
+                    if is_pane(right_child) then
+                        bottom_edge_focused = (right_child.id == focused_id)
+                    else
+                        bottom_edge_focused = focused_on_edge(right_child, focused_id, "top")
+                    end
+
+                    if top_edge_focused or bottom_edge_focused then
+                        color = focused_color
+                    end
+                end
+
+                table.insert(segments, {
+                    ratio_start = pos,
+                    ratio_end = pos + leaf.ratio,
+                    style = { fg = color },
+                })
+                pos = pos + leaf.ratio
+            end
+        elseif right_is_row_split then
+            -- Flatten nested row splits to get all leaf segments
+            local leaves = collect_leaves_in_direction(right_child, "row")
+            local pos = 0
+            for _, leaf in ipairs(leaves) do
+                local color = unfocused_color
+                if focused_id then
+                    local top_edge_focused = false
+                    if is_pane(left_child) then
+                        top_edge_focused = (left_child.id == focused_id)
+                    else
+                        top_edge_focused = focused_on_edge(left_child, focused_id, "bottom")
+                    end
+
+                    local bottom_edge_focused = false
+                    if is_pane(leaf.node) then
+                        bottom_edge_focused = (leaf.node.id == focused_id)
+                    else
+                        bottom_edge_focused = focused_on_edge(leaf.node, focused_id, "top")
+                    end
+
+                    if top_edge_focused or bottom_edge_focused then
+                        color = focused_color
+                    end
+                end
+
+                table.insert(segments, {
+                    ratio_start = pos,
+                    ratio_end = pos + leaf.ratio,
+                    style = { fg = color },
+                })
+                pos = pos + leaf.ratio
+            end
+        end
+    end
+
+    return segments
+end
+
 ---Recursive rendering function
 ---@param node Node
 ---@param force_unfocused? boolean
@@ -2104,8 +2585,8 @@ local function render_node(node, force_unfocused)
             focus = is_focused,
         })
 
-        -- Wrap in Box if borders are enabled
-        if config.borders.enabled then
+        -- Wrap in Box if borders are enabled and mode is "around"
+        if config.borders.enabled and config.borders.mode == "around" then
             local border_color = is_focused and config.borders.focused_color or config.borders.unfocused_color
 
             return prise.Box({
@@ -2119,8 +2600,157 @@ local function render_node(node, force_unfocused)
         end
     elseif is_split(node) then
         local children_widgets = {}
-        for _, child in ipairs(node.children) do
-            table.insert(children_widgets, render_node(child, force_unfocused))
+        local border_mode = config.borders.mode or "around"
+        local h_spacing = config.borders.horizontal_spacing or 0
+        local v_spacing = config.borders.vertical_spacing or 0
+        local has_spacing = h_spacing > 0 or v_spacing > 0
+
+        for i, child in ipairs(node.children) do
+            local child_widget = render_node(child, force_unfocused)
+
+            -- Apply spacing between children only if using "around" mode with spacing
+            if config.borders.enabled and border_mode == "around" and has_spacing then
+                local is_first = i == 1
+                local is_last = i == #node.children
+
+                -- For row splits: add horizontal spacing between children
+                -- For column splits: add vertical spacing between children
+                if node.direction == "row" then
+                    child_widget = prise.Padding({
+                        left = is_first and 0 or (h_spacing / 2),
+                        right = is_last and 0 or (h_spacing / 2),
+                        top = 0,
+                        bottom = 0,
+                        child = child_widget,
+                    })
+                else -- column
+                    child_widget = prise.Padding({
+                        left = 0,
+                        right = 0,
+                        top = is_first and 0 or (v_spacing / 2),
+                        bottom = is_last and 0 or (v_spacing / 2),
+                        child = child_widget,
+                    })
+                end
+            end
+
+            table.insert(children_widgets, child_widget)
+
+            -- Insert divider BETWEEN children (not after the last one) if using "between" mode
+            if config.borders.enabled and border_mode == "between" and i < #node.children then
+                local divider_direction = node.direction == "row" and "vertical" or "horizontal"
+
+                -- Determine if we should try to create segments
+                -- Only create segments if the perpendicular child is a split
+                local should_segment = false
+                if node.direction == "row" then
+                    -- Vertical divider - check if either child is a column split
+                    should_segment = (is_split(child) and child.direction == "col")
+                        or (is_split(node.children[i + 1]) and node.children[i + 1].direction == "col")
+                else
+                    -- Horizontal divider - check if either child is a row split
+                    should_segment = (is_split(child) and child.direction == "row")
+                        or (is_split(node.children[i + 1]) and node.children[i + 1].direction == "row")
+                end
+
+                if should_segment then
+                    local segments = create_divider_segments(
+                        child,
+                        node.children[i + 1],
+                        divider_direction,
+                        state.focused_id,
+                        config.borders.focused_color,
+                        config.borders.unfocused_color
+                    )
+
+                    if segments and #segments > 0 then
+                        table.insert(
+                            children_widgets,
+                            prise.SegmentedDivider({
+                                direction = divider_direction,
+                                segments = segments,
+                                default_style = { fg = config.borders.unfocused_color },
+                            })
+                        )
+                    else
+                        -- Shouldn't happen, but fall back to simple divider
+                        local left_or_top_focused = false
+                        local right_or_bottom_focused = false
+
+                        if is_pane(child) then
+                            left_or_top_focused = (child.id == state.focused_id)
+                        else
+                            if node.direction == "row" then
+                                left_or_top_focused = focused_on_edge(child, state.focused_id, "right")
+                            else
+                                left_or_top_focused = focused_on_edge(child, state.focused_id, "bottom")
+                            end
+                        end
+
+                        if is_pane(node.children[i + 1]) then
+                            right_or_bottom_focused = (node.children[i + 1].id == state.focused_id)
+                        else
+                            if node.direction == "row" then
+                                right_or_bottom_focused =
+                                    focused_on_edge(node.children[i + 1], state.focused_id, "left")
+                            else
+                                right_or_bottom_focused = focused_on_edge(node.children[i + 1], state.focused_id, "top")
+                            end
+                        end
+
+                        local is_focused_border = left_or_top_focused or right_or_bottom_focused
+                        local border_color = is_focused_border and config.borders.focused_color
+                            or config.borders.unfocused_color
+
+                        table.insert(
+                            children_widgets,
+                            prise.Divider({
+                                direction = divider_direction,
+                                style = { fg = border_color },
+                                focus = is_focused_border,
+                            })
+                        )
+                    end
+                else
+                    -- Simple case - just highlight entire divider if either adjacent pane is focused
+                    -- For simple panes, just check if the pane itself is the focused one
+                    local left_or_top_focused = false
+                    local right_or_bottom_focused = false
+
+                    if is_pane(child) then
+                        left_or_top_focused = (child.id == state.focused_id)
+                    else
+                        if node.direction == "row" then
+                            left_or_top_focused = focused_on_edge(child, state.focused_id, "right")
+                        else
+                            left_or_top_focused = focused_on_edge(child, state.focused_id, "bottom")
+                        end
+                    end
+
+                    if is_pane(node.children[i + 1]) then
+                        right_or_bottom_focused = (node.children[i + 1].id == state.focused_id)
+                    else
+                        if node.direction == "row" then
+                            right_or_bottom_focused = focused_on_edge(node.children[i + 1], state.focused_id, "left")
+                        else
+                            right_or_bottom_focused = focused_on_edge(node.children[i + 1], state.focused_id, "top")
+                        end
+                    end
+
+                    local is_focused_border = left_or_top_focused or right_or_bottom_focused
+                    local border_color = is_focused_border and config.borders.focused_color
+                        or config.borders.unfocused_color
+
+                    table.insert(
+                        children_widgets,
+                        prise.Divider({
+                            direction = divider_direction,
+                            style = { fg = border_color },
+                            focus = is_focused_border,
+                        })
+                    )
+                end
+            end
         end
 
         local props = {

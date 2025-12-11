@@ -132,6 +132,12 @@ pub const Widget = struct {
                 p.child.deinit(allocator);
                 allocator.destroy(p.child);
             },
+            .divider => {},
+            .segmented_divider => |*sd| {
+                if (sd.segments.len > 0) {
+                    allocator.free(sd.segments);
+                }
+            },
         }
     }
 
@@ -156,6 +162,14 @@ pub const Widget = struct {
             .text => |*text| layoutTextImpl(text, constraints),
             .stack => |*stack| layoutStackImpl(stack, constraints),
             .positioned => |*pos| layoutPositionedImpl(pos, constraints),
+            .divider => |d| .{
+                .width = if (d.direction == .horizontal) (constraints.max_width orelse 1) else 1,
+                .height = if (d.direction == .vertical) (constraints.max_height orelse 1) else 1,
+            },
+            .segmented_divider => |sd| .{
+                .width = if (sd.direction == .horizontal) (constraints.max_width orelse 1) else 1,
+                .height = if (sd.direction == .vertical) (constraints.max_height orelse 1) else 1,
+            },
         };
         self.width = size.width;
         self.height = size.height;
@@ -246,6 +260,8 @@ pub const Widget = struct {
             .positioned => |pos| {
                 try pos.child.collectHitRegionsRecursive(allocator, regions, abs_x, abs_y);
             },
+            .divider => {},
+            .segmented_divider => {},
         }
     }
 
@@ -324,6 +340,8 @@ pub const Widget = struct {
             .padding => |p| {
                 try p.child.collectSplitHandlesRecursive(allocator, handles, abs_x, abs_y);
             },
+            .divider => {},
+            .segmented_divider => {},
         }
     }
 };
@@ -359,6 +377,29 @@ pub fn hitTestSplitHandle(handles: []const SplitHandle, x: f64, y: f64) ?*const 
     return null;
 }
 
+pub const Divider = struct {
+    direction: Direction,
+    style: vaxis.Style = .{},
+
+    pub const Direction = enum {
+        horizontal,
+        vertical,
+    };
+};
+
+pub const DividerSegment = struct {
+    start: u16, // Starting position (row or col depending on direction)
+    end: u16, // Ending position (exclusive)
+    style: vaxis.Style,
+    is_ratio: bool = false, // If true, start/end are permille values (0-1000)
+};
+
+pub const SegmentedDivider = struct {
+    direction: Divider.Direction,
+    segments: []const DividerSegment,
+    default_style: vaxis.Style = .{},
+};
+
 pub const WidgetKind = union(enum) {
     surface: Surface,
     text: Text,
@@ -370,6 +411,8 @@ pub const WidgetKind = union(enum) {
     row: Row,
     stack: Stack,
     positioned: Positioned,
+    divider: Divider,
+    segmented_divider: SegmentedDivider,
 };
 
 pub const CrossAxisAlignment = enum {
@@ -1136,6 +1179,115 @@ pub fn parseWidget(lua: *ziglua.Lua, allocator: std.mem.Allocator, index: i32) !
             .y = y,
             .anchor = anchor,
         } } };
+    } else if (std.mem.eql(u8, widget_type, "divider")) {
+        var direction: Divider.Direction = .horizontal;
+        _ = lua.getField(index, "direction");
+        if (lua.typeOf(-1) == .string) {
+            const dir_str = try lua.toString(-1);
+            if (std.mem.eql(u8, dir_str, "vertical")) direction = .vertical;
+        }
+        lua.pop(1);
+
+        var style = vaxis.Style{};
+        _ = lua.getField(index, "style");
+        if (lua.typeOf(-1) == .table) {
+            style = parseStyle(lua, -1) catch .{};
+        }
+        lua.pop(1);
+
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .divider = .{
+            .direction = direction,
+            .style = style,
+        } } };
+    } else if (std.mem.eql(u8, widget_type, "segmented_divider")) {
+        var direction: Divider.Direction = .horizontal;
+        _ = lua.getField(index, "direction");
+        if (lua.typeOf(-1) == .string) {
+            const dir_str = try lua.toString(-1);
+            if (std.mem.eql(u8, dir_str, "vertical")) direction = .vertical;
+        }
+        lua.pop(1);
+
+        var default_style = vaxis.Style{};
+        _ = lua.getField(index, "default_style");
+        if (lua.typeOf(-1) == .table) {
+            default_style = parseStyle(lua, -1) catch .{};
+        }
+        lua.pop(1);
+
+        // Parse segments array
+        var segments_list: std.ArrayList(DividerSegment) = .empty;
+        defer segments_list.deinit(allocator);
+
+        _ = lua.getField(index, "segments");
+        if (lua.typeOf(-1) == .table) {
+            const segments_len = lua.rawLen(-1);
+            for (1..segments_len + 1) |i| {
+                _ = lua.getIndex(-1, @intCast(i));
+                if (lua.typeOf(-1) == .table) {
+                    var ratio_start: ?f32 = null;
+                    var ratio_end: ?f32 = null;
+                    var start: u16 = 0;
+                    var end: u16 = 0;
+                    var seg_style = default_style;
+
+                    // Check for ratio_start/ratio_end (for proportional positioning)
+                    _ = lua.getField(-1, "ratio_start");
+                    if (lua.typeOf(-1) == .number) {
+                        ratio_start = @floatCast(lua.toNumber(-1) catch 0.0);
+                    }
+                    lua.pop(1);
+
+                    _ = lua.getField(-1, "ratio_end");
+                    if (lua.typeOf(-1) == .number) {
+                        ratio_end = @floatCast(lua.toNumber(-1) catch 0.0);
+                    }
+                    lua.pop(1);
+
+                    // Check for absolute start/end
+                    _ = lua.getField(-1, "start");
+                    if (lua.typeOf(-1) == .number) {
+                        start = @intCast(lua.toInteger(-1) catch 0);
+                    }
+                    lua.pop(1);
+
+                    _ = lua.getField(-1, "end");
+                    if (lua.typeOf(-1) == .number) {
+                        end = @intCast(lua.toInteger(-1) catch 0);
+                    }
+                    lua.pop(1);
+
+                    _ = lua.getField(-1, "style");
+                    if (lua.typeOf(-1) == .table) {
+                        seg_style = parseStyle(lua, -1) catch default_style;
+                    }
+                    lua.pop(1);
+
+                    // If we have ratio positions, store them as permille (0-1000)
+                    var is_ratio = false;
+                    if (ratio_start != null and ratio_end != null) {
+                        start = @intFromFloat(ratio_start.? * 1000.0);
+                        end = @intFromFloat(ratio_end.? * 1000.0);
+                        is_ratio = true;
+                    }
+
+                    try segments_list.append(allocator, .{
+                        .start = start,
+                        .end = end,
+                        .style = seg_style,
+                        .is_ratio = is_ratio,
+                    });
+                }
+                lua.pop(1);
+            }
+        }
+        lua.pop(1);
+
+        return .{ .ratio = ratio, .id = id, .focus = focus, .kind = .{ .segmented_divider = .{
+            .direction = direction,
+            .segments = try segments_list.toOwnedSlice(allocator),
+            .default_style = default_style,
+        } } };
     }
 
     return error.UnknownWidgetType;
@@ -1703,7 +1855,7 @@ fn layoutColumnImpl(col: *Column, constraints: BoxConstraints) Size {
     var nil_count: u16 = 0;
 
     for (col.children) |*child| {
-        const is_intrinsic = child.ratio == null and (child.kind == .text or child.kind == .text_input or child.kind == .list);
+        const is_intrinsic = child.ratio == null and (child.kind == .text or child.kind == .text_input or child.kind == .list or child.kind == .divider or child.kind == .segmented_divider);
         if (is_intrinsic) {
             const remaining = if (total_height > intrinsic_height) total_height - intrinsic_height else 0;
             const child_constraints: BoxConstraints = .{
@@ -1750,7 +1902,7 @@ fn layoutColumnImpl(col: *Column, constraints: BoxConstraints) Size {
         var remaining = remaining_for_nil;
         var count = nil_count;
         for (col.children) |*child| {
-            const is_intrinsic = child.kind == .text or child.kind == .text_input or child.kind == .list;
+            const is_intrinsic = child.kind == .text or child.kind == .text_input or child.kind == .list or child.kind == .divider or child.kind == .segmented_divider;
             if (child.ratio == null and !is_intrinsic) {
                 const share = remaining / count;
                 remaining -= share;
@@ -1806,7 +1958,7 @@ fn layoutRowImpl(row: *Row, constraints: BoxConstraints) Size {
     var nil_count: u16 = 0;
 
     for (row.children) |*child| {
-        const is_intrinsic = child.ratio == null and child.kind == .text;
+        const is_intrinsic = child.ratio == null and (child.kind == .text or child.kind == .divider or child.kind == .segmented_divider);
         if (is_intrinsic) {
             const remaining = if (total_width > intrinsic_width) total_width - intrinsic_width else 0;
             const child_constraints: BoxConstraints = .{
@@ -1853,7 +2005,7 @@ fn layoutRowImpl(row: *Row, constraints: BoxConstraints) Size {
         var remaining = remaining_for_nil;
         var count = nil_count;
         for (row.children) |*child| {
-            const is_intrinsic = child.kind == .text;
+            const is_intrinsic = child.kind == .text or child.kind == .divider or child.kind == .segmented_divider;
             if (child.ratio == null and !is_intrinsic) {
                 const share = remaining / count;
                 remaining -= share;
