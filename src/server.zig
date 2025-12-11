@@ -1296,11 +1296,24 @@ const Client = struct {
             var writer = std.Io.Writer.fixed(&encode_buf);
 
             pty_instance.terminal_mutex.lock();
+
+            // Reset scroll position to bottom on any key press
+            if (!is_release) {
+                pty_instance.terminal.scrollViewport(.bottom) catch |err| {
+                    log.err("Failed to reset scroll viewport: {}", .{err});
+                };
+            }
+
             key_encode.encode(&writer, key, &pty_instance.terminal, self.macos_option_as_alt) catch |err| {
                 log.err("Failed to encode key: {}", .{err});
                 pty_instance.terminal_mutex.unlock();
                 return;
             };
+
+            // Trigger redraw after scroll reset
+            if (!is_release) {
+                _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
+            }
 
             const encoded = writer.buffered();
             if (encoded.len > 0 and !key.key.modifier()) {
@@ -1393,8 +1406,8 @@ const Client = struct {
             };
         } else {
             const delta: isize = switch (mouse.button) {
-                .wheel_up => -1,
-                .wheel_down => 1,
+                .wheel_up => -3,
+                .wheel_down => 3,
                 else => 0,
             };
             if (delta != 0) {
@@ -1463,6 +1476,26 @@ const Client = struct {
                     defer pty_instance.terminal_mutex.unlock();
 
                     const screen = pty_instance.terminal.screens.active;
+
+                    // Auto-scroll if dragging near viewport edges
+                    const viewport_height = screen.pages.rows;
+                    const auto_scroll_margin: u16 = 2;
+                    var scroll_delta: isize = 0;
+
+                    if (row < auto_scroll_margin) {
+                        // Near top edge - scroll up
+                        scroll_delta = -1;
+                    } else if (row >= viewport_height - auto_scroll_margin) {
+                        // Near bottom edge - scroll down
+                        scroll_delta = 1;
+                    }
+
+                    if (scroll_delta != 0) {
+                        pty_instance.terminal.scrollViewport(.{ .delta = scroll_delta }) catch |err| {
+                            log.err("Failed to auto-scroll during drag: {}", .{err});
+                        };
+                    }
+
                     const start_pin = screen.pages.pin(.{ .viewport = .{
                         .x = start.col,
                         .y = start.row,
@@ -1940,12 +1973,13 @@ const Server = struct {
     /// Timestamp (ms since epoch) when server started - used to detect server restarts
     start_time_ms: i64 = 0,
 
-    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.Winsize, attach: bool, cwd: ?[]const u8, env: ?[]const msgpack.Value, macos_option_as_alt: key_encode.OptionAsAlt } {
+    fn parseSpawnPtyParams(params: msgpack.Value) struct { size: pty.Winsize, attach: bool, cwd: ?[]const u8, env: ?[]const msgpack.Value, cmd: ?[]const msgpack.Value, macos_option_as_alt: key_encode.OptionAsAlt } {
         var rows: u16 = 24;
         var cols: u16 = 80;
         var attach: bool = false;
         var cwd: ?[]const u8 = null;
         var env: ?[]const msgpack.Value = null;
+        var cmd: ?[]const msgpack.Value = null;
         var macos_option_as_alt: key_encode.OptionAsAlt = .false;
 
         if (params == .map) {
@@ -1961,6 +1995,8 @@ const Server = struct {
                     cwd = kv.value.string;
                 } else if (std.mem.eql(u8, kv.key.string, "env") and kv.value == .array) {
                     env = kv.value.array;
+                } else if (std.mem.eql(u8, kv.key.string, "cmd") and kv.value == .array) {
+                    cmd = kv.value.array;
                 } else if (std.mem.eql(u8, kv.key.string, "macos_option_as_alt")) {
                     macos_option_as_alt = parseMacosOptionAsAlt(kv.value);
                 }
@@ -1977,6 +2013,7 @@ const Server = struct {
             .attach = attach,
             .cwd = cwd,
             .env = env,
+            .cmd = cmd,
             .macos_option_as_alt = macos_option_as_alt,
         };
     }
@@ -1998,6 +2035,21 @@ const Server = struct {
         return parsePtyId(params);
     }
 
+    fn parseMacosOptionAsAlt(value: msgpack.Value) key_encode.OptionAsAlt {
+        if (value == .string) {
+            if (std.mem.eql(u8, value.string, "left")) {
+                return .left;
+            } else if (std.mem.eql(u8, value.string, "right")) {
+                return .right;
+            } else if (std.mem.eql(u8, value.string, "true")) {
+                return .true;
+            }
+        } else if (value == .boolean and value.boolean) {
+            return .true;
+        }
+        return .false;
+    }
+
     fn parseAttachPtyParams(params: msgpack.Value) !struct { pty_id: usize, macos_option_as_alt: key_encode.OptionAsAlt } {
         const pty_id = try parsePtyId(params);
         const macos_option_as_alt = if (params == .array and params.array.len >= 2)
@@ -2016,21 +2068,6 @@ const Server = struct {
             .integer => |i| @intCast(i),
             else => error.InvalidParams,
         };
-    }
-
-    fn parseMacosOptionAsAlt(value: msgpack.Value) key_encode.OptionAsAlt {
-        if (value == .string) {
-            if (std.mem.eql(u8, value.string, "left")) {
-                return .left;
-            } else if (std.mem.eql(u8, value.string, "right")) {
-                return .right;
-            } else if (std.mem.eql(u8, value.string, "true")) {
-                return .true;
-            }
-        } else if (value == .boolean and value.boolean) {
-            return .true;
-        }
-        return .false;
     }
 
     fn parseWritePtyParams(params: msgpack.Value) !struct { id: usize, data: []const u8 } {
@@ -2073,6 +2110,16 @@ const Server = struct {
         };
     }
 
+    fn parseDetachPtyParams(params: msgpack.Value) !struct { id: usize, client_fd: posix.fd_t } {
+        if (params != .array or params.array.len < 2 or params.array[0] != .unsigned or params.array[1] != .unsigned) {
+            return error.InvalidParams;
+        }
+        return .{
+            .id = @intCast(params.array[0].unsigned),
+            .client_fd = @intCast(params.array[1].unsigned),
+        };
+    }
+
     fn handleSpawnPty(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
         if (self.ptys.count() >= LIMITS.PTYS_MAX) {
             log.warn("PTY limit reached ({})", .{LIMITS.PTYS_MAX});
@@ -2081,9 +2128,10 @@ const Server = struct {
 
         const parsed = parseSpawnPtyParams(params);
         const cwd = parsed.cwd orelse posix.getenv("HOME");
-        log.info("spawn_pty: rows={} cols={} attach={} cwd={?s} has_client_env={}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach, cwd, parsed.env != null });
+        log.info("spawn_pty: rows={} cols={} attach={} cwd={?s} has_client_env={} has_cmd={}", .{ parsed.size.ws_row, parsed.size.ws_col, parsed.attach, cwd, parsed.env != null, parsed.cmd != null });
 
-        var shell: []const u8 = "/bin/sh";
+        var shell: []const u8 = try self.allocator.dupe(u8, "/bin/sh");
+
         var env_list = std.ArrayList([]const u8).empty;
         defer {
             for (env_list.items) |item| {
@@ -2098,7 +2146,8 @@ const Server = struct {
                     const env_str = try self.allocator.dupe(u8, val.string);
                     try env_list.append(self.allocator, env_str);
                     if (std.mem.startsWith(u8, val.string, "SHELL=")) {
-                        shell = env_str[6..];
+                        self.allocator.free(shell);
+                        shell = try self.allocator.dupe(u8, env_str[6..]);
                     }
                 }
             }
@@ -2112,11 +2161,45 @@ const Server = struct {
             const prepared = try prepareSpawnEnv(self.allocator, &env_map);
             env_list = prepared;
             if (posix.getenv("SHELL")) |s| {
-                shell = s;
+                self.allocator.free(shell);
+                shell = try self.allocator.dupe(u8, s);
             }
         }
 
-        const process = try pty.Process.spawn(self.allocator, parsed.size, &.{shell}, @ptrCast(env_list.items), cwd);
+        var cmd_list = std.ArrayList([]const u8).empty;
+        defer cmd_list.deinit(self.allocator);
+
+        var argv_owned: ?[][]const u8 = null;
+        var cmd_str_owned: ?[]u8 = null;
+
+        const argv: []const []const u8 = if (parsed.cmd) |cmd_array| blk: {
+            for (cmd_array) |val| {
+                if (val == .string) {
+                    try cmd_list.append(self.allocator, val.string);
+                }
+            }
+
+            if (cmd_list.items.len > 0) {
+                // Run command through shell: [shell, "-c", "cmd arg1 arg2"]
+                const cmd_str = try std.mem.join(self.allocator, " ", cmd_list.items);
+                cmd_str_owned = cmd_str;
+
+                argv_owned = try self.allocator.alloc([]const u8, 3);
+                argv_owned.?[0] = shell;
+                argv_owned.?[1] = "-c";
+                argv_owned.?[2] = cmd_str;
+                break :blk argv_owned.?;
+            }
+            break :blk &.{shell};
+        } else &.{shell};
+        const process = try pty.Process.spawn(self.allocator, parsed.size, argv, @ptrCast(env_list.items), cwd);
+
+        // Now clean up after spawn has completed
+        defer {
+            if (argv_owned) |owned| self.allocator.free(owned);
+            if (cmd_str_owned) |str| self.allocator.free(str);
+            self.allocator.free(shell);
+        }
 
         const pty_id = self.next_pty_id;
         self.next_pty_id += 1;
@@ -2173,26 +2256,26 @@ const Server = struct {
             log.warn("attach_pty: invalid params: {}", .{err});
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
         };
+        const pty_id = parsed.pty_id;
+        client.macos_option_as_alt = parsed.macos_option_as_alt;
 
-        log.info("attach_pty: pty_id={} client_fd={} macos_option_as_alt={}", .{ parsed.pty_id, client.fd, parsed.macos_option_as_alt });
+        log.info("attach_pty: pty_id={} client_fd={}", .{ pty_id, client.fd });
 
-        const pty_instance = self.ptys.get(parsed.pty_id) orelse {
-            log.warn("attach_pty: PTY {} not found", .{parsed.pty_id});
+        const pty_instance = self.ptys.get(pty_id) orelse {
+            log.warn("attach_pty: PTY {} not found", .{pty_id});
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
         };
 
-        client.macos_option_as_alt = parsed.macos_option_as_alt;
-
         try pty_instance.addClient(self.allocator, client);
-        try client.attached_ptys.append(self.allocator, parsed.pty_id);
-        log.info("Client {} attached to PTY {}", .{ client.fd, parsed.pty_id });
+        try client.attached_ptys.append(self.allocator, pty_id);
+        log.info("Client {} attached to PTY {}", .{ client.fd, pty_id });
 
         const msg = try buildRedrawMessageFromPty(self.allocator, pty_instance, .full);
         defer self.allocator.free(msg);
 
         try self.sendRedraw(self.loop, pty_instance, msg, client);
 
-        return msgpack.Value{ .unsigned = parsed.pty_id };
+        return msgpack.Value{ .unsigned = pty_id };
     }
 
     fn handleWritePty(self: *Server, params: msgpack.Value) !msgpack.Value {
@@ -2296,42 +2379,57 @@ const Server = struct {
         return msgpack.Value.nil;
     }
 
-    fn handleDetachPty(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
-        const pty_id: usize = switch (params) {
-            .unsigned => |u| u,
-            .integer => |i| @intCast(i),
-            .array => |arr| blk: {
-                if (arr.len < 1) return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
-                break :blk switch (arr[0]) {
-                    .unsigned => |u| u,
-                    .integer => |i| @intCast(i),
-                    else => return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") },
-                };
-            },
-            else => return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") },
+    fn handleDetachPty(self: *Server, params: msgpack.Value) !msgpack.Value {
+        const args = parseDetachPtyParams(params) catch {
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
         };
 
-        const pty_instance = self.ptys.get(pty_id) orelse {
+        const pty_instance = self.ptys.get(args.id) orelse {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "PTY not found") };
         };
 
-        pty_instance.removeClient(client);
-        for (client.attached_ptys.items, 0..) |pid, i| {
-            if (pid == pty_id) {
-                _ = client.attached_ptys.swapRemove(i);
+        for (self.clients.items) |c| {
+            if (c.fd == args.client_fd) {
+                pty_instance.removeClient(c);
+                for (c.attached_ptys.items, 0..) |pid, i| {
+                    if (pid == args.id) {
+                        _ = c.attached_ptys.swapRemove(i);
+                        break;
+                    }
+                }
+                log.info("Client {} detached from PTY {}", .{ c.fd, args.id });
                 break;
             }
         }
-        log.info("Client {} detached from PTY {}", .{ client.fd, pty_id });
 
         return msgpack.Value.nil;
     }
 
-    fn handleDetachPtys(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
-        const pty_ids = switch (params) {
+    fn handleDetachPtys(self: *Server, params: msgpack.Value) !msgpack.Value {
+        const params_arr = switch (params) {
             .array => |arr| arr,
             else => return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") },
         };
+        if (params_arr.len < 2) {
+            return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
+        }
+        const pty_ids = switch (params_arr[0]) {
+            .array => |arr| arr,
+            else => return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") },
+        };
+        const client_fd: posix.fd_t = switch (params_arr[1]) {
+            .unsigned => |u| @intCast(u),
+            .integer => |i| @intCast(i),
+            else => return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") },
+        };
+
+        var matching_client: ?*Client = null;
+        for (self.clients.items) |c| {
+            if (c.fd == client_fd) {
+                matching_client = c;
+                break;
+            }
+        }
 
         for (pty_ids) |pty_id_val| {
             const pty_id: usize = switch (pty_id_val) {
@@ -2341,14 +2439,16 @@ const Server = struct {
             };
 
             if (self.ptys.get(pty_id)) |pty_instance| {
-                pty_instance.removeClient(client);
-                for (client.attached_ptys.items, 0..) |pid, i| {
-                    if (pid == pty_id) {
-                        _ = client.attached_ptys.swapRemove(i);
-                        break;
+                if (matching_client) |c| {
+                    pty_instance.removeClient(c);
+                    for (c.attached_ptys.items, 0..) |pid, i| {
+                        if (pid == pty_id) {
+                            _ = c.attached_ptys.swapRemove(i);
+                            break;
+                        }
                     }
                 }
-                std.log.info("Client {} detached from PTY {}", .{ client.fd, pty_id });
+                std.log.info("Client detached from PTY {}", .{pty_id});
             }
         }
 
@@ -2477,9 +2577,9 @@ const Server = struct {
         } else if (std.mem.eql(u8, method, "resize_pty")) {
             return self.handleResizePty(client, params);
         } else if (std.mem.eql(u8, method, "detach_pty")) {
-            return self.handleDetachPty(client, params);
+            return self.handleDetachPty(params);
         } else if (std.mem.eql(u8, method, "detach_ptys")) {
-            return self.handleDetachPtys(client, params);
+            return self.handleDetachPtys(params);
         } else if (std.mem.eql(u8, method, "get_selection")) {
             return self.handleGetSelection(params);
         } else if (std.mem.eql(u8, method, "clear_selection")) {
@@ -3368,11 +3468,6 @@ test "parseAttachPtyParams" {
     try testing.expectEqual(@as(usize, 42), result.pty_id);
     try testing.expectEqual(key_encode.OptionAsAlt.false, result.macos_option_as_alt);
 
-    var valid_args_with_opt = [_]msgpack.Value{ .{ .unsigned = 42 }, .{ .string = "left" } };
-    const result2 = try Server.parseAttachPtyParams(.{ .array = &valid_args_with_opt });
-    try testing.expectEqual(@as(usize, 42), result2.pty_id);
-    try testing.expectEqual(key_encode.OptionAsAlt.left, result2.macos_option_as_alt);
-
     var invalid_args = [_]msgpack.Value{};
     try testing.expectError(error.InvalidParams, Server.parseAttachPtyParams(.{ .array = &invalid_args }));
 }
@@ -3417,6 +3512,18 @@ test "parseResizePtyParams" {
     try testing.expectEqual(@as(u16, 80), p_args.cols);
     try testing.expectEqual(@as(u16, 800), p_args.x_pixel);
     try testing.expectEqual(@as(u16, 600), p_args.y_pixel);
+}
+
+test "parseDetachPtyParams" {
+    const testing = std.testing;
+
+    var valid_args = [_]msgpack.Value{
+        .{ .unsigned = 42 },
+        .{ .unsigned = 10 },
+    };
+    const args = try Server.parseDetachPtyParams(.{ .array = &valid_args });
+    try testing.expectEqual(@as(usize, 42), args.id);
+    try testing.expectEqual(@as(posix.fd_t, 10), args.client_fd);
 }
 
 test "buildRedrawMessageFromPty" {

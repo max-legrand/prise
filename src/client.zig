@@ -301,7 +301,13 @@ pub const ClientLogic = struct {
 
     fn handleCopySelectionResult(result: msgpack.Value) ServerAction {
         if (result == .string) {
+            log.info("handleCopySelectionResult: received selection text ({} bytes)", .{result.string.len});
             return .{ .copy_to_clipboard = result.string };
+        }
+        if (result == .nil) {
+            log.warn("handleCopySelectionResult: no selection (nil result)", .{});
+        } else {
+            log.warn("handleCopySelectionResult: unexpected result type: {s}", .{@tagName(result)});
         }
         return .none;
     }
@@ -603,10 +609,7 @@ pub const App = struct {
     ui: UI = undefined,
     first_resize_done: bool = false,
     socket_path: []const u8 = undefined,
-    /// Session name to attach to (existing session passed via `prise session attach <name>`)
     attach_session: ?[]const u8 = null,
-    /// User-specified session name for new session (passed via `prise -s <name>`)
-    new_session_name: ?[]const u8 = null,
     initial_cwd: ?[]const u8 = null,
     last_render_time: i64 = 0,
     render_timer: ?io.Task = null,
@@ -855,39 +858,49 @@ pub const App = struct {
         self.ui.setDetachCallback(self, struct {
             fn detachCb(ctx: *anyopaque, session_name: []const u8) anyerror!void {
                 const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                log.info("detachCb called with session_name='{s}', current_session_name={?s}", .{ session_name, app_ptr.current_session_name });
                 try app_ptr.saveSession(session_name);
 
                 // Build array of PTY IDs to detach
-                var pty_ids = try app_ptr.allocator.alloc(msgpack.Value, app_ptr.surfaces.count());
-                defer app_ptr.allocator.free(pty_ids);
+                var pty_id_list = try app_ptr.allocator.alloc(u32, app_ptr.surfaces.count());
+                defer app_ptr.allocator.free(pty_id_list);
                 var i: usize = 0;
                 var key_iter = app_ptr.surfaces.keyIterator();
                 while (key_iter.next()) |pty_id| {
-                    pty_ids[i] = .{ .unsigned = pty_id.* };
+                    pty_id_list[i] = pty_id.*;
                     i += 1;
                 }
 
-                // Send single detach_session request with all PTY IDs
+                // Send detach_ptys request with all PTY IDs
                 const msgid = app_ptr.state.next_msgid;
                 app_ptr.state.next_msgid +%= 1;
 
+                // Build the message as: [0, msgid, "detach_ptys", [pty_ids, fd]]
+                var pty_ids_msgpack = try app_ptr.allocator.alloc(msgpack.Value, pty_id_list.len);
+                defer app_ptr.allocator.free(pty_ids_msgpack);
+                for (pty_id_list, 0..) |id, j| {
+                    pty_ids_msgpack[j] = .{ .unsigned = id };
+                }
+
+                var params = try app_ptr.allocator.alloc(msgpack.Value, 2);
+                defer app_ptr.allocator.free(params);
+                params[0] = .{ .array = pty_ids_msgpack };
+                params[1] = .{ .unsigned = @intCast(app_ptr.fd) };
+
                 var arr = try app_ptr.allocator.alloc(msgpack.Value, 4);
+                defer app_ptr.allocator.free(arr);
                 arr[0] = .{ .unsigned = 0 }; // request
                 arr[1] = .{ .unsigned = msgid };
                 arr[2] = .{ .string = "detach_ptys" };
-                arr[3] = .{ .array = pty_ids };
+                arr[3] = .{ .array = params };
 
-                const encoded = msgpack.encodeFromValue(app_ptr.allocator, msgpack.Value{ .array = arr }) catch {
-                    app_ptr.allocator.free(arr);
-                    return;
-                };
+                const encoded = try msgpack.encodeFromValue(app_ptr.allocator, msgpack.Value{ .array = arr });
                 defer app_ptr.allocator.free(encoded);
-                app_ptr.allocator.free(arr);
 
                 // Track that we're waiting for detach response
                 try app_ptr.state.pending_requests.put(msgid, .detach);
 
-                app_ptr.sendDirect(encoded) catch {};
+                try app_ptr.sendDirect(encoded);
             }
         }.detachCb);
 
@@ -914,6 +927,14 @@ pub const App = struct {
                 try app_ptr.renameCurrentSession(new_name);
             }
         }.renameCb);
+
+        // Register switch_session callback
+        self.ui.setSwitchSessionCallback(self, struct {
+            fn switchCb(ctx: *anyopaque, target_session: []const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.switchToSession(target_session);
+            }
+        }.switchCb);
 
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
@@ -1485,8 +1506,362 @@ pub const App = struct {
         }
     }
 
+    fn applyDimToStyle(self: *App, style: vaxis.Style, dim_factor: f32) vaxis.Style {
+        if (dim_factor == 0.0) return style;
+
+        var dimmed = style;
+
+        // Apply dimming to foreground color
+        if (dimmed.fg != .default) {
+            const fg_rgb = self.resolveColor(dimmed.fg);
+            if (fg_rgb) |rgb| {
+                dimmed.fg = .{ .rgb = Surface.TerminalColors.reduceContrast(rgb, dim_factor * 0.5) };
+            }
+        }
+
+        // Apply dimming to background color
+        if (dimmed.bg != .default) {
+            const bg_rgb = self.resolveColor(dimmed.bg);
+            if (bg_rgb) |rgb| {
+                dimmed.bg = .{ .rgb = Surface.TerminalColors.reduceContrast(rgb, dim_factor) };
+            }
+        }
+
+        return dimmed;
+    }
+
+    fn resolveColor(self: *App, color: vaxis.Cell.Color) ?[3]u8 {
+        return switch (color) {
+            .rgb => |rgb| rgb,
+            .index => |idx| blk: {
+                if (idx >= 16) break :blk null;
+                if (self.colors.palette[idx]) |c_val| {
+                    break :blk switch (c_val) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+            .default => blk: {
+                if (self.colors.bg) |bg| {
+                    break :blk switch (bg) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+        };
+    }
+
     fn renderWidget(self: *App, w: widget.Widget, win: vaxis.Window) !void {
-        try w.renderTo(win, self.allocator);
+        switch (w.kind) {
+            .surface => |surf| {
+                if (self.surfaces.get(surf.pty_id)) |surface| {
+                    // Check if we need to resize the PTY
+                    log.debug("renderWidget surface: pty={} widget={}x{} surface={}x{}", .{
+                        surf.pty_id,
+                        w.width,
+                        w.height,
+                        surface.cols,
+                        surface.rows,
+                    });
+                    if (w.width != surface.cols or w.height != surface.rows) {
+                        log.info("renderWidget: size mismatch for pty={}, sending resize", .{surf.pty_id});
+                        self.sendResize(surf.pty_id, w.height, w.width) catch |err| {
+                            log.err("Failed to send resize: {}", .{err});
+                        };
+                    }
+                    // Calculate dim factor based on focus
+                    const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                    log.debug("renderWidget surface: pty={} focus={} dim_factor={d}", .{ surf.pty_id, w.focus, dim_factor });
+                    surface.render(win, w.focus, &self.colors, dim_factor);
+                }
+            },
+            .text => |text| {
+                // Use a temporary arena for rendering this frame
+                var arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer arena.deinit();
+                const alloc = arena.allocator();
+
+                var iter = widget.Text.Iterator{
+                    .text = text,
+                    .max_width = w.width,
+                    .allocator = alloc,
+                };
+
+                var row: usize = 0;
+                while (iter.next() catch null) |line| {
+                    var col: usize = 0;
+
+                    // Handle alignment
+                    const free_space = if (w.width > line.width) w.width - line.width else 0;
+                    const start_col: u16 = switch (text.@"align") {
+                        widget.Text.Align.left => 0,
+                        widget.Text.Align.center => free_space / 2,
+                        widget.Text.Align.right => free_space,
+                    };
+
+                    col = start_col;
+
+                    for (line.segments) |seg| {
+                        _ = win.printSegment(seg, .{ .row_offset = @intCast(row), .col_offset = @intCast(col) });
+                        col += vaxis.gwidth.gwidth(seg.text, .unicode);
+                    }
+
+                    // Fill remaining space with background from last segment
+                    if (line.segments.len > 0 and col < w.width) {
+                        const last_style = line.segments[line.segments.len - 1].style;
+                        const spacer = vaxis.Segment{
+                            .text = " ",
+                            .style = last_style,
+                        };
+                        while (col < w.width) {
+                            _ = win.printSegment(spacer, .{ .row_offset = @intCast(row), .col_offset = @intCast(col) });
+                            col += 1;
+                        }
+                    }
+
+                    row += 1;
+                }
+            },
+            .text_input => |ti| {
+                if (self.ui.text_inputs.get(ti.input_id)) |input| {
+                    input.updateScrollOffset(@intCast(win.width));
+                    input.render(win, ti.style);
+                }
+            },
+            .list => |list| {
+                const visible_rows = w.height;
+                const start = list.scroll_offset;
+                const end = @min(start + visible_rows, list.items.len);
+
+                log.debug("render list: items={} height={} start={} end={}", .{ list.items.len, w.height, start, end });
+
+                for (start..end) |i| {
+                    const row: u16 = @intCast(i - start);
+                    const item = list.items[i];
+                    const is_selected = list.selected != null and list.selected.? == i;
+
+                    const item_style = if (is_selected)
+                        list.selected_style
+                    else
+                        item.style orelse list.style;
+
+                    // Fill entire row with background first
+                    for (0..win.width) |col| {
+                        win.writeCell(@intCast(col), row, .{
+                            .char = .{ .grapheme = " ", .width = 1 },
+                            .style = item_style,
+                        });
+                    }
+
+                    // Render text using grapheme iterator
+                    var col: u16 = 0;
+                    var giter = vaxis.unicode.graphemeIterator(item.text);
+                    while (giter.next()) |grapheme| {
+                        if (col >= win.width) break;
+                        const bytes = grapheme.bytes(item.text);
+                        const gw: u8 = @intCast(vaxis.gwidth.gwidth(bytes, .unicode));
+                        win.writeCell(col, row, .{
+                            .char = .{ .grapheme = bytes, .width = gw },
+                            .style = item_style,
+                        });
+                        col += gw;
+                    }
+                }
+            },
+            .box => |b| {
+                const chars = b.borderChars();
+                // Apply dimming to border style if not focused
+                const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                const style = self.applyDimToStyle(b.style, dim_factor);
+
+                log.debug("render box: w={} h={} focus={} dim_factor={d}", .{ win.width, win.height, w.focus, dim_factor });
+
+                // Fill background for the entire box area
+                if (style.bg != .default) {
+                    for (0..win.height) |row| {
+                        for (0..win.width) |col| {
+                            win.writeCell(@intCast(col), @intCast(row), .{
+                                .char = .{ .grapheme = " ", .width = 1 },
+                                .style = style,
+                            });
+                        }
+                    }
+                }
+
+                // Render border if not none
+                if (b.border != .none and win.width >= 2 and win.height >= 2) {
+                    win.writeCell(0, 0, .{ .char = .{ .grapheme = chars.tl, .width = 1 }, .style = style });
+                    win.writeCell(win.width - 1, 0, .{ .char = .{ .grapheme = chars.tr, .width = 1 }, .style = style });
+                    win.writeCell(0, win.height - 1, .{ .char = .{ .grapheme = chars.bl, .width = 1 }, .style = style });
+                    win.writeCell(win.width - 1, win.height - 1, .{ .char = .{ .grapheme = chars.br, .width = 1 }, .style = style });
+
+                    if (win.width > 2) {
+                        for (1..win.width - 1) |col| {
+                            win.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                            win.writeCell(@intCast(col), win.height - 1, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                        }
+                    }
+
+                    if (win.height > 2) {
+                        for (1..win.height - 1) |row| {
+                            win.writeCell(0, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                            win.writeCell(win.width - 1, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                        }
+                    }
+                }
+
+                const child_win = win.child(.{
+                    .x_off = b.child.x,
+                    .y_off = b.child.y,
+                    .width = b.child.width,
+                    .height = b.child.height,
+                });
+                try self.renderWidget(b.child.*, child_win);
+            },
+            .padding => |p| {
+                const child_win = win.child(.{
+                    .x_off = p.child.x,
+                    .y_off = p.child.y,
+                    .width = p.child.width,
+                    .height = p.child.height,
+                });
+                try self.renderWidget(p.child.*, child_win);
+            },
+            .column => |col| {
+                for (col.children) |child| {
+                    const child_win = win.child(.{
+                        .x_off = child.x,
+                        .y_off = child.y,
+                        .width = child.width,
+                        .height = child.height,
+                    });
+                    try self.renderWidget(child, child_win);
+                }
+            },
+            .row => |row| {
+                for (row.children) |child| {
+                    const child_win = win.child(.{
+                        .x_off = child.x,
+                        .y_off = child.y,
+                        .width = child.width,
+                        .height = child.height,
+                    });
+                    try self.renderWidget(child, child_win);
+                }
+            },
+            .stack => |stack| {
+                for (stack.children) |child| {
+                    const child_win = win.child(.{
+                        .x_off = child.x,
+                        .y_off = child.y,
+                        .width = child.width,
+                        .height = child.height,
+                    });
+                    try self.renderWidget(child, child_win);
+                }
+            },
+            .positioned => |pos| {
+                const child_win = win.child(.{
+                    .x_off = pos.child.x,
+                    .y_off = pos.child.y,
+                    .width = pos.child.width,
+                    .height = pos.child.height,
+                });
+                try self.renderWidget(pos.child.*, child_win);
+            },
+            .divider => |d| {
+                const style = self.applyDimToStyle(d.style, if (w.focus) 0.0 else self.ui.dim_factor);
+                const char: []const u8 = if (d.direction == .horizontal) "─" else "│";
+
+                if (d.direction == .horizontal) {
+                    // Draw horizontal line across width
+                    for (0..win.width) |col| {
+                        win.writeCell(@intCast(col), 0, .{
+                            .char = .{ .grapheme = char, .width = 1 },
+                            .style = style,
+                        });
+                    }
+                } else {
+                    // Draw vertical line down height
+                    for (0..win.height) |row| {
+                        win.writeCell(0, @intCast(row), .{
+                            .char = .{ .grapheme = char, .width = 1 },
+                            .style = style,
+                        });
+                    }
+                }
+            },
+            .segmented_divider => |sd| {
+                const char: []const u8 = if (sd.direction == .horizontal) "─" else "│";
+                const default_style = self.applyDimToStyle(sd.default_style, if (w.focus) 0.0 else self.ui.dim_factor);
+                const total_size: u16 = if (sd.direction == .horizontal) win.width else win.height;
+
+                // Guard against zero-size windows
+                if (total_size == 0) return;
+
+                // If no segments, just draw with default style (shouldn't happen but be safe)
+                if (sd.segments.len == 0) {
+                    if (sd.direction == .horizontal) {
+                        for (0..win.width) |col| {
+                            win.writeCell(@intCast(col), 0, .{
+                                .char = .{ .grapheme = char, .width = 1 },
+                                .style = default_style,
+                            });
+                        }
+                    } else {
+                        for (0..win.height) |row| {
+                            win.writeCell(0, @intCast(row), .{
+                                .char = .{ .grapheme = char, .width = 1 },
+                                .style = default_style,
+                            });
+                        }
+                    }
+                    return;
+                }
+
+                if (sd.direction == .horizontal) {
+                    // Draw horizontal line across width with segments
+                    for (0..win.width) |col| {
+                        var segment_style = default_style;
+                        // Check which segment this position belongs to
+                        for (sd.segments) |segment| {
+                            const actual_start: u16 = if (segment.is_ratio) @intFromFloat(@as(f32, @floatFromInt(segment.start)) / 1000.0 * @as(f32, @floatFromInt(total_size))) else segment.start;
+                            const actual_end: u16 = if (segment.is_ratio) @intFromFloat(@as(f32, @floatFromInt(segment.end)) / 1000.0 * @as(f32, @floatFromInt(total_size))) else segment.end;
+                            if (col >= actual_start and col < actual_end) {
+                                segment_style = self.applyDimToStyle(segment.style, if (w.focus) 0.0 else self.ui.dim_factor);
+                                break;
+                            }
+                        }
+                        win.writeCell(@intCast(col), 0, .{
+                            .char = .{ .grapheme = char, .width = 1 },
+                            .style = segment_style,
+                        });
+                    }
+                } else {
+                    // Draw vertical line down height with segments
+                    for (0..win.height) |row| {
+                        var segment_style = default_style;
+                        // Check which segment this position belongs to
+                        for (sd.segments) |segment| {
+                            const actual_start: u16 = if (segment.is_ratio) @intFromFloat(@as(f32, @floatFromInt(segment.start)) / 1000.0 * @as(f32, @floatFromInt(total_size))) else segment.start;
+                            const actual_end: u16 = if (segment.is_ratio) @intFromFloat(@as(f32, @floatFromInt(segment.end)) / 1000.0 * @as(f32, @floatFromInt(total_size))) else segment.end;
+                            if (row >= actual_start and row < actual_end) {
+                                segment_style = self.applyDimToStyle(segment.style, if (w.focus) 0.0 else self.ui.dim_factor);
+                                break;
+                            }
+                        }
+                        win.writeCell(0, @intCast(row), .{
+                            .char = .{ .grapheme = char, .width = 1 },
+                            .style = segment_style,
+                        });
+                    }
+                }
+            },
+        }
     }
 
     pub fn scheduleRender(self: *App) !void {
@@ -1494,20 +1869,16 @@ pub const App = struct {
             const now = std.time.milliTimestamp();
             const FRAME_TIME = 8;
 
-            if (now - self.last_render_time >= FRAME_TIME) {
-                try self.render();
-            } else if (self.render_timer == null) {
+            // Always schedule through a timer to avoid reentrancy from Lua callbacks
+            if (self.render_timer == null) {
                 const delay = FRAME_TIME - (now - self.last_render_time);
-                // Make sure delay is positive
+                // Make sure delay is positive (minimum 0ms)
                 const safe_delay = if (delay < 0) 0 else delay;
                 self.render_timer = try loop.timeout(@as(u64, @intCast(safe_delay)) * std.time.ns_per_ms, .{
                     .ptr = self,
                     .cb = onRenderTimer,
                 });
             }
-        } else {
-            // Fallback if no loop (e.g. during tests or init)
-            try self.render();
         }
     }
 
@@ -1639,18 +2010,21 @@ pub const App = struct {
         // After receiving server info, proceed with spawn or session attach
         if (self.attach_session) |session_name| {
             // Use the attached session name
-            log.info("Setting current_session_name to: {s}", .{session_name});
+            log.info("onServerInfoReceived: attaching to session '{s}'", .{session_name});
+            if (self.current_session_name) |old| {
+                log.info("onServerInfoReceived: freeing old current_session_name='{s}'", .{old});
+                self.allocator.free(old);
+            }
             self.current_session_name = try self.allocator.dupe(u8, session_name);
+            log.info("onServerInfoReceived: set current_session_name='{s}'", .{self.current_session_name.?});
             try self.startSessionAttach(session_name);
-        } else if (self.new_session_name) |name| {
-            // User specified a name for new session
-            self.current_session_name = try self.allocator.dupe(u8, name);
-            log.info("Starting new session with user-specified name: {s}", .{name});
-            try self.spawnInitialPty();
         } else {
             // Generate a new session name for fresh launch
+            if (self.current_session_name) |old| {
+                self.allocator.free(old);
+            }
             self.current_session_name = try self.ui.getNextSessionName();
-            log.info("Starting new session: {s}", .{self.current_session_name.?});
+            log.info("onServerInfoReceived: generated new session name='{s}'", .{self.current_session_name.?});
             try self.spawnInitialPty();
         }
     }
@@ -1677,8 +2051,7 @@ pub const App = struct {
             try env_array.append(self.allocator, .{ .string = env_str });
         }
 
-        const macos_option_as_alt = self.ui.getMacosOptionAsAlt();
-        const param_count: usize = if (self.initial_cwd != null) 6 else 5;
+        const param_count: usize = if (self.initial_cwd != null) 5 else 4;
         var params_kv = try self.allocator.alloc(msgpack.Value.KeyValue, param_count);
         defer self.allocator.free(params_kv);
         log.info("Sending spawn_pty: rows={} cols={} cwd={?s} env_count={}", .{ ws.rows, ws.cols, self.initial_cwd, env_array.items.len });
@@ -1686,9 +2059,8 @@ pub const App = struct {
         params_kv[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = ws.cols } };
         params_kv[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } };
         params_kv[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
-        params_kv[4] = .{ .key = .{ .string = "macos_option_as_alt" }, .value = .{ .string = macos_option_as_alt } };
         if (self.initial_cwd) |cwd| {
-            params_kv[5] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+            params_kv[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
         }
         const params_val = msgpack.Value{ .map = params_kv };
         const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_pty", params_val });
@@ -1758,11 +2130,9 @@ pub const App = struct {
             self.state.next_msgid += 1;
             try self.state.pending_requests.put(msgid, .{ .attach = .{ .pty_id = @intCast(pty_id), .cwd = cwd } });
 
-            // Server expects params as array: [pty_id, macos_option_as_alt]
-            const macos_option_as_alt = self.ui.getMacosOptionAsAlt();
-            var params = try self.allocator.alloc(msgpack.Value, 2);
+            // Server expects params as array: [pty_id]
+            var params = try self.allocator.alloc(msgpack.Value, 1);
             params[0] = .{ .unsigned = pty_id };
-            params[1] = .{ .string = macos_option_as_alt };
             const params_val = msgpack.Value{ .array = params };
 
             var arr = try self.allocator.alloc(msgpack.Value, 4);
@@ -1804,17 +2174,15 @@ pub const App = struct {
             try env_array.append(self.allocator, .{ .string = env_str });
         }
 
-        const macos_option_as_alt = self.ui.getMacosOptionAsAlt();
-        const param_count: usize = if (cwd != null) 6 else 5;
+        const param_count: usize = if (cwd != null) 5 else 4;
         var params_kv = try self.allocator.alloc(msgpack.Value.KeyValue, param_count);
         defer self.allocator.free(params_kv);
         params_kv[0] = .{ .key = .{ .string = "rows" }, .value = .{ .unsigned = ws.rows } };
         params_kv[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = ws.cols } };
         params_kv[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = true } };
         params_kv[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
-        params_kv[4] = .{ .key = .{ .string = "macos_option_as_alt" }, .value = .{ .string = macos_option_as_alt } };
         if (cwd) |c| {
-            params_kv[5] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = c } };
+            params_kv[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = c } };
         }
         const params_val = msgpack.Value{ .map = params_kv };
         const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "spawn_pty", params_val });
@@ -1883,7 +2251,7 @@ pub const App = struct {
                         switch (action) {
                             .send_attach => |pty_id| {
                                 log.info("Sending attach_pty for session {}", .{pty_id});
-                                app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{ pty_id, "false" } });
+                                app.send_buffer = try msgpack.encode(app.allocator, .{ 0, @intFromEnum(MsgId.attach_pty), "attach_pty", .{pty_id} });
                                 _ = try l.send(app.fd, app.send_buffer.?, .{
                                     .ptr = app,
                                     .cb = onSendComplete,
@@ -1930,6 +2298,7 @@ pub const App = struct {
                                                 .id = pty_id,
                                                 .surface = surface,
                                                 .app = app,
+                                                .allocator = app.allocator,
                                                 .send_key_fn = struct {
                                                     fn appSendDirect(ctx: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void {
                                                         const self: *App = @ptrCast(@alignCast(ctx));
@@ -2084,15 +2453,6 @@ pub const App = struct {
                                                         try self.requestCopySelection(id);
                                                     }
                                                 }.appCopySelection,
-                                                .cell_size_fn = struct {
-                                                    fn appGetCellSize(ctx: *anyopaque) lua_event.CellSize {
-                                                        const self: *App = @ptrCast(@alignCast(ctx));
-                                                        return .{
-                                                            .width = self.cell_width_px,
-                                                            .height = self.cell_height_px,
-                                                        };
-                                                    }
-                                                }.appGetCellSize,
                                             },
                                         }) catch |err| {
                                             log.err("Failed to update UI with pty_attach: {}", .{err});
@@ -2305,10 +2665,7 @@ pub const App = struct {
     fn sendDirect(self: *App, data: []const u8) !void {
         var index: usize = 0;
         while (index < data.len) {
-            const n = posix.write(self.fd, data[index..]) catch |err| {
-                if (err == error.WouldBlock) continue;
-                return err;
-            };
+            const n = try posix.write(self.fd, data[index..]);
             index += n;
         }
     }
@@ -2332,7 +2689,10 @@ pub const App = struct {
             try env_array.append(self.allocator, .{ .string = env_str });
         }
 
-        const num_params: usize = if (opts.cwd != null) 5 else 4;
+        var num_params: usize = 4;
+        if (opts.cwd != null) num_params += 1;
+        if (opts.cmd != null) num_params += 1;
+
         var map_items = try self.allocator.alloc(msgpack.Value.KeyValue, num_params);
         defer self.allocator.free(map_items);
 
@@ -2340,8 +2700,18 @@ pub const App = struct {
         map_items[1] = .{ .key = .{ .string = "cols" }, .value = .{ .unsigned = opts.cols } };
         map_items[2] = .{ .key = .{ .string = "attach" }, .value = .{ .boolean = opts.attach } };
         map_items[3] = .{ .key = .{ .string = "env" }, .value = .{ .array = env_array.items } };
+
+        var idx: usize = 4;
         if (opts.cwd) |cwd| {
-            map_items[4] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+            map_items[idx] = .{ .key = .{ .string = "cwd" }, .value = .{ .string = cwd } };
+            idx += 1;
+        }
+        if (opts.cmd) |cmd| {
+            var cmd_array = try self.allocator.alloc(msgpack.Value, cmd.len);
+            for (cmd, 0..) |arg, i| {
+                cmd_array[i] = .{ .string = arg };
+            }
+            map_items[idx] = .{ .key = .{ .string = "cmd" }, .value = .{ .array = cmd_array } };
         }
 
         const params = msgpack.Value{ .map = map_items };
@@ -2373,19 +2743,85 @@ pub const App = struct {
     }
 
     fn copyToClipboard(self: *App, text: []const u8) void {
+        if (text.len == 0) {
+            log.warn("copyToClipboard: empty text, nothing to copy", .{});
+            return;
+        }
+
+        log.info("copyToClipboard: copying {} bytes to clipboard", .{text.len});
+
+        // Try native clipboard utilities first (more reliable than OSC 52)
+        self.copyToClipboardNative(text) catch |err| {
+            log.warn("Native clipboard copy failed: {}, trying OSC 52", .{err});
+            self.copyToClipboardOSC52(text);
+        };
+    }
+
+    fn copyToClipboardNative(self: *App, text: []const u8) !void {
+        const builtin = @import("builtin");
+        const clipboard_cmd = switch (builtin.os.tag) {
+            .macos => "pbcopy",
+            .linux => blk: {
+                // Try to detect which clipboard utility is available
+                // Prefer wl-copy (Wayland) or xclip (X11)
+                const wayland = std.process.hasEnvVar(self.allocator, "WAYLAND_DISPLAY") catch false;
+                break :blk if (wayland) "wl-copy" else "xclip";
+            },
+            else => return error.UnsupportedPlatform,
+        };
+
+        const args = if (std.mem.eql(u8, clipboard_cmd, "xclip"))
+            &[_][]const u8{ clipboard_cmd, "-selection", "clipboard" }
+        else
+            &[_][]const u8{clipboard_cmd};
+
+        var child = std.process.Child.init(args, self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+
+        if (child.stdin) |stdin| {
+            stdin.writeAll(text) catch |err| {
+                log.err("Failed to write to clipboard process: {}", .{err});
+                _ = child.kill() catch {};
+                return err;
+            };
+            stdin.close();
+            child.stdin = null;
+        }
+
+        const result = try child.wait();
+        if (result != .Exited or result.Exited != 0) {
+            log.err("Clipboard process exited with error: {}", .{result});
+            return error.ClipboardProcessFailed;
+        }
+
+        log.info("Successfully copied to clipboard using {s}", .{clipboard_cmd});
+    }
+
+    fn copyToClipboardOSC52(self: *App, text: []const u8) void {
         const encoder = std.base64.standard.Encoder;
         const encoded_len = encoder.calcSize(text.len);
-        const encoded = self.allocator.alloc(u8, encoded_len) catch return;
+        const encoded = self.allocator.alloc(u8, encoded_len) catch |err| {
+            log.err("Failed to allocate memory for OSC 52 encoding: {}", .{err});
+            return;
+        };
         defer self.allocator.free(encoded);
         _ = encoder.encode(encoded, text);
 
         const writer = self.tty.writer();
         writer.print("\x1b]52;c;{s}\x1b\\", .{encoded}) catch |err| {
-            log.err("Failed to write OSC 52: {}", .{err});
+            log.err("Failed to write OSC 52 sequence: {}", .{err});
+            return;
         };
+
+        log.info("OSC 52 sequence written (may not work in all terminals)", .{});
     }
 
     pub fn saveSession(self: *App, name: []const u8) !void {
+        log.info("saveSession called with name='{s}', current_session_name={?s}", .{ name, self.current_session_name });
         const json = try self.ui.getStateJson(&cwdLookup, self);
         defer self.allocator.free(json);
 
@@ -2456,6 +2892,42 @@ pub const App = struct {
         };
 
         return error.SessionAlreadyExists;
+    }
+
+    pub fn switchToSession(self: *App, target_session: []const u8) !void {
+        // Don't switch if already on the target session
+        if (self.current_session_name) |current| {
+            if (std.mem.eql(u8, current, target_session)) {
+                log.info("Already on session '{s}', not switching", .{target_session});
+                return;
+            }
+        }
+
+        // Save current session first
+        if (self.current_session_name) |name| {
+            log.info("Saving current session '{s}' before switch", .{name});
+            try self.saveSession(name);
+        }
+
+        // Restore terminal state before exec
+        const writer = self.tty.writer();
+        self.vx.deinit(self.allocator, writer);
+
+        // Build arguments for exec
+        const target_z = try self.allocator.dupeZ(u8, target_session);
+        const args = [_]?[*:0]const u8{
+            "prise",
+            "session",
+            "attach",
+            target_z,
+            null,
+        };
+
+        log.info("Exec'ing prise session attach '{s}'", .{target_session});
+
+        // Use execvpeZ with current environment
+        const err = posix.execvpeZ("prise", @ptrCast(&args), @ptrCast(std.c.environ));
+        log.err("Failed to exec prise: {}", .{err});
     }
 
     pub fn deleteCurrentSession(self: *App) void {
@@ -2664,6 +3136,7 @@ pub const App = struct {
         return .{
             .surface = surface,
             .app = self,
+            .allocator = self.allocator,
             .send_key_fn = struct {
                 fn sendKey(app_ctx: *anyopaque, pty_id: u32, key: lua_event.KeyData) anyerror!void {
                     const app: *App = @ptrCast(@alignCast(app_ctx));
@@ -2820,15 +3293,6 @@ pub const App = struct {
                     try app.requestCopySelection(pty_id);
                 }
             }.copySelection,
-            .cell_size_fn = struct {
-                fn getCellSize(app_ctx: *anyopaque) lua_event.CellSize {
-                    const app: *App = @ptrCast(@alignCast(app_ctx));
-                    return .{
-                        .width = app.cell_width_px,
-                        .height = app.cell_height_px,
-                    };
-                }
-            }.getCellSize,
         };
     }
 };

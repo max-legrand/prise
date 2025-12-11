@@ -12,15 +12,11 @@ const vaxis_helper = @import("vaxis_helper.zig");
 
 const log = std.log.scoped(.lua_event);
 
-pub const CellSize = struct {
-    width: u16,
-    height: u16,
-};
-
 pub const PtyAttachInfo = struct {
     id: u32,
     surface: *Surface,
     app: *anyopaque,
+    allocator: std.mem.Allocator,
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
@@ -28,7 +24,6 @@ pub const PtyAttachInfo = struct {
     close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     cwd_fn: *const fn (app: *anyopaque, id: u32) ?[]const u8,
     copy_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
-    cell_size_fn: *const fn (app: *anyopaque) CellSize,
 };
 
 pub const PtyExitedInfo = struct {
@@ -130,6 +125,7 @@ fn pushPtyAttachEvent(lua: *ziglua.Lua, info: PtyAttachInfo) void {
         .id = info.id,
         .surface = info.surface,
         .app = info.app,
+        .allocator = info.allocator,
         .send_key_fn = info.send_key_fn,
         .send_mouse_fn = info.send_mouse_fn,
         .send_paste_fn = info.send_paste_fn,
@@ -137,7 +133,6 @@ fn pushPtyAttachEvent(lua: *ziglua.Lua, info: PtyAttachInfo) void {
         .close_fn = info.close_fn,
         .cwd_fn = info.cwd_fn,
         .copy_selection_fn = info.copy_selection_fn,
-        .cell_size_fn = info.cell_size_fn,
     };
 
     _ = lua.getMetatableRegistry("PrisePty");
@@ -383,6 +378,7 @@ const PtyHandle = struct {
     id: u32,
     surface: *Surface,
     app: *anyopaque,
+    allocator: std.mem.Allocator,
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
@@ -390,7 +386,6 @@ const PtyHandle = struct {
     close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     cwd_fn: *const fn (app: *anyopaque, id: u32) ?[]const u8,
     copy_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
-    cell_size_fn: *const fn (app: *anyopaque) CellSize,
 };
 
 fn ptyIndex(lua: *ziglua.Lua) i32 {
@@ -438,36 +433,38 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
     return 0;
 }
 
+fn getPtyHandle(lua: *ziglua.Lua) ?*PtyHandle {
+    return lua.toUserdata(PtyHandle, 1) catch {
+        log.err("getPtyHandle: failed to get PtyHandle userdata", .{});
+        return null;
+    };
+}
+
 fn ptySize(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
-    const cell_size = pty.cell_size_fn(pty.app);
-    lua.createTable(0, 4);
+    const pty = getPtyHandle(lua) orelse return 0;
+    lua.createTable(0, 2);
     lua.pushInteger(@intCast(pty.surface.rows));
     lua.setField(-2, "rows");
     lua.pushInteger(@intCast(pty.surface.cols));
     lua.setField(-2, "cols");
-    lua.pushInteger(@intCast(@as(u32, pty.surface.cols) * cell_size.width));
-    lua.setField(-2, "width_px");
-    lua.pushInteger(@intCast(@as(u32, pty.surface.rows) * cell_size.height));
-    lua.setField(-2, "height_px");
     return 1;
 }
 
 fn ptyTitle(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     const title = pty.surface.getTitle();
     _ = lua.pushString(title);
     return 1;
 }
 
 fn ptyId(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     lua.pushInteger(@intCast(pty.id));
     return 1;
 }
 
 fn ptyCwd(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     if (pty.cwd_fn(pty.app, pty.id)) |cwd| {
         _ = lua.pushString(cwd);
     } else {
@@ -477,7 +474,7 @@ fn ptyCwd(lua: *ziglua.Lua) i32 {
 }
 
 fn ptyCopySelection(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     pty.copy_selection_fn(pty.app, pty.id) catch |err| {
         log.err("Failed to copy selection: {}", .{err});
     };
@@ -485,7 +482,7 @@ fn ptyCopySelection(lua: *ziglua.Lua) i32 {
 }
 
 fn ptySendKey(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     lua.checkType(2, .table);
 
     _ = lua.getField(2, "key");
@@ -530,7 +527,7 @@ fn ptySendKey(lua: *ziglua.Lua) i32 {
 }
 
 fn ptySendMouse(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     lua.checkType(2, .table);
 
     _ = lua.getField(2, "x");
@@ -585,7 +582,7 @@ fn ptySendMouse(lua: *ziglua.Lua) i32 {
 }
 
 fn ptySendPaste(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     const data = lua.toString(2) catch {
         lua.raiseErrorStr("Expected string for paste data", .{});
     };
@@ -596,7 +593,7 @@ fn ptySendPaste(lua: *ziglua.Lua) i32 {
 }
 
 fn ptySetFocus(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     const focused = lua.toBoolean(2);
     pty.set_focus_fn(pty.app, pty.id, focused) catch |err| {
         lua.raiseErrorStr("Failed to set focus: %s", .{@errorName(err).ptr});
@@ -605,7 +602,7 @@ fn ptySetFocus(lua: *ziglua.Lua) i32 {
 }
 
 fn ptyClose(lua: *ziglua.Lua) i32 {
-    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const pty = getPtyHandle(lua) orelse return 0;
     pty.close_fn(pty.app, pty.id) catch |err| {
         lua.raiseErrorStr("Failed to close pty: %s", .{@errorName(err).ptr});
     };
@@ -729,6 +726,7 @@ pub fn pushPtyUserdata(
     id: u32,
     surface: *Surface,
     app: *anyopaque,
+    allocator: std.mem.Allocator,
     send_key_fn: *const fn (app: *anyopaque, id: u32, key: KeyData) anyerror!void,
     send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: MouseData) anyerror!void,
     send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
@@ -736,13 +734,13 @@ pub fn pushPtyUserdata(
     close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     cwd_fn: *const fn (app: *anyopaque, id: u32) ?[]const u8,
     copy_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
-    cell_size_fn: *const fn (app: *anyopaque) CellSize,
 ) !void {
     const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
     pty.* = .{
         .id = id,
         .surface = surface,
         .app = app,
+        .allocator = allocator,
         .send_key_fn = send_key_fn,
         .send_mouse_fn = send_mouse_fn,
         .send_paste_fn = send_paste_fn,
@@ -750,7 +748,6 @@ pub fn pushPtyUserdata(
         .close_fn = close_fn,
         .cwd_fn = cwd_fn,
         .copy_selection_fn = copy_selection_fn,
-        .cell_size_fn = cell_size_fn,
     };
 
     _ = lua.getMetatableRegistry("PrisePty");

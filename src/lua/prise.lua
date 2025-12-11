@@ -1,5 +1,5 @@
 ---@class TerminalOpts
----@field pty Pty
+---@field pty userdata
 ---@field ratio? number
 ---@field id? string
 ---@field focus? boolean
@@ -10,7 +10,7 @@
 ---@field style? table
 
 ---@class TextOpts
----@field content? (TextSegment|string)[]
+---@field content? TextSegment[]
 ---@field show_cursor? boolean
 
 ---@class LayoutOpts
@@ -30,7 +30,7 @@
 ---@field id? string|number
 
 ---@class TextInputOpts
----@field input TextInput
+---@field input userdata
 ---@field style? table
 ---@field focus? boolean
 
@@ -58,11 +58,26 @@
 ---@field left? number
 ---@field right? number
 
+---@class DividerOpts
+---@field direction? "horizontal"|"vertical"
+---@field style? table
+---@field focus? boolean
+
+---@class DividerSegment
+---@field start number Starting position (row or col)
+---@field end number Ending position (exclusive)
+---@field style table Style for this segment
+
+---@class SegmentedDividerOpts
+---@field direction? "horizontal"|"vertical"
+---@field segments? DividerSegment[]
+---@field default_style? table
+
 ---@class PriseUI
 ---@field update fun(event: table) Handle an input event
 ---@field view fun(): table Return the widget tree to render
 ---@field get_state? fun(cwd_lookup: fun(id: number): string?): table Serialize UI state for persistence
----@field set_state? fun(saved: table?, pty_lookup: fun(id: number): Pty?) Restore UI state
+---@field set_state? fun(saved: table?, pty_lookup: fun(id: number): userdata?) Restore UI state
 ---@field setup? fun(opts: table?) Configure the UI (optional)
 
 local M = {}
@@ -92,7 +107,7 @@ function M.Terminal(opts)
 end
 
 ---Create a text widget with optional styling and segments
----@param opts string|TextSegment[]|TextOpts|TextSegment
+---@param opts string|TextSegment[]|TextOpts
 ---@return table Text widget
 function M.Text(opts)
     if type(opts) == "string" then
@@ -260,6 +275,30 @@ function M.Padding(opts)
         bottom = opts.bottom,
         left = opts.left,
         right = opts.right,
+    }
+end
+
+---Create a divider widget that draws a line (for tmux-style borders)
+---@param opts DividerOpts
+---@return table Divider widget
+function M.Divider(opts)
+    return {
+        type = "divider",
+        direction = opts.direction or "horizontal",
+        style = opts.style,
+        focus = opts.focus,
+    }
+end
+
+---Create a segmented divider widget that can render different segments with different colors
+---@param opts SegmentedDividerOpts
+---@return table SegmentedDivider widget
+function M.SegmentedDivider(opts)
+    return {
+        type = "segmented_divider",
+        direction = opts.direction or "horizontal",
+        segments = opts.segments or {},
+        default_style = opts.default_style,
     }
 end
 
