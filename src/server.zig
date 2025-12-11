@@ -1394,8 +1394,8 @@ const Client = struct {
             };
         } else {
             const delta: isize = switch (mouse.button) {
-                .wheel_up => -1,
-                .wheel_down => 1,
+                .wheel_up => -3,
+                .wheel_down => 3,
                 else => 0,
             };
             if (delta != 0) {
@@ -1464,6 +1464,26 @@ const Client = struct {
                     defer pty_instance.terminal_mutex.unlock();
 
                     const screen = pty_instance.terminal.screens.active;
+
+                    // Auto-scroll if dragging near viewport edges
+                    const viewport_height = screen.pages.rows;
+                    const auto_scroll_margin: u16 = 2;
+                    var scroll_delta: isize = 0;
+
+                    if (row < auto_scroll_margin) {
+                        // Near top edge - scroll up
+                        scroll_delta = -1;
+                    } else if (row >= viewport_height - auto_scroll_margin) {
+                        // Near bottom edge - scroll down
+                        scroll_delta = 1;
+                    }
+
+                    if (scroll_delta != 0) {
+                        pty_instance.terminal.scrollViewport(.{ .delta = scroll_delta }) catch |err| {
+                            log.err("Failed to auto-scroll during drag: {}", .{err});
+                        };
+                    }
+
                     const start_pin = screen.pages.pin(.{ .viewport = .{
                         .x = start.col,
                         .y = start.row,
