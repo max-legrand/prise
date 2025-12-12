@@ -609,7 +609,10 @@ pub const App = struct {
     ui: UI = undefined,
     first_resize_done: bool = false,
     socket_path: []const u8 = undefined,
+    /// Session name to attach to (existing session passed via `prise session attach <name>`)
     attach_session: ?[]const u8 = null,
+    /// User-specified session name for new session (passed via `prise -s <name>`)
+    new_session_name: ?[]const u8 = null,
     initial_cwd: ?[]const u8 = null,
     last_render_time: i64 = 0,
     render_timer: ?io.Task = null,
@@ -2018,6 +2021,11 @@ pub const App = struct {
             self.current_session_name = try self.allocator.dupe(u8, session_name);
             log.info("onServerInfoReceived: set current_session_name='{s}'", .{self.current_session_name.?});
             try self.startSessionAttach(session_name);
+        } else if (self.new_session_name) |name| {
+            // User specified a name for new session
+            self.current_session_name = try self.allocator.dupe(u8, name);
+            log.info("Starting new session with user-specified name: {s}", .{name});
+            try self.spawnInitialPty();
         } else {
             // Generate a new session name for fresh launch
             if (self.current_session_name) |old| {
