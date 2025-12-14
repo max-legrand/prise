@@ -227,7 +227,8 @@ pub const Widget = struct {
     pub fn renderTo(self: *const Widget, win: vaxis.Window, allocator: std.mem.Allocator) !void {
         switch (self.kind) {
             .surface => |surf| {
-                surf.surface.render(win, self.focus);
+                // Use default dim factor of 0.0 for standalone rendering
+                surf.surface.render(win, self.focus, null, 0.0);
             },
             .text_input => |ti| {
                 ti.input.updateScrollOffset(@intCast(win.width));
