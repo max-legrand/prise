@@ -2585,17 +2585,39 @@ function M.update(event)
         local child_index = d.child_index
         local new_ratio = d.ratio
 
-        -- Find the split by id and update the child's ratio
+        -- Find the split by id and update using pairwise adjustment
         local function update_split_ratio(node)
             if not node then
                 return false
             end
             if is_split(node) then
                 if node.split_id == split_id then
-                    -- Found it - update the first child's ratio
-                    if node.children[child_index + 1] then
-                        node.children[child_index + 1].ratio = new_ratio
+                    -- Found it - use pairwise adjustment between child_index and child_index+1
+                    local left_idx = child_index + 1 -- Convert 0-based to 1-based
+                    local right_idx = left_idx + 1
+
+                    if not node.children[left_idx] or not node.children[right_idx] then
+                        return false
                     end
+
+                    -- Get effective ratios for both children
+                    local left_r = effective_ratio(node, left_idx)
+                    local right_r = effective_ratio(node, right_idx)
+                    local total = left_r + right_r
+
+                    -- Calculate new left ratio (clamped)
+                    local new_left = new_ratio
+                    if new_left < MIN_PANE_SHARE then
+                        new_left = MIN_PANE_SHARE
+                    end
+                    if new_left > total - MIN_PANE_SHARE then
+                        new_left = total - MIN_PANE_SHARE
+                    end
+
+                    -- Set both ratios to maintain their combined share
+                    local new_right = total - new_left
+                    node.children[left_idx].ratio = new_left
+                    node.children[right_idx].ratio = new_right
                     return true
                 end
                 for _, child in ipairs(node.children) do
