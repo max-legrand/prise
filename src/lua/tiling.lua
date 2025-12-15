@@ -1174,6 +1174,98 @@ local function move_focus(direction)
     end
 end
 
+---Swap the focused pane with a sibling pane in the given direction
+---@param direction "left"|"right"|"up"|"down"
+local function swap_pane(direction)
+    local root = get_active_root()
+    if not state.focused_id or not root then
+        return
+    end
+
+    local path = find_node_path(root, state.focused_id)
+    if not path then
+        return
+    end
+
+    -- "left"/"right" implies moving along "row"
+    -- "up"/"down" implies moving along "col"
+    local target_split_type = (direction == "left" or direction == "right") and "row" or "col"
+    local forward = (direction == "right" or direction == "down")
+
+    local sibling_node = nil
+
+    -- Traverse up the path to find a split of the correct type where we can swap
+    for i = #path - 1, 1, -1 do
+        local node = path[i]
+        local child = path[i + 1]
+
+        if node.type == "split" and node.direction == target_split_type then
+            -- Find index of child
+            local idx = 0
+            for k, c in ipairs(node.children) do
+                if c == child then
+                    idx = k
+                    break
+                end
+            end
+
+            if forward then
+                if idx < #node.children then
+                    sibling_node = node.children[idx + 1]
+                    break
+                end
+            else
+                if idx > 1 then
+                    sibling_node = node.children[idx - 1]
+                    break
+                end
+            end
+        end
+    end
+
+    if sibling_node then
+        -- Found a sibling tree/pane. Find the closest leaf.
+        local target_leaf
+        if forward then
+            target_leaf = get_first_leaf(sibling_node)
+        else
+            target_leaf = get_last_leaf(sibling_node)
+        end
+
+        if target_leaf and target_leaf.id ~= state.focused_id then
+            -- Find both panes
+            local focused_path = find_node_path(root, state.focused_id)
+            local target_path = find_node_path(root, target_leaf.id)
+
+            if focused_path and target_path then
+                local focused_pane = focused_path[#focused_path]
+                local target_pane = target_path[#target_path]
+
+                -- Unfocus the currently focused pane before swapping
+                if state.app_focused then
+                    focused_pane.pty:set_focus(false)
+                end
+
+                -- Swap both the PTY references and the IDs so everything stays consistent
+                focused_pane.pty, target_pane.pty = target_pane.pty, focused_pane.pty
+                focused_pane.id, target_pane.id = target_pane.id, focused_pane.id
+
+                -- Focus stays on the same ID (which now moved to the target position)
+                -- state.focused_id doesn't need to change since we swapped the IDs
+
+                -- Focus the pane that now has our original ID (at target position)
+                if state.app_focused then
+                    target_pane.pty:set_focus(true)
+                end
+
+                update_cached_git_branch()
+                prise.request_frame()
+                prise.save()
+            end
+        end
+    end
+end
+
 local function open_rename_tab()
     if not state.rename_tab.input then
         state.rename_tab.input = prise.create_text_input()
@@ -1733,7 +1825,19 @@ function M.update(event)
                 return
             end
 
-            if k == "h" then
+            if event.data.ctrl and k == "h" then
+                swap_pane("left")
+                handled = true
+            elseif event.data.ctrl and k == "l" then
+                swap_pane("right")
+                handled = true
+            elseif event.data.ctrl and k == "j" then
+                swap_pane("down")
+                handled = true
+            elseif event.data.ctrl and k == "k" then
+                swap_pane("up")
+                handled = true
+            elseif k == "h" then
                 move_focus("left")
                 handled = true
             elseif k == "l" then
