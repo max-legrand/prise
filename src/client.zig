@@ -301,7 +301,13 @@ pub const ClientLogic = struct {
 
     fn handleCopySelectionResult(result: msgpack.Value) ServerAction {
         if (result == .string) {
+            log.info("handleCopySelectionResult: received selection text ({} bytes)", .{result.string.len});
             return .{ .copy_to_clipboard = result.string };
+        }
+        if (result == .nil) {
+            log.warn("handleCopySelectionResult: no selection (nil result)", .{});
+        } else {
+            log.warn("handleCopySelectionResult: unexpected result type: {s}", .{@tagName(result)});
         }
         return .none;
     }
@@ -915,6 +921,14 @@ pub const App = struct {
             }
         }.renameCb);
 
+        // Register switch_session callback
+        self.ui.setSwitchSessionCallback(self, struct {
+            fn switchCb(ctx: *anyopaque, target_session: []const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.switchToSession(target_session);
+            }
+        }.switchCb);
+
         // Manually trigger initial resize to connect
         const ws = try vaxis.Tty.getWinsize(self.tty.fd);
         try self.handleVaxisEvent(.{ .winsize = ws });
@@ -1485,8 +1499,150 @@ pub const App = struct {
         }
     }
 
+    fn applyDimToStyle(self: *App, style: vaxis.Style, dim_factor: f32) vaxis.Style {
+        if (dim_factor == 0.0) return style;
+
+        var dimmed = style;
+
+        // Apply dimming to foreground color
+        if (dimmed.fg != .default) {
+            const fg_rgb = self.resolveColor(dimmed.fg);
+            if (fg_rgb) |rgb| {
+                dimmed.fg = .{ .rgb = Surface.TerminalColors.reduceContrast(rgb, dim_factor * 0.5) };
+            }
+        }
+
+        // Apply dimming to background color
+        if (dimmed.bg != .default) {
+            const bg_rgb = self.resolveColor(dimmed.bg);
+            if (bg_rgb) |rgb| {
+                dimmed.bg = .{ .rgb = Surface.TerminalColors.reduceContrast(rgb, dim_factor) };
+            }
+        }
+
+        return dimmed;
+    }
+
+    fn resolveColor(self: *App, color: vaxis.Cell.Color) ?[3]u8 {
+        return switch (color) {
+            .rgb => |rgb| rgb,
+            .index => |idx| blk: {
+                if (idx >= 16) break :blk null;
+                if (self.colors.palette[idx]) |c_val| {
+                    break :blk switch (c_val) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+            .default => blk: {
+                if (self.colors.bg) |bg| {
+                    break :blk switch (bg) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+        };
+    }
+
     fn renderWidget(self: *App, w: widget.Widget, win: vaxis.Window) !void {
-        try w.renderTo(win, self.allocator);
+        switch (w.kind) {
+            .surface => |surf| {
+                if (self.surfaces.get(surf.pty_id)) |surface| {
+                    // Check for resize mismatch and send resize request if needed
+                    if (surface.rows != w.height or surface.cols != w.width) {
+                        log.debug("renderWidget: surface resize needed for pty {}: {}x{} -> {}x{}", .{
+                            surf.pty_id,
+                            surface.cols,
+                            surface.rows,
+                            w.width,
+                            w.height,
+                        });
+                        self.sendResize(surf.pty_id, w.height, w.width) catch |err| {
+                            log.err("Failed to send resize: {}", .{err});
+                        };
+                    }
+                    // Calculate dim factor based on focus
+                    const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                    surface.render(win, w.focus, &self.colors, dim_factor);
+                }
+            },
+            .text => {
+                // Use renderTo for text widgets
+                try w.renderTo(win, self.allocator);
+            },
+            .box => |b| {
+                const chars = b.borderChars();
+                // Apply dimming to border style if not focused
+                const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                const style = self.applyDimToStyle(b.style, dim_factor);
+
+                log.debug("render box: w={} h={} focus={} dim_factor={d}", .{ win.width, win.height, w.focus, dim_factor });
+
+                // Fill background for the entire box area
+                if (style.bg != .default) {
+                    for (0..win.height) |row| {
+                        for (0..win.width) |col| {
+                            win.writeCell(@intCast(col), @intCast(row), .{
+                                .char = .{ .grapheme = " ", .width = 1 },
+                                .style = style,
+                            });
+                        }
+                    }
+                }
+
+                // Render border if not none
+                if (b.border != .none and win.width >= 2 and win.height >= 2) {
+                    win.writeCell(0, 0, .{ .char = .{ .grapheme = chars.tl, .width = 1 }, .style = style });
+                    win.writeCell(win.width - 1, 0, .{ .char = .{ .grapheme = chars.tr, .width = 1 }, .style = style });
+                    win.writeCell(0, win.height - 1, .{ .char = .{ .grapheme = chars.bl, .width = 1 }, .style = style });
+                    win.writeCell(win.width - 1, win.height - 1, .{ .char = .{ .grapheme = chars.br, .width = 1 }, .style = style });
+
+                    for (1..win.width - 1) |col| {
+                        win.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                        win.writeCell(@intCast(col), win.height - 1, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                    }
+
+                    for (1..win.height - 1) |row| {
+                        win.writeCell(0, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                        win.writeCell(win.width - 1, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                    }
+                }
+
+                // Render child widget if present
+                const inner_win = win.child(.{
+                    .x_off = if (b.border != .none) 1 else 0,
+                    .y_off = if (b.border != .none) 1 else 0,
+                    .width = if (b.border != .none and win.width >= 2) win.width - 2 else win.width,
+                    .height = if (b.border != .none and win.height >= 2) win.height - 2 else win.height,
+                });
+                try self.renderWidget(b.child.*, inner_win);
+            },
+            .positioned => |pos| {
+                const child_win = win.child(.{
+                    .x_off = pos.x orelse 0,
+                    .y_off = pos.y orelse 0,
+                    .width = pos.child.width,
+                    .height = pos.child.height,
+                });
+                try self.renderWidget(pos.child.*, child_win);
+            },
+            .text_input,
+            .list,
+            .padding,
+            .column,
+            .row,
+            .stack,
+            .divider,
+            .segmented_divider,
+            => {
+                // These widgets use renderTo for now
+                try w.renderTo(win, self.allocator);
+            },
+        }
     }
 
     pub fn scheduleRender(self: *App) !void {
@@ -2373,9 +2529,62 @@ pub const App = struct {
     }
 
     fn copyToClipboard(self: *App, text: []const u8) void {
+        if (text.len == 0) {
+            log.warn("copyToClipboard: empty text, nothing to copy", .{});
+            return;
+        }
+
+        log.info("copyToClipboard: copying {} bytes to clipboard", .{text.len});
+
+        // Try native clipboard utilities first (more reliable than OSC 52)
+        self.copyToClipboardNative(text) catch |err| {
+            log.warn("Native clipboard copy failed: {}, trying OSC 52", .{err});
+            self.copyToClipboardOSC52(text);
+        };
+    }
+
+    fn copyToClipboardNative(self: *App, text: []const u8) !void {
+        const builtin = @import("builtin");
+        const clipboard_cmd = switch (builtin.os.tag) {
+            .macos => "pbcopy",
+            .linux => blk: {
+                // Try to detect which clipboard utility is available
+                // Prefer wl-copy (Wayland) or xclip (X11)
+                const wayland = std.process.hasEnvVar(self.allocator, "WAYLAND_DISPLAY") catch false;
+                break :blk if (wayland) "wl-copy" else "xclip";
+            },
+            else => return error.UnsupportedPlatform,
+        };
+
+        const args = if (std.mem.eql(u8, clipboard_cmd, "xclip"))
+            &[_][]const u8{ clipboard_cmd, "-selection", "clipboard" }
+        else
+            &[_][]const u8{clipboard_cmd};
+
+        var child = std.process.Child.init(args, self.allocator);
+        child.stdin_behavior = .Pipe;
+
+        try child.spawn();
+
+        try child.stdin.?.writeAll(text);
+        child.stdin.?.close();
+        child.stdin = null;
+
+        const result = try child.wait();
+        if (result != .Exited or result.Exited != 0) {
+            return error.ClipboardCopyFailed;
+        }
+
+        log.info("Successfully copied to clipboard using {s}", .{clipboard_cmd});
+    }
+
+    fn copyToClipboardOSC52(self: *App, text: []const u8) void {
         const encoder = std.base64.standard.Encoder;
         const encoded_len = encoder.calcSize(text.len);
-        const encoded = self.allocator.alloc(u8, encoded_len) catch return;
+        const encoded = self.allocator.alloc(u8, encoded_len) catch |err| {
+            log.err("Failed to allocate memory for OSC 52 encoding: {}", .{err});
+            return;
+        };
         defer self.allocator.free(encoded);
         _ = encoder.encode(encoded, text);
 
@@ -2456,6 +2665,42 @@ pub const App = struct {
         };
 
         return error.SessionAlreadyExists;
+    }
+
+    pub fn switchToSession(self: *App, target_session: []const u8) !void {
+        // Don't switch if already on the target session
+        if (self.current_session_name) |current| {
+            if (std.mem.eql(u8, current, target_session)) {
+                log.info("Already on session '{s}', not switching", .{target_session});
+                return;
+            }
+        }
+
+        // Save current session first
+        if (self.current_session_name) |name| {
+            log.info("Saving current session '{s}' before switch", .{name});
+            try self.saveSession(name);
+        }
+
+        // Restore terminal state before exec
+        const writer = self.tty.writer();
+        self.vx.deinit(self.allocator, writer);
+
+        // Build arguments for exec
+        const target_z = try self.allocator.dupeZ(u8, target_session);
+        const args = [_]?[*:0]const u8{
+            "prise",
+            "session",
+            "attach",
+            target_z,
+            null,
+        };
+
+        log.info("Exec'ing prise session attach '{s}'", .{target_session});
+
+        // Use execvpeZ with current environment
+        const err = posix.execvpeZ("prise", @ptrCast(&args), @ptrCast(std.c.environ));
+        log.err("Failed to exec prise: {}", .{err});
     }
 
     pub fn deleteCurrentSession(self: *App) void {

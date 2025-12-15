@@ -40,6 +40,14 @@ local utils = require("utils")
 ---@field visible boolean
 ---@field input? TextInput
 
+---@class SessionPickerState
+---@field visible boolean
+---@field input? TextInput
+---@field selected number
+---@field scroll_offset number
+---@field sessions string[]
+---@field regions PaletteRegion[]
+
 ---@class State
 ---@field tabs Tab[]
 ---@field active_tab integer
@@ -55,6 +63,7 @@ local utils = require("utils")
 ---@field palette PaletteState
 ---@field rename RenameState
 ---@field rename_tab RenameState
+---@field session_picker SessionPickerState
 ---@field screen_cols number
 ---@field screen_rows number
 
@@ -148,11 +157,25 @@ local POWERLINE_SYMBOLS = {
 ---@field green string
 ---@field yellow string
 
+---@class StatusSegmentStyle
+---@field fg? string Foreground color (hex string)
+---@field bg? string Background color (hex string)
+---@field bold? boolean Bold text
+---@field italic? boolean Italic text
+
+---@class StatusSegment
+---@field command string Script or binary to execute
+---@field cache_time? number Cache duration in seconds (default: 5)
+---@field style? StatusSegmentStyle Styling for the segment
+---@field separator_style? StatusSegmentStyle Styling for the powerline separator before this segment
+
 ---@class PriseStatusBarConfig
 ---@field enabled? boolean Show the status bar (default: true)
+---@field custom_segments? StatusSegment[] Custom segments to display on the right side
 
 ---@class PriseTabBarConfig
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
+---@field style? string Tab bar style: "pill" (rounded, default) or "bar" (square/flat)
 
 ---@class PriseKeybind
 ---@field key string The key (e.g., "k", "p", "Enter")
@@ -164,6 +187,8 @@ local POWERLINE_SYMBOLS = {
 ---@class PriseKeybinds
 ---@field leader? PriseKeybind Key to enter command mode (default: super+k)
 ---@field palette? PriseKeybind Key to open command palette (default: super+p)
+---@field rename_session? PriseKeybind Key to rename current session (default: none)
+---@field swap_session? PriseKeybind Key to swap/switch session (default: none)
 
 ---@class PriseBordersConfig
 ---@field enabled? boolean Show pane borders (default: false)
@@ -222,6 +247,13 @@ local config = {
     },
     status_bar = {
         enabled = true,
+        custom_segments = {
+            {
+                command = "git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ''",
+                cache_time = 2,
+                style = { bg = "#313244", fg = "#cdd6f4" },
+            },
+        },
     },
     tab_bar = {
         show_single_tab = false,
@@ -271,6 +303,15 @@ local state = {
         visible = false,
         input = nil, -- TextInput handle
     },
+    -- Session switcher
+    session_picker = {
+        visible = false,
+        input = nil, -- TextInput handle
+        selected = 1,
+        scroll_offset = 0,
+        sessions = {}, -- List of session names
+        regions = {}, -- Click regions for items
+    },
     -- Tab bar hit regions: array of {start_x, end_x, tab_index}
     tab_regions = {},
     -- Tab close button regions: array of {start_x, end_x, tab_index}
@@ -282,10 +323,10 @@ local state = {
     -- Screen dimensions
     screen_cols = 80,
     screen_rows = 24,
-    -- Cached git branch (updated on cwd_changed)
-    cached_git_branch = nil,
     -- True when detaching (prevents new timers from being scheduled)
     detaching = false,
+    -- Custom segment cache
+    custom_segment_cache = {},
 }
 
 local M = {}
@@ -584,23 +625,6 @@ local function update_focus_history()
     end
 end
 
----Update the cached git branch for the focused pane
-local function update_cached_git_branch()
-    local root = get_active_root()
-    if state.focused_id and root then
-        local path = find_node_path(root, state.focused_id)
-        if path then
-            local pane = path[#path]
-            local cwd = pane.pty:cwd()
-            if cwd then
-                state.cached_git_branch = prise.get_git_branch(cwd)
-                return
-            end
-        end
-    end
-    state.cached_git_branch = nil
-end
-
 ---Recursively insert a new pane relative to target_id
 ---@param node Node
 ---@param target_id number
@@ -796,7 +820,6 @@ local function set_active_tab_index(new_index)
 
     state.focused_id = new_focus_id
     update_pty_focus(old_focused, new_focus_id)
-    update_cached_git_branch()
     prise.request_frame()
 end
 
@@ -857,11 +880,9 @@ local function close_tab(idx)
         end
         state.focused_id = new_focus_id
         update_pty_focus(old_focused, new_focus_id)
-        update_cached_git_branch()
     else
         -- No tabs left
         state.focused_id = nil
-        state.cached_git_branch = nil
     end
 
     prise.request_frame()
@@ -923,7 +944,6 @@ local function remove_pane_by_id(id)
                 end
                 state.focused_id = new_focus_id
                 update_pty_focus(old_focused, new_focus_id)
-                update_cached_git_branch()
             end
             prise.request_frame()
             return false
@@ -941,7 +961,6 @@ local function remove_pane_by_id(id)
                 end
             end
             update_pty_focus(old_id, state.focused_id)
-            update_cached_git_branch()
         end
         prise.request_frame()
         return false
@@ -1458,8 +1477,98 @@ local function move_focus(direction)
             local old_id = state.focused_id
             state.focused_id = target_leaf.id
             update_pty_focus(old_id, state.focused_id)
-            update_cached_git_branch()
             prise.request_frame()
+        end
+    end
+end
+
+---Swap the focused pane with a sibling pane in the given direction
+---@param direction "left"|"right"|"up"|"down"
+local function swap_pane(direction)
+    local root = get_active_root()
+    if not state.focused_id or not root then
+        return
+    end
+
+    local path = find_node_path(root, state.focused_id)
+    if not path then
+        return
+    end
+
+    -- "left"/"right" implies moving along "row"
+    -- "up"/"down" implies moving along "col"
+    local target_split_type = (direction == "left" or direction == "right") and "row" or "col"
+    local forward = (direction == "right" or direction == "down")
+
+    local sibling_node = nil
+
+    -- Traverse up the path to find a split of the correct type where we can swap
+    for i = #path - 1, 1, -1 do
+        local node = path[i]
+        local child = path[i + 1]
+
+        if node.type == "split" and node.direction == target_split_type then
+            -- Find index of child
+            local idx = 0
+            for k, c in ipairs(node.children) do
+                if c == child then
+                    idx = k
+                    break
+                end
+            end
+
+            if forward then
+                if idx < #node.children then
+                    sibling_node = node.children[idx + 1]
+                    break
+                end
+            else
+                if idx > 1 then
+                    sibling_node = node.children[idx - 1]
+                    break
+                end
+            end
+        end
+    end
+
+    if sibling_node then
+        -- Found a sibling tree/pane. Find the closest leaf.
+        local target_leaf
+        if forward then
+            target_leaf = get_first_leaf(sibling_node)
+        else
+            target_leaf = get_last_leaf(sibling_node)
+        end
+
+        if target_leaf and target_leaf.id ~= state.focused_id then
+            -- Find both panes
+            local focused_path = find_node_path(root, state.focused_id)
+            local target_path = find_node_path(root, target_leaf.id)
+
+            if focused_path and target_path then
+                local focused_pane = focused_path[#focused_path]
+                local target_pane = target_path[#target_path]
+
+                -- Unfocus the currently focused pane before swapping
+                if state.app_focused then
+                    focused_pane.pty:set_focus(false)
+                end
+
+                -- Swap both the PTY references and the IDs so everything stays consistent
+                focused_pane.pty, target_pane.pty = target_pane.pty, focused_pane.pty
+                focused_pane.id, target_pane.id = target_pane.id, focused_pane.id
+
+                -- Focus stays on the same ID (which now moved to the target position)
+                -- state.focused_id doesn't need to change since we swapped the IDs
+
+                -- Focus the pane that now has our original ID (at target position)
+                if state.app_focused then
+                    target_pane.pty:set_focus(true)
+                end
+
+                prise.request_frame()
+                prise.save()
+            end
         end
     end
 end
@@ -1848,6 +1957,51 @@ local function execute_rename()
     close_rename()
 end
 
+local function open_session_picker()
+    if not state.session_picker.input then
+        state.session_picker.input = prise.create_text_input()
+    end
+    state.session_picker.input:clear()
+    state.session_picker.sessions = prise.list_sessions() or {}
+    state.session_picker.selected = 1
+    state.session_picker.scroll_offset = 0
+    state.session_picker.visible = true
+    prise.request_frame()
+end
+
+local function close_session_picker()
+    state.session_picker.visible = false
+    prise.request_frame()
+end
+
+---Filter sessions by fuzzy matching the input text
+---@param query string
+---@return string[]
+local function filter_sessions(query)
+    if not query or query == "" then
+        return state.session_picker.sessions
+    end
+    local lower_query = query:lower()
+    local matches = {}
+    for _, session in ipairs(state.session_picker.sessions) do
+        if session:lower():find(lower_query, 1, true) then
+            table.insert(matches, session)
+        end
+    end
+    return matches
+end
+
+local function execute_session_switch()
+    local query = state.session_picker.input:text()
+    local filtered = filter_sessions(query)
+    local idx = state.session_picker.selected
+    if idx >= 1 and idx <= #filtered then
+        local target = filtered[idx]
+        close_session_picker()
+        prise.switch_session(target)
+    end
+end
+
 -- --- Main Functions ---
 
 ---@param event Event
@@ -1967,6 +2121,54 @@ function M.update(event)
             return
         end
 
+        -- Handle session picker
+        if state.session_picker.visible then
+            local k = event.data.key
+            local filtered = filter_sessions(state.session_picker.input:text())
+
+            if k == "Escape" then
+                close_session_picker()
+                return
+            elseif k == "Enter" then
+                execute_session_switch()
+                return
+            elseif k == "ArrowUp" or (k == "p" and event.data.ctrl) then
+                if state.session_picker.selected > 1 then
+                    state.session_picker.selected = state.session_picker.selected - 1
+                    -- Adjust scroll if needed
+                    if state.session_picker.selected <= state.session_picker.scroll_offset then
+                        state.session_picker.scroll_offset = state.session_picker.selected - 1
+                    end
+                end
+                prise.request_frame()
+                return
+            elseif k == "ArrowDown" or (k == "n" and event.data.ctrl) then
+                if state.session_picker.selected < #filtered then
+                    state.session_picker.selected = state.session_picker.selected + 1
+                    -- Adjust scroll if needed (visible height approx screen_rows - 15)
+                    local visible_height = math.max(1, state.screen_rows - 15)
+                    if state.session_picker.selected > state.session_picker.scroll_offset + visible_height then
+                        state.session_picker.scroll_offset = state.session_picker.selected - visible_height
+                    end
+                end
+                prise.request_frame()
+                return
+            elseif k == "Backspace" then
+                state.session_picker.input:delete_backward()
+                state.session_picker.selected = 1
+                state.session_picker.scroll_offset = 0
+                prise.request_frame()
+                return
+            elseif #k == 1 and not event.data.ctrl and not event.data.alt and not event.data.super then
+                state.session_picker.input:insert(k)
+                state.session_picker.selected = 1
+                state.session_picker.scroll_offset = 0
+                prise.request_frame()
+                return
+            end
+            return
+        end
+
         -- Handle rename session prompt
         if state.rename.visible then
             local k = event.data.key
@@ -2023,7 +2225,19 @@ function M.update(event)
                 return
             end
 
-            if k == "h" then
+            if event.data.ctrl and k == "h" then
+                swap_pane("left")
+                handled = true
+            elseif event.data.ctrl and k == "l" then
+                swap_pane("right")
+                handled = true
+            elseif event.data.ctrl and k == "j" then
+                swap_pane("down")
+                handled = true
+            elseif event.data.ctrl and k == "k" then
+                swap_pane("up")
+                handled = true
+            elseif k == "h" then
                 move_focus("left")
                 handled = true
             elseif k == "l" then
@@ -2090,6 +2304,14 @@ function M.update(event)
             elseif k == "r" then
                 -- Rename current tab
                 open_rename_tab()
+                handled = true
+            elseif k == "S" then
+                -- Switch/swap session
+                open_session_picker()
+                handled = true
+            elseif k == "R" then
+                -- Rename session
+                open_rename()
                 handled = true
             elseif k >= "1" and k <= "9" then
                 -- Switch to tab N
@@ -2392,7 +2614,6 @@ function M.update(event)
         end
     elseif event.type == "cwd_changed" then
         -- CWD changed for a PTY - update cached git branch
-        update_cached_git_branch()
         prise.request_frame()
         prise.save() -- Auto-save on cwd change
     end
@@ -2770,6 +2991,90 @@ local function build_rename_tab()
     })
 end
 
+---Build the session picker modal
+---@return table?
+local function build_session_picker()
+    if not state.session_picker.visible or not state.session_picker.input then
+        state.session_picker.regions = {}
+        return nil
+    end
+
+    local text = state.session_picker.input:text()
+    local filtered = filter_sessions(text)
+    local has_sessions = #filtered > 0
+
+    local items = {}
+    local current_session = prise.get_session_name()
+    for _, session in ipairs(filtered) do
+        local display = session
+        if session == current_session then
+            display = session .. " (current)"
+        end
+        table.insert(items, display)
+    end
+
+    if not has_sessions then
+        table.insert(items, "No sessions found")
+    end
+
+    local palette_style = { bg = THEME.bg1, fg = THEME.fg_bright }
+    local selected_style = { bg = THEME.accent, fg = THEME.fg_dark }
+    local input_style = { bg = THEME.bg1, fg = THEME.fg_bright }
+
+    -- Calculate click regions for visible items
+    local items_start_y = 5 + 1 + 1 + 1 -- palette_y + padding + input + separator
+    state.session_picker.regions = {}
+    if has_sessions then
+        local available_height = state.screen_rows - items_start_y - 1
+        local visible_count = math.min(#items - state.session_picker.scroll_offset, available_height)
+        for display_row = 1, visible_count do
+            local item_index = state.session_picker.scroll_offset + display_row
+            table.insert(state.session_picker.regions, {
+                start_y = items_start_y + (display_row - 1),
+                end_y = items_start_y + display_row,
+                index = item_index,
+            })
+        end
+    end
+
+    return prise.Positioned({
+        anchor = "top_center",
+        y = 5,
+        focus = true,
+        child = prise.Box({
+            border = "none",
+            max_width = PALETTE_WIDTH,
+            style = palette_style,
+            focus = true,
+            child = prise.Padding({
+                top = 1,
+                bottom = 1,
+                left = 2,
+                right = 2,
+                child = prise.Column({
+                    cross_axis_align = "stretch",
+                    children = {
+                        prise.Text({ text = "Switch Session", style = { fg = THEME.fg_dim } }),
+                        prise.TextInput({
+                            input = state.session_picker.input,
+                            style = input_style,
+                            focus = true,
+                        }),
+                        prise.Text({ text = string.rep("─", PALETTE_WIDTH), style = { fg = THEME.bg3 } }),
+                        prise.List({
+                            items = items,
+                            selected = state.session_picker.selected,
+                            scroll_offset = state.session_picker.scroll_offset,
+                            style = palette_style,
+                            selected_style = selected_style,
+                        }),
+                    },
+                }),
+            }),
+        }),
+    })
+end
+
 ---Build the tab bar (only shown if more than 1 tab)
 ---@return table?
 local function build_tab_bar()
@@ -2779,136 +3084,207 @@ local function build_tab_bar()
         return nil
     end
 
-    local num_tabs = #state.tabs
-    local total_width = state.screen_cols
-    local endcap_width = 2 -- left_round and right_round are 1 cell each
-
-    -- Calculate tab widths: divide available space evenly
-    local base_tab_width = math.floor(total_width / num_tabs)
-    local extra_pixels = total_width % num_tabs
-
+    local tab_bar_style = config.tab_bar.style or "pill"
     local segments = {}
     local x_pos = 0
     state.tab_regions = {}
     state.tab_close_regions = {}
 
-    for i, tab in ipairs(state.tabs) do
-        local is_active = (i == state.active_tab)
-        local is_hovered = (i == state.hovered_tab)
-        local is_close_hovered = (i == state.hovered_close_tab)
+    if tab_bar_style == "bar" then
+        -- Simple flat/square bar style (original)
+        for i, tab in ipairs(state.tabs) do
+            local is_active = (i == state.active_tab)
+            local is_hovered = (i == state.hovered_tab)
+            local label = " " .. (tab.title or tostring(i)) .. " "
+            local label_width = prise.gwidth(label)
 
-        -- Distribute extra width to last tabs so they fill the line
-        local tab_width = base_tab_width
-        if i > (num_tabs - extra_pixels) then
-            tab_width = tab_width + 1
+            -- Record hit region for this tab
+            table.insert(state.tab_regions, {
+                start_x = x_pos,
+                end_x = x_pos + label_width,
+                tab_index = i,
+            })
+            x_pos = x_pos + label_width
+
+            local style
+            if is_active then
+                style = { bg = THEME.accent, fg = THEME.fg_dark }
+            elseif is_hovered then
+                style = { bg = THEME.bg3, fg = THEME.fg_bright }
+            else
+                style = { bg = THEME.bg2, fg = THEME.fg_dim }
+            end
+
+            table.insert(segments, { text = label, style = style })
         end
 
-        -- Close widget: always reserve 2 cells, only show icon when hovered
-        local close_widget_width = 2
-        local close_text = "  " -- 2 spaces when not hovered
-        if is_close_hovered then
-            close_text = "\u{F530}" -- md-close_circle (filled)
-        elseif is_hovered then
-            close_text = "\u{F467}" -- md-close_circle_outline
+        -- Fill remaining width with bg color
+        local remaining_width = math.floor(state.screen_cols - x_pos)
+        if remaining_width > 0 then
+            table.insert(segments, { text = string.rep(" ", remaining_width), style = { bg = THEME.bg1 } })
         end
-        -- Pad close_text to exactly close_widget_width cells
-        local close_text_width = prise.gwidth(close_text)
-        if close_text_width < close_widget_width then
-            close_text = close_text .. string.rep(" ", close_widget_width - close_text_width)
-        end
+    else
+        -- Pill style (rounded, default)
+        local num_tabs = #state.tabs
+        local total_width = state.screen_cols
+        local endcap_width = 2 -- left_round and right_round are 1 cell each
 
-        -- Get title: manual title, or focused pty title, or focused pty cwd
-        local title = "Terminal"
-        if tab.title then
-            title = tab.title
-        else
-            local focused_id = is_active and state.focused_id or tab.last_focused_id
-            if focused_id and tab.root then
-                local path = find_node_path(tab.root, focused_id)
-                if path then
-                    local pane = path[#path]
-                    local pty_title = pane.pty:title()
-                    if pty_title and #pty_title > 0 then
-                        title = pty_title
-                    else
-                        local cwd = pane.pty:cwd()
-                        if cwd then
-                            title = cwd:match("([^/]+)/?$") or cwd
+        -- Calculate tab widths: divide available space evenly
+        local base_tab_width = math.floor(total_width / num_tabs)
+        local extra_pixels = total_width % num_tabs
+
+        x_pos = 0
+        for i, tab in ipairs(state.tabs) do
+            local is_active = (i == state.active_tab)
+            local is_hovered = (i == state.hovered_tab)
+            local is_close_hovered = (i == state.hovered_close_tab)
+
+            -- Distribute extra width to last tabs so they fill the line
+            local tab_width = base_tab_width
+            if i > (num_tabs - extra_pixels) then
+                tab_width = tab_width + 1
+            end
+
+            -- Close widget: always reserve 2 cells, only show icon when hovered
+            local close_widget_width = 2
+            local close_text = "  " -- 2 spaces when not hovered
+            if is_close_hovered then
+                close_text = "\u{F530}" -- md-close_circle (filled)
+            elseif is_hovered then
+                close_text = "\u{F467}" -- md-close_circle_outline
+            end
+            -- Pad close_text to exactly close_widget_width cells
+            local close_text_width = prise.gwidth(close_text)
+            if close_text_width < close_widget_width then
+                close_text = close_text .. string.rep(" ", close_widget_width - close_text_width)
+            end
+
+            -- Get title: manual title, or focused pty title, or focused pty cwd
+            local title = "Terminal"
+            if tab.title then
+                title = tab.title
+            else
+                local focused_id = is_active and state.focused_id or tab.last_focused_id
+                if focused_id and tab.root then
+                    local path = find_node_path(tab.root, focused_id)
+                    if path then
+                        local pane = path[#path]
+                        local pty_title = pane.pty:title()
+                        if pty_title and #pty_title > 0 then
+                            title = pty_title
+                        else
+                            local cwd = pane.pty:cwd()
+                            if cwd then
+                                title = cwd:match("([^/]+)/?$") or cwd
+                            end
                         end
                     end
                 end
             end
+
+            -- Tab index shown on the right
+            local index_str = tostring(i)
+            local index_width = #index_str + 2 -- space + index + space
+
+            -- Always reserve space for endcaps, close widget, and index
+            local inner_width = tab_width - endcap_width - close_widget_width - index_width
+            local title_width = prise.gwidth(title)
+
+            -- Truncate title if needed
+            if title_width > inner_width then
+                title = string.sub(title, 1, inner_width - 1) .. "…"
+                title_width = prise.gwidth(title)
+            end
+
+            -- Center the title
+            local padding_total = inner_width - title_width
+            local pad_left = math.floor(padding_total / 2)
+            local pad_right = padding_total - pad_left
+            if pad_left < 0 then
+                pad_left = 0
+            end
+            if pad_right < 0 then
+                pad_right = 0
+            end
+
+            local label = string.rep(" ", pad_left) .. title .. string.rep(" ", pad_right)
+            local index_label = " " .. index_str .. " "
+
+            -- Record close button hit region (after left endcap)
+            local close_start = x_pos + 1 -- after left endcap
+            table.insert(state.tab_close_regions, {
+                start_x = close_start,
+                end_x = close_start + close_widget_width,
+                tab_index = i,
+            })
+
+            -- Record hit region for this tab
+            table.insert(state.tab_regions, {
+                start_x = x_pos,
+                end_x = x_pos + tab_width,
+                tab_index = i,
+            })
+            x_pos = x_pos + tab_width
+
+            local tab_bg, tab_fg
+            if is_active then
+                tab_bg = THEME.bg4
+                tab_fg = THEME.fg_bright
+            elseif is_hovered then
+                tab_bg = THEME.bg3
+                tab_fg = THEME.fg_bright
+            else
+                tab_bg = THEME.bg2
+                tab_fg = THEME.fg_dim
+            end
+
+            -- Left endcap
+            table.insert(segments, { text = POWERLINE_SYMBOLS.left_round, style = { fg = tab_bg, bg = THEME.bg1 } })
+            -- Close widget
+            table.insert(segments, { text = close_text, style = { bg = tab_bg, fg = tab_fg } })
+            -- Tab content (title)
+            table.insert(segments, { text = label, style = { bg = tab_bg, fg = tab_fg, bold = is_active } })
+            -- Tab index (right side, dimmed)
+            table.insert(segments, { text = index_label, style = { bg = tab_bg, fg = THEME.fg_dim } })
+            -- Right endcap
+            table.insert(segments, { text = POWERLINE_SYMBOLS.right_round, style = { fg = tab_bg, bg = THEME.bg1 } })
         end
-
-        -- Tab index shown on the right
-        local index_str = tostring(i)
-        local index_width = #index_str + 2 -- space + index + space
-
-        -- Always reserve space for endcaps, close widget, and index
-        local inner_width = tab_width - endcap_width - close_widget_width - index_width
-        local title_width = prise.gwidth(title)
-
-        -- Truncate title if needed
-        if title_width > inner_width then
-            title = string.sub(title, 1, inner_width - 1) .. "…"
-            title_width = prise.gwidth(title)
-        end
-
-        -- Center the title
-        local padding_total = inner_width - title_width
-        local pad_left = math.floor(padding_total / 2)
-        local pad_right = padding_total - pad_left
-        if pad_left < 0 then
-            pad_left = 0
-        end
-        if pad_right < 0 then
-            pad_right = 0
-        end
-
-        local label = string.rep(" ", pad_left) .. title .. string.rep(" ", pad_right)
-        local index_label = " " .. index_str .. " "
-
-        -- Record close button hit region (after left endcap)
-        local close_start = x_pos + 1 -- after left endcap
-        table.insert(state.tab_close_regions, {
-            start_x = close_start,
-            end_x = close_start + close_widget_width,
-            tab_index = i,
-        })
-
-        -- Record hit region for this tab
-        table.insert(state.tab_regions, {
-            start_x = x_pos,
-            end_x = x_pos + tab_width,
-            tab_index = i,
-        })
-        x_pos = x_pos + tab_width
-
-        local tab_bg, tab_fg
-        if is_active then
-            tab_bg = THEME.bg4
-            tab_fg = THEME.fg_bright
-        elseif is_hovered then
-            tab_bg = THEME.bg3
-            tab_fg = THEME.fg_bright
-        else
-            tab_bg = THEME.bg2
-            tab_fg = THEME.fg_dim
-        end
-
-        -- Left endcap
-        table.insert(segments, { text = POWERLINE_SYMBOLS.left_round, style = { fg = tab_bg, bg = THEME.bg1 } })
-        -- Close widget
-        table.insert(segments, { text = close_text, style = { bg = tab_bg, fg = tab_fg } })
-        -- Tab content (title)
-        table.insert(segments, { text = label, style = { bg = tab_bg, fg = tab_fg, bold = is_active } })
-        -- Tab index (right side, dimmed)
-        table.insert(segments, { text = index_label, style = { bg = tab_bg, fg = THEME.fg_dim } })
-        -- Right endcap
-        table.insert(segments, { text = POWERLINE_SYMBOLS.right_round, style = { fg = tab_bg, bg = THEME.bg1 } })
     end
 
     return prise.Text(segments)
+end
+
+---Execute a custom segment command with caching
+---@param segment_idx number Index of the segment in config
+---@param segment StatusSegment Segment configuration
+---@return string
+local function execute_custom_segment(segment_idx, segment)
+    local cache = state.custom_segment_cache[segment_idx]
+    local now = os.time()
+    local cache_time = segment.cache_time or 5
+
+    -- Check if cache is valid
+    if cache and (now - cache.last_update) < cache_time then
+        return cache.value
+    end
+
+    -- Execute command
+    local handle = io.popen(segment.command .. " 2>/dev/null")
+    local output = ""
+    if handle then
+        output = handle:read("*a")
+        handle:close()
+        -- Trim whitespace
+        output = output:gsub("^%s+", ""):gsub("%s+$", "")
+    end
+
+    -- Update cache
+    state.custom_segment_cache[segment_idx] = {
+        value = output,
+        last_update = now,
+    }
+
+    return output
 end
 
 ---Build the powerline-style status bar
@@ -2917,9 +3293,6 @@ local function build_status_bar()
     local mode_color = state.pending_command and THEME.mode_command or THEME.mode_normal
     local session_name = (prise.get_session_name() or "prise"):upper()
     local mode_text = state.pending_command and " CMD " or (" " .. session_name .. " ")
-
-    -- Use cached git branch (updated on cwd_changed and focus change)
-    local git_branch = state.cached_git_branch
 
     -- Get current time
     local time_str = prise.get_time()
@@ -2935,21 +3308,35 @@ local function build_status_bar()
     -- Track the last background color for proper powerline transitions
     local last_bg = mode_color
 
-    -- Git branch
-    if git_branch then
-        local branch_text = " \u{F062C} " .. git_branch .. " "
-        table.insert(segments, { text = POWERLINE_SYMBOLS.right_solid, style = { fg = last_bg, bg = THEME.bg2 } })
-        table.insert(segments, { text = branch_text, style = { bg = THEME.bg2, fg = THEME.fg_bright } })
-        left_width = left_width + 1 + prise.gwidth(branch_text)
-        last_bg = THEME.bg2
-    end
-
     -- Zoom indicator
     if state.zoomed_pane_id then
         table.insert(segments, { text = POWERLINE_SYMBOLS.right_solid, style = { fg = last_bg, bg = THEME.yellow } })
         table.insert(segments, { text = " ZOOM ", style = { bg = THEME.yellow, fg = THEME.fg_dark, bold = true } })
         left_width = left_width + 1 + 6
         last_bg = THEME.yellow
+    end
+
+    -- Add custom segments if configured
+    if config.status_bar.custom_segments then
+        for i, segment in ipairs(config.status_bar.custom_segments) do
+            local output = execute_custom_segment(i, segment)
+            if output and #output > 0 then
+                -- Default styling
+                local seg_style = segment.style or { bg = THEME.bg4, fg = THEME.fg_bright }
+                local sep_style = segment.separator_style or { fg = last_bg, bg = seg_style.bg }
+
+                -- Add separator
+                table.insert(segments, { text = POWERLINE_SYMBOLS.right_solid, style = sep_style })
+                left_width = left_width + 1
+                -- Add segment content
+                local seg_text = " " .. output .. " "
+                table.insert(segments, { text = seg_text, style = seg_style })
+                left_width = left_width + prise.gwidth(seg_text)
+
+                -- Update last_bg for next segment
+                last_bg = seg_style.bg
+            end
+        end
     end
 
     -- End left side
@@ -3008,11 +3395,15 @@ function M.view()
     local palette = build_palette()
     local rename = build_rename()
     local rename_tab = build_rename_tab()
+    local session_picker = build_session_picker()
     local tab_bar = build_tab_bar()
     prise.log.debug("view: palette.visible=" .. tostring(state.palette.visible))
 
     -- When zoomed, render only the zoomed pane
-    local overlay_visible = state.palette.visible or state.rename.visible or state.rename_tab.visible
+    local overlay_visible = state.palette.visible
+        or state.rename.visible
+        or state.rename_tab.visible
+        or state.session_picker.visible
     local content
     if state.zoomed_pane_id then
         local path = find_node_path(root, state.zoomed_pane_id)
@@ -3057,7 +3448,7 @@ function M.view()
         children = main_children,
     })
 
-    local overlay = palette or rename or rename_tab
+    local overlay = palette or rename or rename_tab or session_picker
     if overlay then
         return prise.Stack({
             children = {

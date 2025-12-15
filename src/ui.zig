@@ -81,10 +81,13 @@ pub const UI = struct {
     detach_ctx: *anyopaque = undefined,
     save_callback: ?*const fn (ctx: *anyopaque) void = null,
     save_ctx: *anyopaque = undefined,
+    switch_session_callback: ?*const fn (ctx: *anyopaque, target_session: []const u8) anyerror!void = null,
+    switch_session_ctx: *anyopaque = undefined,
     get_session_name_callback: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     get_session_name_ctx: *anyopaque = undefined,
     rename_session_callback: ?*const fn (ctx: *anyopaque, new_name: []const u8) anyerror!void = null,
     rename_session_ctx: *anyopaque = undefined,
+    dim_factor: f32 = 0.025,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -206,6 +209,19 @@ pub const UI = struct {
         // Store pointer to self in registry for static functions to use
         self.lua.pushLightUserdata(self);
         self.lua.setField(ziglua.registry_index, "prise_ui_ptr");
+
+        // Apply any pending dim_factor that was set during init.lua
+        _ = self.lua.getField(ziglua.registry_index, "_pending_dim_factor");
+        if (self.lua.typeOf(-1) == .number) {
+            const pending_dim = self.lua.toNumber(-1) catch 0.025;
+            log.debug("setLoop: applying pending dim_factor={d}", .{pending_dim});
+            self.dim_factor = @floatCast(pending_dim);
+            self.lua.pop(1);
+            self.lua.pushNil();
+            self.lua.setField(ziglua.registry_index, "_pending_dim_factor");
+        } else {
+            self.lua.pop(1);
+        }
     }
 
     pub fn setExitCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
@@ -231,6 +247,11 @@ pub const UI = struct {
     pub fn setSaveCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
         self.save_ctx = ctx;
         self.save_callback = cb;
+    }
+
+    pub fn setSwitchSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, target_session: []const u8) anyerror!void) void {
+        self.switch_session_ctx = ctx;
+        self.switch_session_callback = cb;
     }
 
     pub fn setGetSessionNameCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) ?[]const u8) void {
@@ -361,9 +382,25 @@ pub const UI = struct {
         lua.pushFunction(ziglua.wrap(renameSession));
         lua.setField(-2, "rename_session");
 
+        // Register set_dim_factor
+        lua.pushFunction(ziglua.wrap(setDimFactor));
+        lua.setField(-2, "set_dim_factor");
+
+        // Register get_dim_factor
+        lua.pushFunction(ziglua.wrap(getDimFactor));
+        lua.setField(-2, "get_dim_factor");
+
         // Register create_text_input
         lua.pushFunction(ziglua.wrap(createTextInput));
         lua.setField(-2, "create_text_input");
+
+        // Register list_sessions
+        lua.pushFunction(ziglua.wrap(listSessions));
+        lua.setField(-2, "list_sessions");
+
+        // Register switch_session
+        lua.pushFunction(ziglua.wrap(switchSession));
+        lua.setField(-2, "switch_session");
 
         // Register log
         lua.createTable(0, 4);
@@ -515,6 +552,128 @@ pub const UI = struct {
             };
             lua.pushBoolean(true);
         } else {
+            lua.pushBoolean(false);
+        }
+        return 1;
+    }
+
+    fn getDimFactor(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            lua.pushNumber(0.025);
+            return 1;
+        };
+        lua.pop(1);
+
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+        lua.pushNumber(ui.dim_factor);
+        return 1;
+    }
+
+    fn setDimFactor(lua: *ziglua.Lua) i32 {
+        const dim: f64 = lua.toNumber(1) catch 0.025;
+
+        // Try to get the UI pointer and set it directly
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr_result = lua.toPointer(-1);
+        lua.pop(1);
+
+        if (ui_ptr_result) |ui_ptr| {
+            const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+            log.debug("setDimFactor: setting dim_factor to {d}", .{dim});
+            ui.dim_factor = @floatCast(dim);
+            lua.pushBoolean(true);
+            return 1;
+        } else |_| {
+            // UI pointer not available yet (we're in init.lua), store the value for later
+            log.debug("setDimFactor: storing pending dim_factor={d}", .{dim});
+            lua.pushNumber(dim);
+            lua.setField(ziglua.registry_index, "_pending_dim_factor");
+            lua.pushBoolean(true);
+            return 1;
+        }
+    }
+
+    fn listSessions(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            lua.createTable(0, 0);
+            return 1;
+        };
+        lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+
+        const home = std.posix.getenv("HOME") orelse {
+            lua.createTable(0, 0);
+            return 1;
+        };
+
+        const sessions_dir = std.fs.path.join(ui.allocator, &.{ home, ".local", "state", "prise", "sessions" }) catch {
+            lua.createTable(0, 0);
+            return 1;
+        };
+        defer ui.allocator.free(sessions_dir);
+
+        var dir = std.fs.openDirAbsolute(sessions_dir, .{ .iterate = true }) catch {
+            lua.createTable(0, 0);
+            return 1;
+        };
+        defer dir.close();
+
+        // Collect session names in a single pass
+        var names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names.items) |name| {
+                ui.allocator.free(name);
+            }
+            names.deinit(ui.allocator);
+        }
+
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+            const name_without_ext = entry.name[0 .. entry.name.len - 5];
+            const duped = ui.allocator.dupe(u8, name_without_ext) catch continue;
+            names.append(ui.allocator, duped) catch {
+                ui.allocator.free(duped);
+                continue;
+            };
+        }
+
+        lua.createTable(@intCast(names.items.len), 0);
+        for (names.items, 1..) |name, idx| {
+            _ = lua.pushString(name);
+            lua.rawSetIndex(-2, @intCast(idx));
+        }
+
+        return 1;
+    }
+
+    fn switchSession(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            log.warn("switchSession: failed to get ui pointer", .{});
+            lua.pushBoolean(false);
+            return 1;
+        };
+        lua.pop(1);
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+
+        const target_session = lua.toString(1) catch {
+            log.warn("switchSession: failed to get target session name", .{});
+            lua.pushBoolean(false);
+            return 1;
+        };
+        log.info("switchSession: called with target_session='{s}'", .{target_session});
+
+        if (ui.switch_session_callback) |cb| {
+            cb(ui.switch_session_ctx, target_session) catch |err| {
+                lua.raiseErrorStr("Failed to switch session: %s", .{@errorName(err).ptr});
+            };
+            lua.pushBoolean(true);
+        } else {
+            log.warn("switchSession: no callback registered", .{});
             lua.pushBoolean(false);
         }
         return 1;
