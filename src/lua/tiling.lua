@@ -331,9 +331,9 @@ function M.setup(opts)
     if opts then
         merge_config(config, opts)
     end
-    -- Re-initialize keybinds if config changed
+    -- Mark keybinds for re-initialization on next key event
+    -- (lazy init because UI pointer may not be available during config loading)
     state.keybind_matcher = nil
-    init_keybinds()
 end
 
 ---Get the macos_option_as_alt setting
