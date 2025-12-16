@@ -231,6 +231,7 @@ local config = {
     leader = "<D-k>",
     keybinds = {
         ["<D-p>"] = "command_palette",
+        ["<leader>x"] = "capture_pane",
         ["<leader>v"] = "split_horizontal",
         ["<leader>s"] = "split_vertical",
         ["<leader><Enter>"] = "split_auto",
@@ -283,6 +284,7 @@ local state = {
     clock_timer = nil,
     pending_split = nil,
     pending_new_tab = false,
+    pending_capture_cmd = nil,
     next_split_id = 1,
     -- Command palette
     palette = {
@@ -1563,6 +1565,15 @@ local commands = {
             return #state.tabs >= 10
         end,
     },
+    {
+        name = "Capture Pane",
+        action = function()
+            local handler = action_handlers["capture_pane"]
+            if handler then
+                handler()
+            end
+        end,
+    },
 }
 
 -- Action handlers for keybind system
@@ -1685,6 +1696,24 @@ action_handlers = {
     end,
     rename_session = function()
         open_rename()
+    end,
+    capture_pane = function()
+        local pty = get_focused_pty()
+        if pty then
+            local timestamp = os.date("%Y%m%d_%H%M%S")
+            local filename = "/tmp/pane_" .. timestamp .. ".txt"
+            pty:capture_pane(filename)
+            prise.log.info("Pane captured to " .. filename)
+
+            -- Defer opening editor to allow server to send capture content
+            prise.set_timeout(500, function()
+                -- Create new tab with shell that opens editor
+                local editor = os.getenv("EDITOR") or "vim"
+                state.pending_new_tab = true
+                state.pending_capture_cmd = editor .. ' "' .. filename .. '"'
+                prise.spawn({ cwd = pty:cwd() })
+            end)
+        end
     end,
     quit = function()
         detach_session()
@@ -1834,6 +1863,14 @@ function M.update(event)
             }
             table.insert(state.tabs, new_tab)
             set_active_tab_index(#state.tabs)
+
+            -- If there's a pending capture command, send it to the new PTY
+            if state.pending_capture_cmd then
+                local cmd = state.pending_capture_cmd
+                state.pending_capture_cmd = nil
+                -- Close tab when editor exits
+                pty:send_paste(cmd .. " && exit\n")
+            end
         elseif #state.tabs == 0 then
             -- First terminal - create first tab
             local tab_id = state.next_tab_id
@@ -2040,7 +2077,7 @@ function M.update(event)
             if state.timer then
                 state.timer:cancel()
             end
-            state.timer = prise.set_timeout(1000, function()
+            state.timer = prise.set_timeout(3000, function()
                 if state.pending_command then
                     state.pending_command = false
                     state.timer = nil
@@ -2089,6 +2126,10 @@ function M.update(event)
             end
         end
     elseif event.type == "key_release" then
+        -- Don't forward key releases to PTY if we're waiting for a keybind
+        if state.pending_command then
+            return
+        end
         -- Forward all key releases to focused PTY
         local root = get_active_root()
         if root and state.focused_id then
