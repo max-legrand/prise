@@ -21,6 +21,7 @@ local utils = require("utils")
 ---@field title? string
 ---@field root? Node
 ---@field last_focused_id? number
+---@field return_to_tab? integer Tab index to return to when this tab is closed
 
 ---@class PaletteRegion
 ---@field start_y number
@@ -313,6 +314,7 @@ local state = {
     pending_split = nil,
     pending_new_tab = false,
     pending_capture_cmd = nil,
+    pending_capture_return_tab = nil, -- Tab index to return to when capture tab closes
     next_split_id = 1,
     -- Command palette
     palette = {
@@ -824,13 +826,28 @@ local function close_tab(idx)
     end
 
     local old_focused = state.focused_id
+    local return_to = tab.return_to_tab
     table.remove(state.tabs, idx)
 
     -- Pick new active tab index
-    if idx > #state.tabs then
-        idx = #state.tabs
+    if return_to then
+        -- Tab has a preferred return destination (e.g., capture pane editor)
+        -- Adjust for removed tab if it was before the return target
+        if idx < return_to then
+            return_to = return_to - 1
+        end
+        -- Clamp to valid range
+        if return_to > #state.tabs then
+            return_to = #state.tabs
+        elseif return_to < 1 then
+            return_to = 1
+        end
+        state.active_tab = return_to
+    elseif idx > #state.tabs then
+        state.active_tab = #state.tabs
+    else
+        state.active_tab = idx > 0 and idx or 1
     end
-    state.active_tab = idx > 0 and idx or 1
 
     local new_tab = state.tabs[state.active_tab]
     if new_tab then
@@ -913,12 +930,30 @@ local function remove_pane_by_id(id)
             local old_focused = state.focused_id
             table.remove(state.tabs, tab_idx)
 
-            -- Adjust active_tab if needed
-            if state.active_tab > #state.tabs then
-                state.active_tab = #state.tabs
-            end
-            if state.active_tab < 1 then
-                state.active_tab = 1
+            local return_to = tab.return_to_tab
+
+            -- Pick new active tab index
+            if return_to then
+                -- Tab has a preferred return destination (e.g., capture pane editor)
+                -- Adjust for removed tab if it was before the return target
+                if tab_idx < return_to then
+                    return_to = return_to - 1
+                end
+                -- Clamp to valid range
+                if return_to > #state.tabs then
+                    return_to = #state.tabs
+                elseif return_to < 1 then
+                    return_to = 1
+                end
+                state.active_tab = return_to
+            else
+                -- Adjust active_tab if needed
+                if state.active_tab > #state.tabs then
+                    state.active_tab = #state.tabs
+                end
+                if state.active_tab < 1 then
+                    state.active_tab = 1
+                end
             end
 
             -- Update focus to new active tab
@@ -2120,6 +2155,7 @@ action_handlers = {
                 local editor = os.getenv("EDITOR") or "vim"
                 state.pending_new_tab = true
                 state.pending_capture_cmd = editor .. ' "' .. filename .. '"'
+                state.pending_capture_return_tab = state.active_tab
                 prise.spawn({ cwd = pty:cwd() })
             end)
         end
@@ -2331,6 +2367,11 @@ function M.update(event)
             if state.pending_capture_cmd then
                 local cmd = state.pending_capture_cmd
                 state.pending_capture_cmd = nil
+                -- Store return tab index so we go back when this tab closes
+                if state.pending_capture_return_tab then
+                    new_tab.return_to_tab = state.pending_capture_return_tab
+                    state.pending_capture_return_tab = nil
+                end
                 -- Close tab when editor exits
                 pty:send_paste(cmd .. " && exit\n")
             end

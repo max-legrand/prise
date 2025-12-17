@@ -102,7 +102,7 @@ pub const Compiler = struct {
     pub fn deinit(self: *Compiler) void {
         if (self.leader_owned) {
             if (self.leader) |leader| {
-                self.allocator.free(leader);
+                key_string.freeKeys(self.allocator, leader);
             }
         }
     }
@@ -110,7 +110,7 @@ pub const Compiler = struct {
     pub fn setLeader(self: *Compiler, leader_str: []const u8) !void {
         if (self.leader_owned) {
             if (self.leader) |old| {
-                self.allocator.free(old);
+                key_string.freeKeys(self.allocator, old);
             }
         }
         self.leader = try key_string.parseKeyString(self.allocator, leader_str);
@@ -120,7 +120,7 @@ pub const Compiler = struct {
     pub fn setLeaderKeys(self: *Compiler, keys: []const Key) void {
         if (self.leader_owned) {
             if (self.leader) |old| {
-                self.allocator.free(old);
+                key_string.freeKeys(self.allocator, old);
             }
         }
         self.leader = keys;
@@ -143,7 +143,7 @@ pub const Compiler = struct {
         defer self.allocator.free(expanded);
 
         const keys = key_string.parseKeyString(self.allocator, expanded) catch return error.InvalidKeyString;
-        defer self.allocator.free(keys);
+        defer key_string.freeKeys(self.allocator, keys);
 
         if (keys.len == 0) return error.InvalidKeyString;
 
@@ -276,7 +276,7 @@ test "compile single binding" {
     defer trie.deinit();
 
     const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>");
-    defer std.testing.allocator.free(keys);
+    defer key_string.freeKeys(std.testing.allocator, keys);
 
     const node = trie.lookup(keys);
     try std.testing.expect(node != null);
@@ -295,14 +295,14 @@ test "compile sequence binding" {
     defer trie.deinit();
 
     const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>v");
-    defer std.testing.allocator.free(keys);
+    defer key_string.freeKeys(std.testing.allocator, keys);
 
     const node = trie.lookup(keys);
     try std.testing.expect(node != null);
     try std.testing.expectEqual(Action.split_horizontal, node.?.action.?);
 
     const partial_keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>");
-    defer std.testing.allocator.free(partial_keys);
+    defer key_string.freeKeys(std.testing.allocator, partial_keys);
 
     const partial_node = trie.lookup(partial_keys);
     try std.testing.expect(partial_node != null);
@@ -325,21 +325,21 @@ test "compile multiple bindings" {
 
     {
         const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>v");
-        defer std.testing.allocator.free(keys);
+        defer key_string.freeKeys(std.testing.allocator, keys);
         const node = trie.lookup(keys);
         try std.testing.expectEqual(Action.split_horizontal, node.?.action.?);
     }
 
     {
         const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>s");
-        defer std.testing.allocator.free(keys);
+        defer key_string.freeKeys(std.testing.allocator, keys);
         const node = trie.lookup(keys);
         try std.testing.expectEqual(Action.split_vertical, node.?.action.?);
     }
 
     {
         const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>h");
-        defer std.testing.allocator.free(keys);
+        defer key_string.freeKeys(std.testing.allocator, keys);
         const node = trie.lookup(keys);
         try std.testing.expectEqual(Action.focus_left, node.?.action.?);
     }
@@ -398,7 +398,7 @@ test "leader expansion" {
     defer trie.deinit();
 
     const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>v");
-    defer std.testing.allocator.free(keys);
+    defer key_string.freeKeys(std.testing.allocator, keys);
 
     const node = trie.lookup(keys);
     try std.testing.expect(node != null);
@@ -419,7 +419,7 @@ test "leader expansion multiple keys" {
     defer trie.deinit();
 
     const keys = try key_string.parseKeyString(std.testing.allocator, "<C-a>bx");
-    defer std.testing.allocator.free(keys);
+    defer key_string.freeKeys(std.testing.allocator, keys);
 
     const node = trie.lookup(keys);
     try std.testing.expect(node != null);
@@ -438,7 +438,7 @@ test "lookup nonexistent key" {
     defer trie.deinit();
 
     const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>x");
-    defer std.testing.allocator.free(keys);
+    defer key_string.freeKeys(std.testing.allocator, keys);
 
     const node = trie.lookup(keys);
     try std.testing.expect(node == null);
@@ -457,7 +457,7 @@ test "lookup partial sequence" {
 
     {
         const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>");
-        defer std.testing.allocator.free(keys);
+        defer key_string.freeKeys(std.testing.allocator, keys);
         const node = trie.lookup(keys);
         try std.testing.expect(node != null);
         try std.testing.expect(node.?.action == null);
@@ -466,7 +466,7 @@ test "lookup partial sequence" {
 
     {
         const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>v");
-        defer std.testing.allocator.free(keys);
+        defer key_string.freeKeys(std.testing.allocator, keys);
         const node = trie.lookup(keys);
         try std.testing.expect(node != null);
         try std.testing.expect(node.?.action == null);
@@ -475,7 +475,7 @@ test "lookup partial sequence" {
 
     {
         const keys = try key_string.parseKeyString(std.testing.allocator, "<D-k>vg");
-        defer std.testing.allocator.free(keys);
+        defer key_string.freeKeys(std.testing.allocator, keys);
         const node = trie.lookup(keys);
         try std.testing.expect(node != null);
         try std.testing.expectEqual(Action.split_horizontal, node.?.action.?);
