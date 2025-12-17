@@ -1674,6 +1674,7 @@ pub const App = struct {
             .column,
             .row,
             .stack,
+            .separator,
             => {
                 // These widgets use renderTo for now
                 try w.renderTo(win, self.allocator);
