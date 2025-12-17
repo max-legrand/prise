@@ -23,6 +23,7 @@ pub const ParseError = error{
     UnterminatedBracket,
     EmptyKey,
     UnknownSpecialKey,
+    OutOfMemory,
 };
 
 pub fn parseKeyString(allocator: std.mem.Allocator, input: []const u8) ParseError![]Key {
@@ -35,7 +36,18 @@ pub fn parseKeyString(allocator: std.mem.Allocator, input: []const u8) ParseErro
             const key = try parseBracketedKey(input, &i);
             keys.append(allocator, key) catch return error.InvalidFormat;
         } else {
-            const key = Key{ .key = input[i .. i + 1] };
+            const char = input[i];
+            // Uppercase letters imply shift modifier, but key should be lowercase
+            const is_uppercase = char >= 'A' and char <= 'Z';
+            const key_char = if (is_uppercase) char + ('a' - 'A') else char;
+
+            var buf: [1]u8 = .{key_char};
+            const key_str = try allocator.dupe(u8, &buf);
+
+            const key = Key{
+                .key = key_str,
+                .shift = is_uppercase,
+            };
             keys.append(allocator, key) catch return error.InvalidFormat;
             i += 1;
         }
@@ -239,6 +251,18 @@ test "lowercase modifiers" {
     try std.testing.expectEqualStrings("s", keys[0].key);
     try std.testing.expect(keys[0].ctrl);
     try std.testing.expect(keys[0].alt);
+}
+
+test "uppercase letter implies shift" {
+    const keys = try parseKeyString(std.testing.allocator, "S");
+    defer std.testing.allocator.free(keys);
+
+    try std.testing.expectEqual(1, keys.len);
+    try std.testing.expectEqualStrings("s", keys[0].key); // Normalized to lowercase
+    try std.testing.expect(keys[0].shift);
+    try std.testing.expect(!keys[0].ctrl);
+    try std.testing.expect(!keys[0].alt);
+    try std.testing.expect(!keys[0].super);
 }
 
 test "multi-key sequence with modifiers" {

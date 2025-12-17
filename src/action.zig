@@ -32,6 +32,8 @@ pub const Action = union(enum) {
     rename_tab,
     next_tab,
     previous_tab,
+    swap_tab_left,
+    swap_tab_right,
 
     // Tab selection (1-10)
     tab_1,
@@ -54,10 +56,12 @@ pub const Action = union(enum) {
     // Session
     detach_session,
     rename_session,
+    open_session_picker,
     quit,
 
     // UI
     command_palette,
+    capture_pane,
 
     // Lua function reference (registry ref)
     lua_function: i32,
@@ -108,6 +112,8 @@ pub const Action = union(enum) {
             .rename_tab => "Rename Tab",
             .next_tab => "Next Tab",
             .previous_tab => "Previous Tab",
+            .swap_tab_left => "Swap Tab Left",
+            .swap_tab_right => "Swap Tab Right",
             .tab_1 => "Tab 1",
             .tab_2 => "Tab 2",
             .tab_3 => "Tab 3",
@@ -124,8 +130,10 @@ pub const Action = union(enum) {
             .resize_down => "Resize Down",
             .detach_session => "Detach Session",
             .rename_session => "Rename Session",
+            .open_session_picker => "Switch Session",
             .quit => "Quit",
             .command_palette => "Command Palette",
+            .capture_pane => "Capture Pane",
             .lua_function => null,
         };
     }

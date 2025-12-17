@@ -186,6 +186,7 @@ pub const ClientState = struct {
         detach,
         get_server_info,
         copy_selection,
+        capture_pane: struct { path: []const u8 },
     };
 
     pub fn init(allocator: std.mem.Allocator) ClientState {
@@ -296,6 +297,7 @@ pub const ClientLogic = struct {
                 .detach => .detached,
                 .get_server_info => handleServerInfoResult(state, result),
                 .copy_selection => handleCopySelectionResult(result),
+                .capture_pane => |capture_info| handleCapturePaneResult(result, capture_info.path),
             };
         }
         return handleUnsolicitedResult(state, result);
@@ -311,6 +313,25 @@ pub const ClientLogic = struct {
         } else {
             log.warn("handleCopySelectionResult: unexpected result type: {s}", .{@tagName(result)});
         }
+        return .none;
+    }
+
+    fn handleCapturePaneResult(result: msgpack.Value, path: []const u8) ServerAction {
+        if (result == .string) {
+            log.info("handleCapturePaneResult: writing {} bytes to {s}", .{ result.string.len, path });
+            const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+                log.err("Failed to create file {s}: {}", .{ path, err });
+                return .none;
+            };
+            defer file.close();
+            _ = file.writeAll(result.string) catch |err| {
+                log.err("Failed to write pane content to {s}: {}", .{ path, err });
+                return .none;
+            };
+            log.info("Successfully wrote pane content to {s}", .{path});
+            return .none;
+        }
+        log.warn("handleCapturePaneResult: unexpected result type: {s}", .{@tagName(result)});
         return .none;
     }
 
@@ -1537,8 +1558,150 @@ pub const App = struct {
         }
     }
 
+    fn applyDimToStyle(self: *App, style: vaxis.Style, dim_factor: f32) vaxis.Style {
+        if (dim_factor == 0.0) return style;
+
+        var dimmed = style;
+
+        // Apply dimming to foreground color
+        if (dimmed.fg != .default) {
+            const fg_rgb = self.resolveColor(dimmed.fg);
+            if (fg_rgb) |rgb| {
+                dimmed.fg = .{ .rgb = Surface.TerminalColors.reduceContrast(rgb, dim_factor * 0.5) };
+            }
+        }
+
+        // Apply dimming to background color
+        if (dimmed.bg != .default) {
+            const bg_rgb = self.resolveColor(dimmed.bg);
+            if (bg_rgb) |rgb| {
+                dimmed.bg = .{ .rgb = Surface.TerminalColors.reduceContrast(rgb, dim_factor) };
+            }
+        }
+
+        return dimmed;
+    }
+
+    fn resolveColor(self: *App, color: vaxis.Cell.Color) ?[3]u8 {
+        return switch (color) {
+            .rgb => |rgb| rgb,
+            .index => |idx| blk: {
+                if (idx >= 16) break :blk null;
+                if (self.colors.palette[idx]) |c_val| {
+                    break :blk switch (c_val) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+            .default => blk: {
+                if (self.colors.bg) |bg| {
+                    break :blk switch (bg) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+        };
+    }
+
     fn renderWidget(self: *App, w: widget.Widget, win: vaxis.Window) !void {
-        try w.renderTo(win, self.allocator);
+        switch (w.kind) {
+            .surface => |surf| {
+                if (self.surfaces.get(surf.pty_id)) |surface| {
+                    // Check for resize mismatch and send resize request if needed
+                    if (surface.rows != w.height or surface.cols != w.width) {
+                        log.debug("renderWidget: surface resize needed for pty {}: {}x{} -> {}x{}", .{
+                            surf.pty_id,
+                            surface.cols,
+                            surface.rows,
+                            w.width,
+                            w.height,
+                        });
+                        self.sendResize(surf.pty_id, w.height, w.width) catch |err| {
+                            log.err("Failed to send resize: {}", .{err});
+                        };
+                    }
+                    // Calculate dim factor based on focus
+                    const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                    surface.render(win, w.focus, &self.colors, dim_factor);
+                }
+            },
+            .text => {
+                // Use renderTo for text widgets
+                try w.renderTo(win, self.allocator);
+            },
+            .box => |b| {
+                const chars = b.borderChars();
+                // Apply dimming to border style if not focused
+                const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                const style = self.applyDimToStyle(b.style, dim_factor);
+
+                log.debug("render box: w={} h={} focus={} dim_factor={d}", .{ win.width, win.height, w.focus, dim_factor });
+
+                // Fill background for the entire box area
+                if (style.bg != .default) {
+                    for (0..win.height) |row| {
+                        for (0..win.width) |col| {
+                            win.writeCell(@intCast(col), @intCast(row), .{
+                                .char = .{ .grapheme = " ", .width = 1 },
+                                .style = style,
+                            });
+                        }
+                    }
+                }
+
+                // Render border if not none
+                if (b.border != .none and win.width >= 2 and win.height >= 2) {
+                    win.writeCell(0, 0, .{ .char = .{ .grapheme = chars.tl, .width = 1 }, .style = style });
+                    win.writeCell(win.width - 1, 0, .{ .char = .{ .grapheme = chars.tr, .width = 1 }, .style = style });
+                    win.writeCell(0, win.height - 1, .{ .char = .{ .grapheme = chars.bl, .width = 1 }, .style = style });
+                    win.writeCell(win.width - 1, win.height - 1, .{ .char = .{ .grapheme = chars.br, .width = 1 }, .style = style });
+
+                    for (1..win.width - 1) |col| {
+                        win.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                        win.writeCell(@intCast(col), win.height - 1, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                    }
+
+                    for (1..win.height - 1) |row| {
+                        win.writeCell(0, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                        win.writeCell(win.width - 1, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                    }
+                }
+
+                // Render child widget if present
+                const inner_win = win.child(.{
+                    .x_off = if (b.border != .none) 1 else 0,
+                    .y_off = if (b.border != .none) 1 else 0,
+                    .width = if (b.border != .none and win.width >= 2) win.width - 2 else win.width,
+                    .height = if (b.border != .none and win.height >= 2) win.height - 2 else win.height,
+                });
+                try self.renderWidget(b.child.*, inner_win);
+            },
+            .positioned => |pos| {
+                const child_win = win.child(.{
+                    .x_off = pos.x orelse 0,
+                    .y_off = pos.y orelse 0,
+                    .width = pos.child.width,
+                    .height = pos.child.height,
+                });
+                try self.renderWidget(pos.child.*, child_win);
+            },
+            .text_input,
+            .list,
+            .padding,
+            .column,
+            .row,
+            .stack,
+            .separator,
+            .segmented_separator,
+            => {
+                // These widgets use renderTo for now
+                try w.renderTo(win, self.allocator);
+            },
+        }
     }
 
     pub fn scheduleRender(self: *App) !void {
@@ -2136,6 +2299,12 @@ pub const App = struct {
                                                         try self.requestCopySelection(id);
                                                     }
                                                 }.appCopySelection,
+                                                .capture_pane_fn = struct {
+                                                    fn appCapturePane(ctx: *anyopaque, id: u32, path: []const u8) anyerror!void {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
+                                                        try self.requestCapturePane(id, path);
+                                                    }
+                                                }.appCapturePane,
                                                 .cell_size_fn = struct {
                                                     fn appGetCellSize(ctx: *anyopaque) lua_event.CellSize {
                                                         const self: *App = @ptrCast(@alignCast(ctx));
@@ -2419,6 +2588,23 @@ pub const App = struct {
         params[0] = .{ .unsigned = pty_id };
 
         const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "get_selection", msgpack.Value{ .array = params } });
+        defer self.allocator.free(msg);
+
+        try self.sendDirect(msg);
+    }
+
+    pub fn requestCapturePane(self: *App, pty_id: u32, path: []const u8) !void {
+        const msgid = self.state.next_msgid;
+        self.state.next_msgid += 1;
+
+        const path_copy = try self.allocator.dupe(u8, path);
+        try self.state.pending_requests.put(msgid, .{ .capture_pane = .{ .path = path_copy } });
+
+        var params = try self.allocator.alloc(msgpack.Value, 1);
+        defer self.allocator.free(params);
+        params[0] = .{ .unsigned = pty_id };
+
+        const msg = try msgpack.encode(self.allocator, .{ 0, msgid, "capture_pane", msgpack.Value{ .array = params } });
         defer self.allocator.free(msg);
 
         try self.sendDirect(msg);
@@ -2969,6 +3155,12 @@ pub const App = struct {
                     try app.requestCopySelection(pty_id);
                 }
             }.copySelection,
+            .capture_pane_fn = struct {
+                fn capturePane(app_ctx: *anyopaque, pty_id: u32, path: []const u8) anyerror!void {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+                    try app.requestCapturePane(pty_id, path);
+                }
+            }.capturePane,
             .cell_size_fn = struct {
                 fn getCellSize(app_ctx: *anyopaque) lua_event.CellSize {
                     const app: *App = @ptrCast(@alignCast(app_ctx));

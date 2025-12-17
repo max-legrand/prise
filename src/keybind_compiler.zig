@@ -481,3 +481,28 @@ test "lookup partial sequence" {
         try std.testing.expectEqual(Action.split_horizontal, node.?.action.?);
     }
 }
+
+test "uppercase letter keybind (shift implied)" {
+    var compiler = Compiler.init(std.testing.allocator);
+    defer compiler.deinit();
+
+    try compiler.setLeader("<D-k>");
+
+    const bindings = [_]Keybind{
+        .{ .key_string = "<leader>S", .action = .open_session_picker },
+    };
+
+    var trie = try compiler.compile(&bindings);
+    defer trie.deinit();
+
+    // When pressing Shift+S, we get key="s" with shift=true (after normalization)
+    // The keybind "S" should also parse to key="s" with shift=true
+    const lookup_keys = [_]Key{
+        .{ .key = "k", .super = true }, // leader
+        .{ .key = "s", .shift = true }, // normalized Shift+S
+    };
+
+    const node = trie.lookup(&lookup_keys);
+    try std.testing.expect(node != null);
+    try std.testing.expectEqual(Action.open_session_picker, node.?.action.?);
+}
