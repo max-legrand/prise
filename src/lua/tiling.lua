@@ -894,13 +894,30 @@ local function remove_pane_by_id(id)
         else
             local old_focused = state.focused_id
             table.remove(state.tabs, tab_idx)
+            local return_to = tab.return_to_tab
 
-            -- Adjust active_tab if needed
-            if state.active_tab > #state.tabs then
-                state.active_tab = #state.tabs
-            end
-            if state.active_tab < 1 then
-                state.active_tab = 1
+            -- Pick new active tab index
+            if return_to then
+                -- Tab has a preferred return destination (e.g., capture pane editor)
+                -- Adjust for removed tab if it was before the return target
+                if tab_idx < return_to then
+                    return_to = return_to - 1
+                end
+                -- Clamp to valid range
+                if return_to > #state.tabs then
+                    return_to = #state.tabs
+                elseif return_to < 1 then
+                    return_to = 1
+                end
+                state.active_tab = return_to
+            else
+                -- Adjust active_tab if needed
+                if state.active_tab > #state.tabs then
+                    state.active_tab = #state.tabs
+                end
+                if state.active_tab < 1 then
+                    state.active_tab = 1
+                end
             end
 
             -- Update focus to new active tab
