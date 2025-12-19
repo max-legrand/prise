@@ -3208,7 +3208,7 @@ test "ClientLogic - processServerMessage" {
         try testing.expect(state.response_received);
         try testing.expectEqual(123, state.pty_id.?);
         try testing.expectEqual(std.meta.Tag(ServerAction).attached, std.meta.activeTag(action));
-        try testing.expectEqual(123, action.attached);
+        try testing.expectEqual(123, action.attached.id);
     }
 
     // Test Attach response (already have pty_id)
@@ -3228,7 +3228,7 @@ test "ClientLogic - processServerMessage" {
         const action = try ClientLogic.processServerMessage(&state, msg);
         try testing.expect(state.attached);
         try testing.expectEqual(std.meta.Tag(ServerAction).attached, std.meta.activeTag(action));
-        try testing.expectEqual(123, action.attached);
+        try testing.expectEqual(123, action.attached.id);
     }
 
     // Test Redraw Notification
