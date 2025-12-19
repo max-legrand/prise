@@ -2627,29 +2627,41 @@ pub const App = struct {
         }
 
         // Build arguments for exec
-        // Build arguments for exec
         const target_z = try self.allocator.dupeZ(u8, target_session);
         errdefer self.allocator.free(target_z);
+
+        // Get the path to the current executable
+        var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const self_exe_path = std.fs.selfExePath(&self_exe_buf) catch "prise";
+        const self_exe = try self.allocator.dupeZ(u8, self_exe_path);
+        defer self.allocator.free(self_exe);
+
         const args = [_]?[*:0]const u8{
-            "prise",
+            self_exe,
             "session",
             "attach",
             target_z,
             null,
         };
 
-        log.info("Exec'ing prise session attach '{s}'", .{target_session});
+        log.info("Exec'ing {s} session attach '{s}'", .{ self_exe, target_session });
 
         // Restore terminal state right before exec to minimize window of failure
         const writer = self.tty.writer();
         self.vx.deinit(self.allocator, writer);
+        self.tty.deinit();
 
         // Use execvpeZ with current environment
-        const err = posix.execvpeZ("prise", @ptrCast(&args), @ptrCast(std.c.environ));
+        const err = posix.execvpeZ(self_exe, @ptrCast(&args), @ptrCast(std.c.environ));
 
         // If we get here, exec failed - reinitialize terminal
-        log.err("Failed to exec prise: {}", .{err});
-        self.vx = vaxis.Vaxis.init(self.allocator, .{}) catch return err;
+        log.err("Failed to exec {s}: {}", .{ self_exe, err });
+        self.tty = try vaxis.Tty.init(&self.tty_buffer);
+        self.vx = vaxis.init(self.allocator, .{
+            .kitty_keyboard_flags = .{
+                .report_events = true,
+            },
+        }) catch return err;
         self.vx.enterAltScreen(writer) catch {};
         return err;
     }
