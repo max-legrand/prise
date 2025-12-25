@@ -74,9 +74,13 @@ local utils = require("utils")
 ---@field screen_cols number
 ---@field screen_rows number
 ---@field keybind_matcher? KeybindMatcher
+---@field layout_plan? { windows?: { name?: string, panes?: { title?: string, cmd?: string, split?: "horizontal"|"vertical" }[] }[] }
+---@field layout_window number
+---@field layout_pane number
+---@field layout_pending_cmd? string
 
 ---@class Command
----@field name string
+---@field name string|fun(): string
 ---@field action fun()
 ---@field shortcut? string
 ---@field visible? fun(): boolean
@@ -364,6 +368,11 @@ local state = {
     keybind_matcher = nil,
     -- Custom segment cache
     custom_segment_cache = {},
+
+    layout_plan = nil,
+    layout_window = 1,
+    layout_pane = 1,
+    layout_pending_cmd = nil,
 }
 
 local M = {}
@@ -395,6 +404,16 @@ end
 ---@return string
 function M.get_macos_option_as_alt()
     return config.macos_option_as_alt or "false"
+end
+
+function M.apply_layout(layout)
+    state.layout_plan = layout
+    state.layout_window = 1
+    state.layout_pane = 1
+
+    local win = layout and layout.windows and layout.windows[1]
+    local pane = win and win.panes and win.panes[1]
+    state.layout_pending_cmd = pane and pane.cmd or nil
 end
 
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize
@@ -450,6 +469,46 @@ local function handle_text_input_key(input, key_data)
     end
 
     return false
+end
+
+local function layout_advance(pty)
+    if not state.layout_plan or not state.layout_plan.windows then
+        return
+    end
+
+    if state.layout_pending_cmd and state.layout_pending_cmd ~= "" then
+        pty:write(state.layout_pending_cmd .. "\r")
+    end
+    state.layout_pending_cmd = nil
+
+    local win = state.layout_plan.windows[state.layout_window]
+    if not win or not win.panes then
+        state.layout_plan = nil
+        return
+    end
+
+    state.layout_pane = state.layout_pane + 1
+    local next_pane = win.panes[state.layout_pane]
+    if next_pane then
+        state.layout_pending_cmd = next_pane.cmd
+        local direction = next_pane.split == "horizontal" and "row" or "col"
+        state.pending_split = { direction = direction }
+        prise.spawn({ cwd = pty:cwd() })
+        return
+    end
+
+    state.layout_window = state.layout_window + 1
+    state.layout_pane = 1
+
+    local next_win = state.layout_plan.windows[state.layout_window]
+    if next_win and next_win.panes and next_win.panes[1] then
+        state.layout_pending_cmd = next_win.panes[1].cmd
+        state.pending_new_tab = true
+        prise.spawn({ cwd = pty:cwd() })
+        return
+    end
+
+    state.layout_plan = nil
 end
 
 ---@param node? table
@@ -1517,22 +1576,28 @@ local function resize_pane(dimension, delta_ratio)
 
     local num_children = #parent_split.children
 
-    -- Use pairwise adjustment to move the divider between two adjacent siblings.
-    -- This keeps other siblings unaffected and matches user expectation of
-    -- "move the nearest divider in that direction".
+    -- Use pairwise adjustment to enable resizing in both directions from any focused pane.
     if delta_ratio < 0 then
-        -- Resize left/up: grow current pane by taking from left neighbor
+        -- Negative delta: try to move left boundary (focused pane may grow by taking from left)
         if child_idx > 1 then
-            -- Move divider between (child_idx-1, child_idx) to the left
-            adjust_pair(parent_split, child_idx - 1, child_idx, delta_ratio)
+            -- Left neighbor exists: adjust the left boundary (left shrinks, focused grows)
+            adjust_pair(parent_split, child_idx - 1, child_idx, delta_ratio) -- delta_ratio is negative
+        elseif child_idx < num_children then
+            -- No left neighbor but right exists: adjust right boundary to achieve opposite effect (focused shrinks, right grows)
+            -- Since we want a "left resize" effect but no left neighbor, we make focused shrink instead
+            adjust_pair(parent_split, child_idx, child_idx + 1, delta_ratio) -- delta_ratio is negative, so focused shrinks, right grows
         else
             return
         end
     else
-        -- Resize right/down: grow current pane by taking from right neighbor
+        -- Positive delta: try to move right boundary (focused pane may grow by taking from right)
         if child_idx < num_children then
-            -- Move divider between (child_idx, child_idx+1) to the right
-            adjust_pair(parent_split, child_idx, child_idx + 1, delta_ratio)
+            -- Right neighbor exists: adjust the right boundary (focused grows, right shrinks)
+            adjust_pair(parent_split, child_idx, child_idx + 1, delta_ratio) -- delta_ratio is positive
+        elseif child_idx > 1 then
+            -- No right neighbor but left exists: adjust left boundary to achieve opposite effect (left shrinks, focused grows)
+            -- Since we want a "right resize" effect but no right neighbor, we make left shrink to grow focused
+            adjust_pair(parent_split, child_idx - 1, child_idx, delta_ratio) -- delta_ratio is positive, so left shrinks, focused grows
         else
             return
         end
@@ -1603,6 +1668,17 @@ local function move_focus(direction)
             prise.request_frame()
         end
     end
+end
+
+local function get_tab_display_name(tab_index)
+    local tab = state.tabs[tab_index]
+    if not tab then
+        return "Tab " .. tab_index
+    end
+    if tab.title and tab.title ~= "" then
+        return tab.title
+    end
+    return "Tab " .. tab_index
 end
 
 local function open_rename_tab()
@@ -1967,7 +2043,9 @@ local commands = {
         end,
     },
     {
-        name = "Tab 1",
+        name = function()
+            return get_tab_display_name(1)
+        end,
         shortcut = key_prefix .. " 1",
         action = function()
             set_active_tab_index(1)
@@ -1977,7 +2055,9 @@ local commands = {
         end,
     },
     {
-        name = "Tab 2",
+        name = function()
+            return get_tab_display_name(2)
+        end,
         shortcut = key_prefix .. " 2",
         action = function()
             set_active_tab_index(2)
@@ -1987,7 +2067,9 @@ local commands = {
         end,
     },
     {
-        name = "Tab 3",
+        name = function()
+            return get_tab_display_name(3)
+        end,
         shortcut = key_prefix .. " 3",
         action = function()
             set_active_tab_index(3)
@@ -1997,7 +2079,9 @@ local commands = {
         end,
     },
     {
-        name = "Tab 4",
+        name = function()
+            return get_tab_display_name(4)
+        end,
         shortcut = key_prefix .. " 4",
         action = function()
             set_active_tab_index(4)
@@ -2007,7 +2091,9 @@ local commands = {
         end,
     },
     {
-        name = "Tab 5",
+        name = function()
+            return get_tab_display_name(5)
+        end,
         shortcut = key_prefix .. " 5",
         action = function()
             set_active_tab_index(5)
@@ -2017,7 +2103,9 @@ local commands = {
         end,
     },
     {
-        name = "Tab 6",
+        name = function()
+            return get_tab_display_name(6)
+        end,
         shortcut = key_prefix .. " 6",
         action = function()
             set_active_tab_index(6)
@@ -2027,7 +2115,9 @@ local commands = {
         end,
     },
     {
-        name = "Tab 7",
+        name = function()
+            return get_tab_display_name(7)
+        end,
         shortcut = key_prefix .. " 7",
         action = function()
             set_active_tab_index(7)
@@ -2037,7 +2127,9 @@ local commands = {
         end,
     },
     {
-        name = "Tab 8",
+        name = function()
+            return get_tab_display_name(8)
+        end,
         shortcut = key_prefix .. " 8",
         action = function()
             set_active_tab_index(8)
@@ -2269,7 +2361,12 @@ local function filter_commands(query)
     for _, cmd in ipairs(commands) do
         local is_visible = not cmd.visible or cmd.visible()
         if is_visible then
-            if not query or query == "" or cmd.name:lower():find(query:lower(), 1, true) then
+            local cmd_name = cmd.name
+            if type(cmd_name) == "function" then
+                cmd_name = cmd_name()
+            end
+            cmd_name = tostring(cmd_name)
+            if not query or query == "" or cmd_name:lower():find(query:lower(), 1, true) then
                 table.insert(results, cmd)
             end
         end
@@ -2407,6 +2504,12 @@ function M.update(event)
                 root = new_pane,
                 last_focused_id = new_pane.id,
             }
+            local win = state.layout_plan
+                and state.layout_plan.windows
+                and state.layout_plan.windows[state.layout_window]
+            if win and win.name and win.name ~= "" then
+                new_tab.title = win.name
+            end
             table.insert(state.tabs, new_tab)
             set_active_tab_index(#state.tabs)
 
@@ -2432,6 +2535,12 @@ function M.update(event)
                 root = new_pane,
                 last_focused_id = new_pane.id,
             }
+            local win = state.layout_plan
+                and state.layout_plan.windows
+                and state.layout_plan.windows[state.layout_window]
+            if win and win.name and win.name ~= "" then
+                new_tab.title = win.name
+            end
             table.insert(state.tabs, new_tab)
             state.active_tab = 1
             state.focused_id = new_pane.id
@@ -2468,6 +2577,7 @@ function M.update(event)
             state.pending_split = nil
         end
         update_pty_focus(old_focused_id, state.focused_id)
+        layout_advance(pty)
         prise.request_frame()
         prise.save() -- Auto-save on pane added
     elseif event.type == "key_press" then
@@ -3132,7 +3242,12 @@ local function build_palette()
 
     local items = {}
     for _, cmd in ipairs(filtered) do
-        table.insert(items, format_palette_item(cmd.name, cmd.shortcut, PALETTE_INNER_WIDTH))
+        local cmd_name = cmd.name
+        if type(cmd_name) == "function" then
+            cmd_name = cmd_name()
+        end
+        cmd_name = tostring(cmd_name)
+        table.insert(items, format_palette_item(cmd_name, cmd.shortcut, PALETTE_INNER_WIDTH))
     end
 
     local palette_style = { bg = THEME.bg1, fg = THEME.fg_bright }
