@@ -663,7 +663,7 @@ pub const App = struct {
     pipe_write_fd: posix.fd_t = undefined,
     parser: vaxis.Parser = undefined,
     pipe_buf: std.ArrayList(u8),
-    pipe_recv_buffer: [4096]u8 = undefined,
+    pipe_recv_buffer: [8192]u8 = undefined,
     colors: Surface.TerminalColors = .{},
 
     pending_attach_ids: ?[]u32 = null,
@@ -748,6 +748,17 @@ pub const App = struct {
     pub fn initTty(self: *App) !void {
         self.tty = try vaxis.Tty.init(&self.tty_buffer);
         log.info("TTY initialized", .{});
+
+        // Increase pipe buffer size on Linux to reduce backpressure during rapid input
+        const builtin = @import("builtin");
+        if (builtin.os.tag == .linux) {
+            // F_SETPIPE_SZ = 1031 on Linux
+            const F_SETPIPE_SZ = 1031;
+            const desired_size: c_int = 256 * 1024; // 256KB
+            _ = posix.fcntl(self.pipe_write_fd, F_SETPIPE_SZ, desired_size) catch |err| {
+                log.warn("Failed to increase pipe buffer size: {}", .{err});
+            };
+        }
     }
 
     pub fn deinit(self: *App) void {
@@ -991,7 +1002,7 @@ pub const App = struct {
     fn ttyThreadFn(self: *App) void {
         log.info("TTY thread started", .{});
 
-        var buf: [1024]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         while (!self.state.should_quit) {
             const n = posix.read(self.tty.fd, &buf) catch |err| {
                 log.err("TTY read failed: {}", .{err});
@@ -1013,7 +1024,9 @@ pub const App = struct {
         while (index < data.len) {
             const n = posix.write(self.pipe_write_fd, data[index..]) catch |err| {
                 if (err == error.WouldBlock) {
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    // Pipe buffer is full - yield CPU briefly to let main thread drain it
+                    // Use std.Thread.yield() instead of sleep to avoid 1ms penalty
+                    std.Thread.yield() catch {};
                     continue;
                 }
                 return err;
@@ -2527,7 +2540,11 @@ pub const App = struct {
         var index: usize = 0;
         while (index < data.len) {
             const n = posix.write(self.fd, data[index..]) catch |err| {
-                if (err == error.WouldBlock) continue;
+                if (err == error.WouldBlock) {
+                    // Socket buffer is full - yield briefly to let I/O complete
+                    std.Thread.yield() catch {};
+                    continue;
+                }
                 return err;
             };
             index += n;
