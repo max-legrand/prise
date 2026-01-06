@@ -13,6 +13,7 @@ const msgpack = @import("msgpack.zig");
 const Surface = @import("Surface.zig");
 const TextInput = @import("TextInput.zig");
 const widget = @import("widget.zig");
+const layout = @import("layout.zig");
 
 const log = std.log.scoped(.ui);
 const logger = std.log.scoped(.lua);
@@ -87,6 +88,7 @@ pub const UI = struct {
     get_session_name_ctx: *anyopaque = undefined,
     rename_session_callback: ?*const fn (ctx: *anyopaque, new_name: []const u8) anyerror!void = null,
     rename_session_ctx: *anyopaque = undefined,
+    dim_factor: f32 = 0.025,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -216,6 +218,19 @@ pub const UI = struct {
         // Store pointer to self in registry for static functions to use
         self.lua.pushLightUserdata(self);
         self.lua.setField(ziglua.registry_index, "prise_ui_ptr");
+
+        // Apply any pending dim_factor that was set during init.lua
+        _ = self.lua.getField(ziglua.registry_index, "_pending_dim_factor");
+        if (self.lua.typeOf(-1) == .number) {
+            const pending_dim = self.lua.toNumber(-1) catch 0.025;
+            log.debug("setLoop: applying pending dim_factor={d}", .{pending_dim});
+            self.dim_factor = @floatCast(pending_dim);
+            self.lua.pop(1);
+            self.lua.pushNil();
+            self.lua.setField(ziglua.registry_index, "_pending_dim_factor");
+        } else {
+            self.lua.pop(1);
+        }
     }
 
     pub fn setExitCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
@@ -375,6 +390,14 @@ pub const UI = struct {
         // Register rename_session
         lua.pushFunction(ziglua.wrap(renameSession));
         lua.setField(-2, "rename_session");
+
+        // Register set_dim_factor
+        lua.pushFunction(ziglua.wrap(setDimFactor));
+        lua.setField(-2, "set_dim_factor");
+
+        // Register get_dim_factor
+        lua.pushFunction(ziglua.wrap(getDimFactor));
+        lua.setField(-2, "get_dim_factor");
 
         // Register create_text_input
         lua.pushFunction(ziglua.wrap(createTextInput));
@@ -678,6 +701,43 @@ pub const UI = struct {
         return 1;
     }
 
+    fn getDimFactor(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            lua.pushNumber(0.025);
+            return 1;
+        };
+        lua.pop(1);
+
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+        lua.pushNumber(ui.dim_factor);
+        return 1;
+    }
+
+    fn setDimFactor(lua: *ziglua.Lua) i32 {
+        const dim: f64 = lua.toNumber(1) catch 0.025;
+
+        // Try to get the UI pointer and set it directly
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr_result = lua.toPointer(-1);
+        lua.pop(1);
+
+        if (ui_ptr_result) |ui_ptr| {
+            const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+            log.debug("setDimFactor: setting dim_factor to {d}", .{dim});
+            ui.dim_factor = @floatCast(dim);
+            lua.pushBoolean(true);
+            return 1;
+        } else |_| {
+            // UI pointer not available yet (we're in init.lua), store the value for later
+            log.debug("setDimFactor: storing pending dim_factor={d}", .{dim});
+            lua.pushNumber(dim);
+            lua.setField(ziglua.registry_index, "_pending_dim_factor");
+            lua.pushBoolean(true);
+            return 1;
+        }
+    }
+
     fn detach(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
@@ -972,6 +1032,12 @@ pub const UI = struct {
         _ = loop;
         const ctx = completion.userdataCast(TimerContext);
 
+        // Check if timer was cancelled (io_uring only - kqueue never calls back on cancel)
+        if (completion.result == .err) {
+            ctx.ui.allocator.destroy(ctx);
+            return;
+        }
+
         // Get Timer userdata
         _ = ctx.ui.lua.rawGetIndex(ziglua.registry_index, ctx.timer_ref);
         const timer = ctx.ui.lua.toUserdata(Timer, -1) catch unreachable;
@@ -1023,6 +1089,71 @@ pub const UI = struct {
         if (std.mem.eql(u8, val, "right")) return "right";
         if (std.mem.eql(u8, val, "true")) return "true";
         return "false";
+    }
+
+    pub fn applyLayout(self: *UI, plan: layout.Plan) !void {
+        _ = self.lua.getField(ziglua.registry_index, "prise_ui");
+        defer self.lua.pop(1);
+
+        _ = self.lua.getField(-1, "apply_layout");
+        if (self.lua.typeOf(-1) != .function) {
+            // Optional extension point: custom UIs may not support layouts.
+            self.lua.pop(1);
+            return;
+        }
+
+        pushLayoutPlan(self.lua, plan);
+
+        self.lua.protectedCall(.{ .args = 1, .results = 0, .msg_handler = 0 }) catch |err| {
+            const msg = self.lua.toString(-1) catch "Unknown Lua error";
+            log.err("Lua apply_layout error: {s}", .{msg});
+            self.lua.pop(1);
+            return err;
+        };
+    }
+
+    fn pushLayoutPlan(lua: *ziglua.Lua, plan: layout.Plan) void {
+        lua.createTable(0, 1);
+
+        lua.createTable(@intCast(plan.windows.len), 0);
+        for (plan.windows, 0..) |w, i| {
+            lua.createTable(0, 2);
+
+            if (w.name) |name| {
+                _ = lua.pushString(name);
+                lua.setField(-2, "name");
+            }
+
+            lua.createTable(@intCast(w.panes.len), 0);
+            for (w.panes, 0..) |p, j| {
+                lua.createTable(0, 3);
+
+                if (p.title) |title| {
+                    _ = lua.pushString(title);
+                    lua.setField(-2, "title");
+                }
+
+                if (p.cmd) |cmd| {
+                    _ = lua.pushString(cmd);
+                    lua.setField(-2, "cmd");
+                }
+
+                if (p.split) |split| {
+                    const split_str: []const u8 = switch (split) {
+                        .horizontal => "horizontal",
+                        .vertical => "vertical",
+                    };
+                    _ = lua.pushString(split_str);
+                    lua.setField(-2, "split");
+                }
+
+                lua.rawSetIndex(-2, @intCast(j + 1));
+            }
+            lua.setField(-2, "panes");
+
+            lua.rawSetIndex(-2, @intCast(i + 1));
+        }
+        lua.setField(-2, "windows");
     }
 
     pub fn update(self: *UI, event: lua_event.Event) !void {
@@ -1105,6 +1236,7 @@ pub const UI = struct {
         send_key_fn: *const fn (app: *anyopaque, id: u32, key: lua_event.KeyData) anyerror!void,
         send_mouse_fn: *const fn (app: *anyopaque, id: u32, mouse: lua_event.MouseData) anyerror!void,
         send_paste_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
+        send_write_fn: *const fn (app: *anyopaque, id: u32, data: []const u8) anyerror!void,
         set_focus_fn: *const fn (app: *anyopaque, id: u32, focused: bool) anyerror!void,
         close_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
         cwd_fn: *const fn (app: *anyopaque, id: u32) ?[]const u8,
@@ -1159,7 +1291,7 @@ pub const UI = struct {
         const result = lookup_ctx.lookup_fn(lookup_ctx.ctx, id);
 
         if (result) |r| {
-            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.set_focus_fn, r.close_fn, r.cwd_fn, r.copy_selection_fn, r.capture_pane_fn, r.cell_size_fn) catch {
+            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.send_write_fn, r.set_focus_fn, r.close_fn, r.cwd_fn, r.copy_selection_fn, r.capture_pane_fn, r.cell_size_fn) catch {
                 lua.pushNil();
             };
         } else {

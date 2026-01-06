@@ -131,7 +131,13 @@ fn specialKeyCode(codepoint: u21) ?[]const u8 {
 }
 
 fn letterKeyCode(codepoint: u21) ?[]const u8 {
-    return switch (codepoint) {
+    // Normalize uppercase to lowercase for physical key mapping
+    const cp = if (codepoint >= 'A' and codepoint <= 'Z')
+        codepoint + ('a' - 'A')
+    else
+        codepoint;
+
+    return switch (cp) {
         'a' => "KeyA",
         'b' => "KeyB",
         'c' => "KeyC",

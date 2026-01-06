@@ -23,19 +23,44 @@ pub const ParseError = error{
     UnterminatedBracket,
     EmptyKey,
     UnknownSpecialKey,
+    OutOfMemory,
 };
+
+/// Frees memory allocated by parseKeyString.
+pub fn freeKeys(allocator: std.mem.Allocator, keys: []const Key) void {
+    for (keys) |key| {
+        allocator.free(key.key);
+    }
+    allocator.free(keys);
+}
 
 pub fn parseKeyString(allocator: std.mem.Allocator, input: []const u8) ParseError![]Key {
     var keys: std.ArrayList(Key) = .empty;
-    errdefer keys.deinit(allocator);
+    errdefer {
+        for (keys.items) |key| {
+            allocator.free(key.key);
+        }
+        keys.deinit(allocator);
+    }
 
     var i: usize = 0;
     while (i < input.len) {
         if (input[i] == '<') {
-            const key = try parseBracketedKey(input, &i);
+            const key = try parseBracketedKey(allocator, input, &i);
             keys.append(allocator, key) catch return error.InvalidFormat;
         } else {
-            const key = Key{ .key = input[i .. i + 1] };
+            const char = input[i];
+            // Uppercase letters imply shift modifier, but key should be lowercase
+            const is_uppercase = char >= 'A' and char <= 'Z';
+            const key_char = if (is_uppercase) char + ('a' - 'A') else char;
+
+            var buf: [1]u8 = .{key_char};
+            const key_str = try allocator.dupe(u8, &buf);
+
+            const key = Key{
+                .key = key_str,
+                .shift = is_uppercase,
+            };
             keys.append(allocator, key) catch return error.InvalidFormat;
             i += 1;
         }
@@ -44,7 +69,7 @@ pub fn parseKeyString(allocator: std.mem.Allocator, input: []const u8) ParseErro
     return keys.toOwnedSlice(allocator) catch return error.InvalidFormat;
 }
 
-fn parseBracketedKey(input: []const u8, pos: *usize) ParseError!Key {
+fn parseBracketedKey(allocator: std.mem.Allocator, input: []const u8, pos: *usize) ParseError!Key {
     std.debug.assert(input[pos.*] == '<');
     pos.* += 1;
 
@@ -77,7 +102,8 @@ fn parseBracketedKey(input: []const u8, pos: *usize) ParseError!Key {
 
     if (remaining.len == 0) return error.EmptyKey;
 
-    key.key = mapSpecialKey(remaining) orelse remaining;
+    const key_name = mapSpecialKey(remaining) orelse remaining;
+    key.key = allocator.dupe(u8, key_name) catch return error.OutOfMemory;
     return key;
 }
 
@@ -121,7 +147,7 @@ fn mapSpecialKey(name: []const u8) ?[]const u8 {
 
 test "parse simple character" {
     const keys = try parseKeyString(std.testing.allocator, "a");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(1, keys.len);
     try std.testing.expectEqualStrings("a", keys[0].key);
@@ -133,7 +159,7 @@ test "parse simple character" {
 
 test "parse sequence" {
     const keys = try parseKeyString(std.testing.allocator, "vg");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(2, keys.len);
     try std.testing.expectEqualStrings("v", keys[0].key);
@@ -142,7 +168,7 @@ test "parse sequence" {
 
 test "parse bracketed key with modifier" {
     const keys = try parseKeyString(std.testing.allocator, "<D-k>");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(1, keys.len);
     try std.testing.expectEqualStrings("k", keys[0].key);
@@ -152,7 +178,7 @@ test "parse bracketed key with modifier" {
 
 test "parse multiple modifiers" {
     const keys = try parseKeyString(std.testing.allocator, "<C-S-a>");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(1, keys.len);
     try std.testing.expectEqualStrings("a", keys[0].key);
@@ -164,7 +190,7 @@ test "parse multiple modifiers" {
 
 test "parse mixed sequence" {
     const keys = try parseKeyString(std.testing.allocator, "<D-k>vg");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(3, keys.len);
     try std.testing.expectEqualStrings("k", keys[0].key);
@@ -176,7 +202,7 @@ test "parse mixed sequence" {
 
 test "parse special keys" {
     const keys = try parseKeyString(std.testing.allocator, "<Enter>");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(1, keys.len);
     try std.testing.expectEqualStrings("Enter", keys[0].key);
@@ -184,7 +210,7 @@ test "parse special keys" {
 
 test "parse special key with modifier" {
     const keys = try parseKeyString(std.testing.allocator, "<C-Enter>");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(1, keys.len);
     try std.testing.expectEqualStrings("Enter", keys[0].key);
@@ -194,19 +220,19 @@ test "parse special key with modifier" {
 test "parse escape variants" {
     {
         const keys = try parseKeyString(std.testing.allocator, "<Esc>");
-        defer std.testing.allocator.free(keys);
+        defer freeKeys(std.testing.allocator, keys);
         try std.testing.expectEqualStrings("Escape", keys[0].key);
     }
     {
         const keys = try parseKeyString(std.testing.allocator, "<Escape>");
-        defer std.testing.allocator.free(keys);
+        defer freeKeys(std.testing.allocator, keys);
         try std.testing.expectEqualStrings("Escape", keys[0].key);
     }
 }
 
 test "parse all modifiers" {
     const keys = try parseKeyString(std.testing.allocator, "<C-A-S-D-x>");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(1, keys.len);
     try std.testing.expectEqualStrings("x", keys[0].key);
@@ -233,10 +259,33 @@ test "error: only modifier" {
 
 test "lowercase modifiers" {
     const keys = try parseKeyString(std.testing.allocator, "<c-a-s>");
-    defer std.testing.allocator.free(keys);
+    defer freeKeys(std.testing.allocator, keys);
 
     try std.testing.expectEqual(1, keys.len);
     try std.testing.expectEqualStrings("s", keys[0].key);
     try std.testing.expect(keys[0].ctrl);
     try std.testing.expect(keys[0].alt);
+}
+
+test "uppercase letter implies shift" {
+    const keys = try parseKeyString(std.testing.allocator, "S");
+    defer freeKeys(std.testing.allocator, keys);
+
+    try std.testing.expectEqual(1, keys.len);
+    try std.testing.expectEqualStrings("s", keys[0].key); // Normalized to lowercase
+    try std.testing.expect(keys[0].shift);
+    try std.testing.expect(!keys[0].ctrl);
+    try std.testing.expect(!keys[0].alt);
+    try std.testing.expect(!keys[0].super);
+}
+
+test "multi-key sequence with modifiers" {
+    const keys = try parseKeyString(std.testing.allocator, "<D-k><C-h>");
+    defer freeKeys(std.testing.allocator, keys);
+
+    try std.testing.expectEqual(2, keys.len);
+    try std.testing.expectEqualStrings("k", keys[0].key);
+    try std.testing.expect(keys[0].super);
+    try std.testing.expectEqualStrings("h", keys[1].key);
+    try std.testing.expect(keys[1].ctrl);
 }

@@ -104,6 +104,9 @@ fn matcherHandleKey(lua: *ziglua.Lua) i32 {
         return 1;
     };
 
+    // Debug: log the key being matched
+    log.info("handleKey: key='{s}' shift={} ctrl={} alt={} super={}", .{ key.key, key.shift, key.ctrl, key.alt, key.super });
+
     const result = handle.matcher.handleKey(key);
 
     lua.createTable(0, 3);
@@ -204,6 +207,7 @@ fn compile(lua: *ziglua.Lua) i32 {
             };
 
             const action = Action.fromString(action_str) orelse {
+                log.warn("Unknown action '{s}' for keybind '{s}', skipping", .{ action_str, ks });
                 lua.pop(1);
                 continue;
             };
@@ -276,6 +280,7 @@ fn parseKeyString(lua: *ziglua.Lua) i32 {
             error.UnterminatedBracket => lua.raiseErrorStr("Unterminated bracket in key string", .{}),
             error.EmptyKey => lua.raiseErrorStr("Empty key in key string", .{}),
             error.UnknownSpecialKey => lua.raiseErrorStr("Unknown special key", .{}),
+            error.OutOfMemory => lua.raiseErrorStr("Out of memory parsing key string", .{}),
         }
     };
     defer allocator.free(keys);

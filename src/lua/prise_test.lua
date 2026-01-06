@@ -23,6 +23,7 @@ local function mock_pty()
         set_focus = function() end,
         close = function() end,
         copy_selection = function() end,
+        capture_pane = function() end,
     }
     return pty
 end
@@ -47,6 +48,8 @@ local function mock_text_input()
         move_to_end = function() end,
         clear = function() end,
         destroy = function() end,
+        kill_line = function() end,
+        delete_word_backward = function() end,
     }
     return input
 end
