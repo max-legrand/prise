@@ -3136,7 +3136,14 @@ end
 ---Spawn a new pane with the given command
 ---@param opts { command: string[], cwd?: string, new_tab?: boolean, return_to_tab?: boolean }
 function M.spawn(opts)
-    prise.log.info("M.spawn called with opts: new_tab=" .. tostring(opts.new_tab) .. ", return_to_tab=" .. tostring(opts.return_to_tab) .. ", command=" .. (opts.command and table.concat(opts.command, " ") or "nil"))
+    prise.log.info(
+        "M.spawn called with opts: new_tab="
+            .. tostring(opts.new_tab)
+            .. ", return_to_tab="
+            .. tostring(opts.return_to_tab)
+            .. ", command="
+            .. (opts.command and table.concat(opts.command, " ") or "nil")
+    )
     opts = opts or {}
     local pty = get_focused_pty()
     local cwd = opts.cwd or (pty and pty:cwd())
@@ -3154,7 +3161,12 @@ function M.spawn(opts)
         state.pending_split = { direction = get_auto_split_direction() }
     end
 
-    prise.log.info("M.spawn: calling prise.spawn with cwd=" .. (cwd or "nil") .. ", command=" .. (opts.command and table.concat(opts.command, " ") or "nil"))
+    prise.log.info(
+        "M.spawn: calling prise.spawn with cwd="
+            .. (cwd or "nil")
+            .. ", command="
+            .. (opts.command and table.concat(opts.command, " ") or "nil")
+    )
     prise.spawn({ cwd = cwd, command = opts.command })
     prise.log.info("M.spawn: prise.spawn completed")
 end
