@@ -168,8 +168,26 @@ local POWERLINE_SYMBOLS = {
 ---@class PriseStatusBarConfig
 ---@field enabled? boolean Show the status bar (default: true)
 
+---Tab info passed to custom render function
+---@class TabInfo
+---@field index number Tab index (1-based)
+---@field title string Tab title (explicit title if set, otherwise auto-derived)
+---@field is_explicit_title boolean True if this is an explicit renamed title
+---@field is_active boolean True if this is the active tab
+---@field is_hovered boolean True if mouse is hovering over this tab
+---@field is_close_hovered boolean True if mouse is hovering over close button
+
+---Custom render function for tab bar
+---Must return an array of segments compatible with prise.Text()
+---@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme): table[]
+
+---Optional function to format tab titles for display
+---@alias TabFormatFunction fun(title: string, tab_index: number): string
+
 ---@class PriseTabBarConfig
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
+---@field render? TabRenderFunction Custom tab bar renderer (overrides default design)
+---@field format_title? TabFormatFunction Optional function to format tab titles (default: no formatting)
 
 ---Keybinds are a map from key_string to action name
 ---Example: ["<leader>v"] = "split_horizontal"
@@ -235,6 +253,8 @@ local config = {
     },
     tab_bar = {
         show_single_tab = false,
+        render = nil, -- Use default built-in design
+        format_title = nil, -- Use titles as-is
     },
     leader = "<D-k>",
     keybinds = {
@@ -2920,15 +2940,41 @@ local function build_session_picker()
     })
 end
 
----Build the tab bar (only shown if more than 1 tab)
----@return table?
-local function build_tab_bar()
-    if not config.tab_bar.show_single_tab and #state.tabs <= 1 then
-        state.tab_regions = {}
-        state.tab_close_regions = {}
-        return nil
+---Resolve the display title for a tab
+---@param tab Tab
+---@param is_active boolean
+---@return string
+local function get_tab_title(tab, is_active)
+    ---@type string
+    local result = "Terminal"
+    if tab.title then
+        ---@diagnostic disable-next-line: cast-type-mismatch
+        result = tostring(tab.title)
+    else
+        local focused_id = is_active and state.focused_id or tab.last_focused_id
+        if focused_id and tab.root then
+            local path = find_node_path(tab.root, focused_id)
+            if path then
+                local pane = path[#path]
+                local pty_title = pane.pty:title()
+                if pty_title and #pty_title > 0 then
+                    result = pty_title
+                else
+                    local cwd = pane.pty:cwd()
+                    if cwd then
+                        result = cwd:match("([^/]+)/?$") or cwd
+                    end
+                end
+            end
+        end
     end
+    ---@diagnostic disable-next-line: return-type-mismatch
+    return result
+end
 
+---Build tab bar with default design (rounded pill style)
+---@return table
+local function build_tab_bar_default()
     local num_tabs = #state.tabs
     local total_width = state.screen_cols
     local endcap_width = 2 -- left_round and right_round are 1 cell each
@@ -2967,28 +3013,8 @@ local function build_tab_bar()
             close_text = close_text .. string.rep(" ", close_widget_width - close_text_width)
         end
 
-        -- Get title: manual title, or focused pty title, or focused pty cwd
-        local title = "Terminal"
-        if tab.title then
-            title = tab.title
-        else
-            local focused_id = is_active and state.focused_id or tab.last_focused_id
-            if focused_id and tab.root then
-                local path = find_node_path(tab.root, focused_id)
-                if path then
-                    local pane = path[#path]
-                    local pty_title = pane.pty:title()
-                    if pty_title and #pty_title > 0 then
-                        title = pty_title
-                    else
-                        local cwd = pane.pty:cwd()
-                        if cwd then
-                            title = cwd:match("([^/]+)/?$") or cwd
-                        end
-                    end
-                end
-            end
-        end
+        -- Get title
+        local title = get_tab_title(tab, is_active)
 
         -- Tab index shown on the right
         local index_str = tostring(i)
@@ -3058,7 +3084,128 @@ local function build_tab_bar()
         table.insert(segments, { text = POWERLINE_SYMBOLS.right_round, style = { fg = tab_bg, bg = THEME.bg1 } })
     end
 
-    return prise.Text(segments)
+    return segments
+end
+
+---Build tab bar with custom renderer
+---Calculates actual tab positions from rendered segments to ensure hover detection works correctly
+---@return table
+local function build_tab_bar_custom()
+    -- Build tab info for the custom renderer
+    local tab_infos = {}
+    for i, tab in ipairs(state.tabs) do
+        local title = get_tab_title(tab, i == state.active_tab)
+        local is_explicit = tab.title ~= nil
+
+        -- Apply title formatter only if NOT an explicit renamed title
+        if config.tab_bar.format_title and not is_explicit then
+            title = config.tab_bar.format_title(title, i)
+        end
+
+        table.insert(tab_infos, {
+            index = i,
+            title = title,
+            is_explicit_title = is_explicit,
+            is_active = (i == state.active_tab),
+            is_hovered = (i == state.hovered_tab),
+            is_close_hovered = (i == state.hovered_close_tab),
+        })
+    end
+
+    -- Enhanced custom renderer wrapper that tracks tab boundaries
+    local x_pos = 0
+
+    -- First, render segments and calculate their actual widths
+    local original_segments = config.tab_bar.render(tab_infos, state.screen_cols, THEME)
+
+    -- Build click regions from rendered segments
+    state.tab_regions = {}
+    state.tab_close_regions = {}
+
+    -- Calculate actual segment positions
+    local segment_positions = {}
+    for _, seg in ipairs(original_segments) do
+        local width = prise.gwidth(seg.text)
+        table.insert(segment_positions, {
+            start_x = x_pos,
+            end_x = x_pos + width,
+        })
+        x_pos = x_pos + width
+    end
+
+    -- Map segments to tabs
+    -- Common pattern: custom renderers output alternating tab/separator segments
+    -- Try to detect this pattern and map accordingly
+    local tab_count = #tab_infos
+    local segment_count = #original_segments
+
+    if segment_count >= tab_count then
+        -- Assume segments are ordered: tab1, sep, tab2, sep, ..., tabN
+        -- Or just: tab1, tab2, ..., tabN if no separators
+        local segments_per_tab = segment_count / tab_count
+        local is_alternating = (segments_per_tab >= 1.5 and segments_per_tab <= 2.5)
+
+        if is_alternating then
+            -- Likely pattern: tab, separator, tab, separator, ...
+            for tab_idx = 1, tab_count do
+                local seg_idx = (tab_idx - 1) * 2 + 1
+                if seg_idx <= segment_count then
+                    local tab_start = segment_positions[seg_idx].start_x
+                    -- Include separator in the clickable region if it exists
+                    local sep_seg_idx = seg_idx + 1
+                    local tab_end
+                    if sep_seg_idx <= segment_count and tab_idx < tab_count then
+                        -- Include separator
+                        tab_end = segment_positions[sep_seg_idx].end_x
+                    else
+                        -- Last tab, no separator
+                        tab_end = segment_positions[seg_idx].end_x
+                    end
+
+                    table.insert(state.tab_regions, {
+                        start_x = tab_start,
+                        end_x = tab_end,
+                        tab_index = tab_idx,
+                    })
+                end
+            end
+        else
+            -- Fallback: divide segments proportionally
+            for tab_idx = 1, tab_count do
+                local first_seg = math.floor((tab_idx - 1) * segment_count / tab_count) + 1
+                local last_seg = math.floor(tab_idx * segment_count / tab_count)
+
+                if first_seg <= segment_count then
+                    table.insert(state.tab_regions, {
+                        start_x = segment_positions[first_seg].start_x,
+                        end_x = segment_positions[math.min(last_seg, segment_count)].end_x,
+                        tab_index = tab_idx,
+                    })
+                end
+            end
+        end
+    end
+
+    return original_segments
+end
+
+---Build the tab bar UI
+---@return table?
+local function build_tab_bar()
+    if not config.tab_bar.show_single_tab and #state.tabs <= 1 then
+        state.tab_regions = {}
+        state.tab_close_regions = {}
+        return nil
+    end
+
+    -- Use custom renderer if provided
+    if config.tab_bar.render then
+        local segments = build_tab_bar_custom()
+        return prise.Text(segments)
+    else
+        local segments = build_tab_bar_default()
+        return prise.Text(segments)
+    end
 end
 
 ---Build the powerline-style status bar
