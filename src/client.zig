@@ -960,11 +960,19 @@ pub const App = struct {
 
         // Register rename_session callback
         self.ui.setRenameSessionCallback(self, struct {
-            fn renameCb(ctx: *anyopaque, new_name: []const u8) anyerror!void {
+            fn renameCb(ctx: *anyopaque, old_name: []const u8, new_name: []const u8) anyerror!void {
                 const app_ptr: *App = @ptrCast(@alignCast(ctx));
-                try app_ptr.renameCurrentSession(new_name);
+                try app_ptr.renameSession(old_name, new_name);
             }
         }.renameCb);
+
+        // Register delete_session callback
+        self.ui.setDeleteSessionCallback(self, struct {
+            fn deleteCb(ctx: *anyopaque, session_name: []const u8) anyerror!void {
+                const app_ptr: *App = @ptrCast(@alignCast(ctx));
+                try app_ptr.deleteSession(session_name);
+            }
+        }.deleteCb);
 
         // Register switch_session callback
         self.ui.setSwitchSessionCallback(self, struct {
@@ -1549,8 +1557,149 @@ pub const App = struct {
         }
     }
 
+    fn applyDimToStyle(self: *App, style: vaxis.Style, dim_factor: f32) vaxis.Style {
+        if (dim_factor == 0.0) return style;
+
+        var dimmed = style;
+
+        // Apply dimming to foreground color
+        if (dimmed.fg != .default) {
+            const fg_rgb = self.resolveColor(dimmed.fg);
+            if (fg_rgb) |rgb| {
+                dimmed.fg = .{ .rgb = Surface.TerminalColors.reduceContrast(rgb, dim_factor * 0.5) };
+            }
+        }
+
+        // Apply dimming to background color
+        if (dimmed.bg != .default) {
+            const bg_rgb = self.resolveColor(dimmed.bg);
+            if (bg_rgb) |rgb| {
+                dimmed.bg = .{ .rgb = Surface.TerminalColors.reduceContrast(rgb, dim_factor) };
+            }
+        }
+
+        return dimmed;
+    }
+
+    fn resolveColor(self: *App, color: vaxis.Cell.Color) ?[3]u8 {
+        return switch (color) {
+            .rgb => |rgb| rgb,
+            .index => |idx| blk: {
+                if (idx >= 16) break :blk null;
+                if (self.colors.palette[idx]) |c_val| {
+                    break :blk switch (c_val) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+            .default => blk: {
+                if (self.colors.bg) |bg| {
+                    break :blk switch (bg) {
+                        .rgb => |rgb| rgb,
+                        else => null,
+                    };
+                }
+                break :blk null;
+            },
+        };
+    }
+
     fn renderWidget(self: *App, w: widget.Widget, win: vaxis.Window) !void {
-        try w.renderTo(win, self.allocator);
+        switch (w.kind) {
+            .surface => |surf| {
+                if (self.surfaces.get(surf.pty_id)) |surface| {
+                    // Check for resize mismatch and send resize request if needed
+                    if (surface.rows != w.height or surface.cols != w.width) {
+                        log.debug("renderWidget: surface resize needed for pty {}: {}x{} -> {}x{}", .{
+                            surf.pty_id,
+                            surface.cols,
+                            surface.rows,
+                            w.width,
+                            w.height,
+                        });
+                        self.sendResize(surf.pty_id, w.height, w.width) catch |err| {
+                            log.err("Failed to send resize: {}", .{err});
+                        };
+                    }
+                    // Calculate dim factor based on focus
+                    const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                    surface.render(win, w.focus, &self.colors, dim_factor);
+                }
+            },
+            .text => {
+                // Use renderTo for text widgets
+                try w.renderTo(win, self.allocator);
+            },
+            .box => |b| {
+                const chars = b.borderChars();
+                // Apply dimming to border style if not focused
+                const dim_factor: f32 = if (w.focus) 0.0 else self.ui.dim_factor;
+                const style = self.applyDimToStyle(b.style, dim_factor);
+
+                log.debug("render box: w={} h={} focus={} dim_factor={d}", .{ win.width, win.height, w.focus, dim_factor });
+
+                // Fill background for the entire box area
+                if (style.bg != .default) {
+                    for (0..win.height) |row| {
+                        for (0..win.width) |col| {
+                            win.writeCell(@intCast(col), @intCast(row), .{
+                                .char = .{ .grapheme = " ", .width = 1 },
+                                .style = style,
+                            });
+                        }
+                    }
+                }
+
+                // Render border if not none
+                if (b.border != .none and win.width >= 2 and win.height >= 2) {
+                    win.writeCell(0, 0, .{ .char = .{ .grapheme = chars.tl, .width = 1 }, .style = style });
+                    win.writeCell(win.width - 1, 0, .{ .char = .{ .grapheme = chars.tr, .width = 1 }, .style = style });
+                    win.writeCell(0, win.height - 1, .{ .char = .{ .grapheme = chars.bl, .width = 1 }, .style = style });
+                    win.writeCell(win.width - 1, win.height - 1, .{ .char = .{ .grapheme = chars.br, .width = 1 }, .style = style });
+
+                    for (1..win.width - 1) |col| {
+                        win.writeCell(@intCast(col), 0, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                        win.writeCell(@intCast(col), win.height - 1, .{ .char = .{ .grapheme = chars.h, .width = 1 }, .style = style });
+                    }
+
+                    for (1..win.height - 1) |row| {
+                        win.writeCell(0, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                        win.writeCell(win.width - 1, @intCast(row), .{ .char = .{ .grapheme = chars.v, .width = 1 }, .style = style });
+                    }
+                }
+
+                // Render child widget if present
+                const inner_win = win.child(.{
+                    .x_off = if (b.border != .none) 1 else 0,
+                    .y_off = if (b.border != .none) 1 else 0,
+                    .width = if (b.border != .none and win.width >= 2) win.width - 2 else win.width,
+                    .height = if (b.border != .none and win.height >= 2) win.height - 2 else win.height,
+                });
+                try self.renderWidget(b.child.*, inner_win);
+            },
+            .positioned => |pos| {
+                const child_win = win.child(.{
+                    .x_off = pos.x orelse 0,
+                    .y_off = pos.y orelse 0,
+                    .width = pos.child.width,
+                    .height = pos.child.height,
+                });
+                try self.renderWidget(pos.child.*, child_win);
+            },
+            .text_input,
+            .list,
+            .padding,
+            .column,
+            .row,
+            .stack,
+            .separator,
+            => {
+                // These widgets use renderTo for now
+                try w.renderTo(win, self.allocator);
+            },
+        }
     }
 
     pub fn scheduleRender(self: *App) !void {
@@ -2592,7 +2741,10 @@ pub const App = struct {
 
     pub fn renameCurrentSession(self: *App, new_name: []const u8) !void {
         const old_name = self.current_session_name orelse return error.NoCurrentSession;
+        try self.renameSession(old_name, new_name);
+    }
 
+    pub fn renameSession(self: *App, old_name: []const u8, new_name: []const u8) !void {
         const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
         const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
         defer self.allocator.free(state_dir);
@@ -2614,9 +2766,13 @@ pub const App = struct {
             dir.rename(old_filename, new_filename) catch |rename_err| {
                 return rename_err;
             };
-            // Update current session name
-            self.allocator.free(old_name);
-            self.current_session_name = try self.allocator.dupe(u8, new_name);
+            // Update current session name if renaming the current session
+            if (self.current_session_name) |current| {
+                if (std.mem.eql(u8, current, old_name)) {
+                    self.allocator.free(current);
+                    self.current_session_name = try self.allocator.dupe(u8, new_name);
+                }
+            }
             log.info("Renamed session '{s}' to '{s}'", .{ old_name, new_name });
             return;
         };
@@ -2685,6 +2841,26 @@ pub const App = struct {
             log.warn("Failed to delete session file {s}: {}", .{ filename, err });
             return;
         };
+        log.info("Deleted session file: {s}", .{filename});
+    }
+
+    pub fn deleteSession(self: *App, session_name: []const u8) !void {
+        const home = std.posix.getenv("HOME") orelse return error.NoHomeDirectory;
+        const state_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "state", "prise", "sessions" });
+        defer self.allocator.free(state_dir);
+
+        // Validate session_name doesn't contain path separators
+        if (std.mem.indexOfAny(u8, session_name, "/\\") != null) {
+            return error.InvalidSessionName;
+        }
+
+        const filename = try std.fmt.allocPrint(self.allocator, "{s}.json", .{session_name});
+        defer self.allocator.free(filename);
+
+        var dir = try std.fs.openDirAbsolute(state_dir, .{});
+        defer dir.close();
+
+        try dir.deleteFile(filename);
         log.info("Deleted session file: {s}", .{filename});
     }
 

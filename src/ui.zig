@@ -85,8 +85,11 @@ pub const UI = struct {
     switch_session_ctx: *anyopaque = undefined,
     get_session_name_callback: ?*const fn (ctx: *anyopaque) ?[]const u8 = null,
     get_session_name_ctx: *anyopaque = undefined,
-    rename_session_callback: ?*const fn (ctx: *anyopaque, new_name: []const u8) anyerror!void = null,
+    rename_session_callback: ?*const fn (ctx: *anyopaque, old_name: []const u8, new_name: []const u8) anyerror!void = null,
     rename_session_ctx: *anyopaque = undefined,
+    delete_session_callback: ?*const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void = null,
+    delete_session_ctx: *anyopaque = undefined,
+    dim_factor: f32 = 0.025,
     text_inputs: std.AutoHashMap(u32, *TextInput),
     next_text_input_id: u32 = 1,
 
@@ -216,6 +219,19 @@ pub const UI = struct {
         // Store pointer to self in registry for static functions to use
         self.lua.pushLightUserdata(self);
         self.lua.setField(ziglua.registry_index, "prise_ui_ptr");
+
+        // Apply any pending dim_factor that was set during init.lua
+        _ = self.lua.getField(ziglua.registry_index, "_pending_dim_factor");
+        if (self.lua.typeOf(-1) == .number) {
+            const pending_dim = self.lua.toNumber(-1) catch 0.025;
+            log.debug("setLoop: applying pending dim_factor={d}", .{pending_dim});
+            self.dim_factor = @floatCast(pending_dim);
+            self.lua.pop(1);
+            self.lua.pushNil();
+            self.lua.setField(ziglua.registry_index, "_pending_dim_factor");
+        } else {
+            self.lua.pop(1);
+        }
     }
 
     pub fn setExitCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque) void) void {
@@ -253,9 +269,14 @@ pub const UI = struct {
         self.get_session_name_callback = cb;
     }
 
-    pub fn setRenameSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, new_name: []const u8) anyerror!void) void {
+    pub fn setRenameSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, old_name: []const u8, new_name: []const u8) anyerror!void) void {
         self.rename_session_ctx = ctx;
         self.rename_session_callback = cb;
+    }
+
+    pub fn setDeleteSessionCallback(self: *UI, ctx: *anyopaque, cb: *const fn (ctx: *anyopaque, session_name: []const u8) anyerror!void) void {
+        self.delete_session_ctx = ctx;
+        self.delete_session_callback = cb;
     }
 
     pub fn getNextSessionName(self: *UI) ![]const u8 {
@@ -376,6 +397,18 @@ pub const UI = struct {
         lua.pushFunction(ziglua.wrap(renameSession));
         lua.setField(-2, "rename_session");
 
+        // Register delete_session
+        lua.pushFunction(ziglua.wrap(deleteSession));
+        lua.setField(-2, "delete_session");
+
+        // Register set_dim_factor
+        lua.pushFunction(ziglua.wrap(setDimFactor));
+        lua.setField(-2, "set_dim_factor");
+
+        // Register get_dim_factor
+        lua.pushFunction(ziglua.wrap(getDimFactor));
+        lua.setField(-2, "get_dim_factor");
+
         // Register create_text_input
         lua.pushFunction(ziglua.wrap(createTextInput));
         lua.setField(-2, "create_text_input");
@@ -441,6 +474,7 @@ pub const UI = struct {
     fn spawn(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
+            lua.pop(1); // pop invalid userdata
             lua.pushNil();
             return 1;
         };
@@ -521,6 +555,7 @@ pub const UI = struct {
     fn requestFrame(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
+            lua.pop(1); // pop invalid userdata
             lua.pushNil();
             return 1;
         };
@@ -534,7 +569,10 @@ pub const UI = struct {
 
     fn save(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch return 0;
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pop(1);
+            return 0;
+        };
         lua.pop(1);
 
         if (ui.save_callback) |cb| {
@@ -546,6 +584,7 @@ pub const UI = struct {
     fn getSessionName(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
+            lua.pop(1);
             lua.pushNil();
             return 1;
         };
@@ -569,14 +608,43 @@ pub const UI = struct {
         };
         lua.pop(1);
 
-        const new_name = lua.toString(1) catch {
+        const old_name = lua.toString(1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+
+        const new_name = lua.toString(2) catch {
             lua.pushBoolean(false);
             return 1;
         };
 
         if (ui.rename_session_callback) |cb| {
-            cb(ui.rename_session_ctx, new_name) catch |err| {
+            cb(ui.rename_session_ctx, old_name, new_name) catch |err| {
                 lua.raiseErrorStr("Failed to rename session: %s", .{@errorName(err).ptr});
+            };
+            lua.pushBoolean(true);
+        } else {
+            lua.pushBoolean(false);
+        }
+        return 1;
+    }
+
+    fn deleteSession(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+        lua.pop(1);
+
+        const session_name = lua.toString(1) catch {
+            lua.pushBoolean(false);
+            return 1;
+        };
+
+        if (ui.delete_session_callback) |cb| {
+            cb(ui.delete_session_ctx, session_name) catch |err| {
+                lua.raiseErrorStr("Failed to delete session: %s", .{@errorName(err).ptr});
             };
             lua.pushBoolean(true);
         } else {
@@ -676,6 +744,43 @@ pub const UI = struct {
             lua.pushBoolean(false);
         }
         return 1;
+    }
+
+    fn getDimFactor(lua: *ziglua.Lua) i32 {
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr = lua.toPointer(-1) catch {
+            lua.pushNumber(0.025);
+            return 1;
+        };
+        lua.pop(1);
+
+        const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+        lua.pushNumber(ui.dim_factor);
+        return 1;
+    }
+
+    fn setDimFactor(lua: *ziglua.Lua) i32 {
+        const dim: f64 = lua.toNumber(1) catch 0.025;
+
+        // Try to get the UI pointer and set it directly
+        _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
+        const ui_ptr_result = lua.toPointer(-1);
+        lua.pop(1);
+
+        if (ui_ptr_result) |ui_ptr| {
+            const ui: *UI = @ptrCast(@alignCast(@constCast(ui_ptr)));
+            log.debug("setDimFactor: setting dim_factor to {d}", .{dim});
+            ui.dim_factor = @floatCast(dim);
+            lua.pushBoolean(true);
+            return 1;
+        } else |_| {
+            // UI pointer not available yet (we're in init.lua), store the value for later
+            log.debug("setDimFactor: storing pending dim_factor={d}", .{dim});
+            lua.pushNumber(dim);
+            lua.setField(ziglua.registry_index, "_pending_dim_factor");
+            lua.pushBoolean(true);
+            return 1;
+        }
     }
 
     fn detach(lua: *ziglua.Lua) i32 {
@@ -972,6 +1077,12 @@ pub const UI = struct {
         _ = loop;
         const ctx = completion.userdataCast(TimerContext);
 
+        // Check if timer was cancelled (io_uring only - kqueue never calls back on cancel)
+        if (completion.result == .err) {
+            ctx.ui.allocator.destroy(ctx);
+            return;
+        }
+
         // Get Timer userdata
         _ = ctx.ui.lua.rawGetIndex(ziglua.registry_index, ctx.timer_ref);
         const timer = ctx.ui.lua.toUserdata(Timer, -1) catch unreachable;
@@ -1050,6 +1161,7 @@ pub const UI = struct {
 
         _ = self.lua.getField(-1, "view");
         if (self.lua.typeOf(-1) != .function) {
+            self.lua.pop(1);
             return error.NoViewFunction;
         }
 
