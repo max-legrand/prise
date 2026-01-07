@@ -474,6 +474,7 @@ pub const UI = struct {
     fn spawn(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
+            lua.pop(1); // pop invalid userdata
             lua.pushNil();
             return 1;
         };
@@ -554,6 +555,7 @@ pub const UI = struct {
     fn requestFrame(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
+            lua.pop(1); // pop invalid userdata
             lua.pushNil();
             return 1;
         };
@@ -567,7 +569,10 @@ pub const UI = struct {
 
     fn save(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
-        const ui = lua.toUserdata(UI, -1) catch return 0;
+        const ui = lua.toUserdata(UI, -1) catch {
+            lua.pop(1);
+            return 0;
+        };
         lua.pop(1);
 
         if (ui.save_callback) |cb| {
@@ -579,6 +584,7 @@ pub const UI = struct {
     fn getSessionName(lua: *ziglua.Lua) i32 {
         _ = lua.getField(ziglua.registry_index, "prise_ui_ptr");
         const ui = lua.toUserdata(UI, -1) catch {
+            lua.pop(1);
             lua.pushNil();
             return 1;
         };
@@ -1155,6 +1161,7 @@ pub const UI = struct {
 
         _ = self.lua.getField(-1, "view");
         if (self.lua.typeOf(-1) != .function) {
+            self.lua.pop(1);
             return error.NoViewFunction;
         }
 
