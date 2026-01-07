@@ -21,6 +21,7 @@ local utils = require("utils")
 ---@field title? string
 ---@field root? Node
 ---@field last_focused_id? number
+---@field return_to_tab? integer Tab index to return to when this tab is closed
 
 ---@class PaletteRegion
 ---@field start_y number
@@ -125,7 +126,11 @@ local utils = require("utils")
 ---@field type "cwd_changed"
 ---@field data table
 
----@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent
+---@class CapturePaneCompleteEvent
+---@field type "capture_pane_complete"
+---@field data { pty_id: number, content: string }
+
+---@alias Event PtyAttachEvent|PtyExitedEvent|KeyPressEvent|KeyReleaseEvent|PasteEvent|MouseEvent|WinsizeEvent|FocusInEvent|FocusOutEvent|SplitResizeEvent|CwdChangedEvent|CapturePaneCompleteEvent
 
 -- Powerline symbols
 local POWERLINE_SYMBOLS = {
@@ -279,6 +284,7 @@ local config = {
     leader = "<D-k>",
     keybinds = {
         ["<D-p>"] = "command_palette",
+        ["<leader>x"] = "capture_pane",
         ["<leader>v"] = "split_horizontal",
         ["<leader>s"] = "split_vertical",
         ["<leader><Enter>"] = "split_auto",
@@ -320,6 +326,11 @@ local merge_config = utils.merge_config
 -- Convenience alias for theme access
 local THEME = config.theme
 
+---@class PendingSpawnOpts
+---@field new_tab? boolean Create in new tab instead of split
+---@field return_to_tab? integer Tab index to return to when pane closes
+---@field command? string[] Command to execute in the new pane
+
 ---@type State
 local state = {
     tabs = {},
@@ -333,6 +344,8 @@ local state = {
     clock_timer = nil,
     pending_split = nil,
     pending_new_tab = false,
+    ---@type PendingSpawnOpts?
+    pending_spawn_opts = nil,
     next_split_id = 1,
     -- Command palette
     palette = {
@@ -860,13 +873,28 @@ local function close_tab(idx)
     end
 
     local old_focused = state.focused_id
+    local return_to = tab.return_to_tab
     table.remove(state.tabs, idx)
 
     -- Pick new active tab index
-    if idx > #state.tabs then
-        idx = #state.tabs
+    if return_to then
+        -- Tab has a preferred return destination (e.g., capture pane editor)
+        -- Adjust for removed tab if it was before the return target
+        if idx < return_to then
+            return_to = return_to - 1
+        end
+        -- Clamp to valid range
+        if return_to > #state.tabs then
+            return_to = #state.tabs
+        elseif return_to < 1 then
+            return_to = 1
+        end
+        state.active_tab = return_to
+    elseif idx > #state.tabs then
+        state.active_tab = #state.tabs
+    else
+        state.active_tab = idx > 0 and idx or 1
     end
-    state.active_tab = idx > 0 and idx or 1
 
     local new_tab = state.tabs[state.active_tab]
     if new_tab then
@@ -948,13 +976,30 @@ local function remove_pane_by_id(id)
         else
             local old_focused = state.focused_id
             table.remove(state.tabs, tab_idx)
+            local return_to = tab.return_to_tab
 
-            -- Adjust active_tab if needed
-            if state.active_tab > #state.tabs then
-                state.active_tab = #state.tabs
-            end
-            if state.active_tab < 1 then
-                state.active_tab = 1
+            -- Pick new active tab index
+            if return_to then
+                -- Tab has a preferred return destination (e.g., capture pane editor)
+                -- Adjust for removed tab if it was before the return target
+                if tab_idx < return_to then
+                    return_to = return_to - 1
+                end
+                -- Clamp to valid range
+                if return_to > #state.tabs then
+                    return_to = #state.tabs
+                elseif return_to < 1 then
+                    return_to = 1
+                end
+                state.active_tab = return_to
+            else
+                -- Adjust active_tab if needed
+                if state.active_tab > #state.tabs then
+                    state.active_tab = #state.tabs
+                end
+                if state.active_tab < 1 then
+                    state.active_tab = 1
+                end
             end
 
             -- Update focus to new active tab
@@ -1439,7 +1484,6 @@ local function swap_pane(direction)
                     target_pane.pty:set_focus(true)
                 end
 
-                update_cached_git_branch()
                 prise.request_frame()
                 prise.save()
             end
@@ -1826,6 +1870,15 @@ local commands = {
             swap_pane("down")
         end,
     },
+    {
+        name = "Capture Pane",
+        action = function()
+            local handler = action_handlers["capture_pane"]
+            if handler then
+                handler()
+            end
+        end,
+    },
 }
 
 -- Action handlers for keybind system
@@ -1970,6 +2023,16 @@ action_handlers = {
     end,
     rename_session = function()
         open_rename()
+    end,
+    capture_pane = function()
+        prise.log.info("capture_pane action triggered")
+        local pty = get_focused_pty()
+        if pty then
+            prise.log.info("Calling pty:capture_pane() on pty " .. pty:id())
+            pty:capture_pane()
+        else
+            prise.log.warn("capture_pane: no focused PTY")
+        end
     end,
     quit = function()
         detach_session()
@@ -2153,9 +2216,14 @@ function M.update(event)
         local new_pane = { type = "pane", pty = pty, id = pty:id() }
         local old_focused_id = state.focused_id
 
-        if state.pending_new_tab then
+        -- Check pending_spawn_opts for new_tab flag
+        local spawn_opts = state.pending_spawn_opts
+        state.pending_spawn_opts = nil
+        local create_new_tab = state.pending_new_tab or (spawn_opts and spawn_opts.new_tab)
+        state.pending_new_tab = false
+
+        if create_new_tab then
             -- Create a new tab with this pane
-            state.pending_new_tab = false
             local tab_id = state.next_tab_id
             state.next_tab_id = tab_id + 1
             ---@type Tab
@@ -2163,9 +2231,21 @@ function M.update(event)
                 id = tab_id,
                 root = new_pane,
                 last_focused_id = new_pane.id,
+                return_to_tab = spawn_opts and spawn_opts.return_to_tab,
             }
             table.insert(state.tabs, new_tab)
             set_active_tab_index(#state.tabs)
+
+            -- If there's a pending command, send it to the new PTY
+            if spawn_opts and spawn_opts.command then
+                prise.log.info("Scheduling command for new PTY: " .. table.concat(spawn_opts.command, " "))
+                local cmd_str = table.concat(spawn_opts.command, " ")
+                -- Delay sending the command to allow the shell to fully initialize
+                prise.set_timeout(100, function()
+                    prise.log.info("Sending delayed command to PTY: " .. cmd_str)
+                    pty:send_paste(cmd_str .. " && exit\n")
+                end)
+            end
         elseif #state.tabs == 0 then
             -- First terminal - create first tab
             local tab_id = state.next_tab_id
@@ -2418,7 +2498,6 @@ function M.update(event)
             return
         end
 
-
         -- Handle Ctrl+H/L/J/K for swapping panes when leader is pending
         if state.keybind_matcher:is_pending() and event.data.ctrl then
             if event.data.key == "h" then
@@ -2470,7 +2549,7 @@ function M.update(event)
             if state.timer then
                 state.timer:cancel()
             end
-            state.timer = prise.set_timeout(1000, function()
+            state.timer = prise.set_timeout(3000, function()
                 if state.pending_command then
                     state.pending_command = false
                     state.timer = nil
@@ -2519,6 +2598,10 @@ function M.update(event)
             end
         end
     elseif event.type == "key_release" then
+        -- Don't forward key releases to PTY if we're waiting for a keybind
+        if state.pending_command then
+            return
+        end
         -- Forward all key releases to focused PTY
         local root = get_active_root()
         if root and state.focused_id then
@@ -2728,6 +2811,16 @@ function M.update(event)
         -- CWD changed for a PTY - update cached git branch
         prise.request_frame()
         prise.save() -- Auto-save on cwd change
+    elseif event.type == "capture_pane_complete" then
+        -- Pane content captured - emit to user's event handlers
+        -- User can handle this in their config to pipe to editor, fzf, clipboard, etc.
+        local pty_id = event.data.pty_id
+        local content = event.data.content
+        prise.log.info("Pane content captured for pty " .. pty_id .. " (" .. #content .. " bytes)")
+        -- Call user's on_capture_pane_complete handler if defined
+        if M.on_capture_pane_complete then
+            M.on_capture_pane_complete(pty_id, content)
+        end
     end
 end
 
@@ -3695,6 +3788,44 @@ function M.set_state(saved, pty_lookup)
     end
 
     prise.request_frame()
+end
+
+---Spawn a new pane with the given command
+---@param opts { command: string[], cwd?: string, new_tab?: boolean, return_to_tab?: boolean }
+function M.spawn(opts)
+    prise.log.info(
+        "M.spawn called with opts: new_tab="
+            .. tostring(opts.new_tab)
+            .. ", return_to_tab="
+            .. tostring(opts.return_to_tab)
+            .. ", command="
+            .. (opts.command and table.concat(opts.command, " ") or "nil")
+    )
+    opts = opts or {}
+    local pty = get_focused_pty()
+    local cwd = opts.cwd or (pty and pty:cwd())
+
+    -- Set pending spawn options
+    state.pending_spawn_opts = {
+        new_tab = opts.new_tab,
+        return_to_tab = opts.return_to_tab and state.active_tab or nil,
+        command = opts.command,
+    }
+    prise.log.info("M.spawn: set pending_spawn_opts with new_tab=" .. tostring(state.pending_spawn_opts.new_tab))
+
+    -- If not new_tab, set pending_split direction
+    if not opts.new_tab then
+        state.pending_split = { direction = get_auto_split_direction() }
+    end
+
+    prise.log.info(
+        "M.spawn: calling prise.spawn with cwd="
+            .. (cwd or "nil")
+            .. ", command="
+            .. (opts.command and table.concat(opts.command, " ") or "nil")
+    )
+    prise.spawn({ cwd = cwd, command = opts.command })
+    prise.log.info("M.spawn: prise.spawn completed")
 end
 
 -- Export internal functions for testing
