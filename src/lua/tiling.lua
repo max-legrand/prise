@@ -311,6 +311,7 @@ local config = {
         ["<leader><lt>"] = "swap_tab_left",
         ["<leader><gt>"] = "swap_tab_right",
         ["<leader>d"] = "detach_session",
+        ["<leader>S"] = "switch_session",
         ["<leader>q"] = "quit",
         ["<leader>H"] = "resize_left",
         ["<leader>L"] = "resize_right",
@@ -2414,6 +2415,9 @@ action_handlers = {
         else
             prise.log.warn("capture_pane: no focused PTY")
         end
+    end,
+    switch_session = function()
+        open_session_picker()
     end,
     quit = function()
         detach_session()

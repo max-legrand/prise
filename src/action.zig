@@ -56,6 +56,7 @@ pub const Action = union(enum) {
     // Session
     detach_session,
     rename_session,
+    switch_session,
     quit,
 
     // UI
@@ -129,6 +130,7 @@ pub const Action = union(enum) {
             .resize_down => "Resize Down",
             .detach_session => "Detach Session",
             .rename_session => "Rename Session",
+            .switch_session => "Switch Session",
             .quit => "Quit",
             .command_palette => "Command Palette",
             .capture_pane => "Capture Pane",
