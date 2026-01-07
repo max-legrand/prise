@@ -13,7 +13,6 @@ local utils = require("utils")
 ---@field direction "row"|"col"
 ---@field ratio? number
 ---@field children (Pane|Split)[]
----@field last_focused_child_idx? number
 
 ---@alias Node Pane|Split
 
@@ -573,47 +572,9 @@ local function update_cached_git_branch()
     state.cached_git_branch = nil
 end
 
----Update the last_focused_child_idx for splits in the current focus path
+---Update focus path state (for future use)
 local function update_focus_path()
-    local root = get_active_root()
-    if not state.focused_id or not root then
-        return
-    end
-    local path = find_node_path(root, state.focused_id)
-    if not path then
-        return
-    end
-    -- path[1] is root, path[#path] is the focused pane
-    for i = 1, #path - 1 do
-        local node = path[i]
-        local child = path[i + 1]
-        if is_split(node) then
-            for idx, c in ipairs(node.children) do
-                if c == child then
-                    node.last_focused_child_idx = idx
-                    break
-                end
-            end
-        end
-    end
-end
-
----Get the preferred leaf pane from a node, preferring the last focused child
----@param node Node
----@return Pane?
-local function get_preferred_leaf(node)
-    if is_pane(node) then
-        ---@cast node Pane
-        return node
-    elseif is_split(node) then
-        ---@cast node Split
-        if node.last_focused_child_idx and node.children[node.last_focused_child_idx] then
-            return get_preferred_leaf(node.children[node.last_focused_child_idx])
-        else
-            return get_first_leaf(node)
-        end
-    end
-    return nil
+    -- Currently a no-op, kept for future extensions
 end
 
 ---Recursively insert a new pane relative to target_id
@@ -1132,7 +1093,10 @@ local function create_divider_segments(left_child, right_child, direction, focus
         local left_is_col_split = is_split(left_child) and left_child.direction == "col" and left_child.children
         local right_is_col_split = is_split(right_child) and right_child.direction == "col" and right_child.children
 
-        if left_is_col_split then
+        if left_is_col_split and right_is_col_split then
+            -- Both sides have column splits: fall back to simple coloring
+            return segments
+        elseif left_is_col_split then
             -- Flatten nested column splits to get all leaf segments
             local leaves = collect_leaves_in_direction(left_child, "col")
             local pos = 0
@@ -1205,7 +1169,10 @@ local function create_divider_segments(left_child, right_child, direction, focus
         local left_is_row_split = is_split(left_child) and left_child.direction == "row" and left_child.children
         local right_is_row_split = is_split(right_child) and right_child.direction == "row" and right_child.children
 
-        if left_is_row_split then
+        if left_is_row_split and right_is_row_split then
+            -- Both sides have row splits: fall back to simple coloring
+            return segments
+        elseif left_is_row_split then
             -- Flatten nested row splits to get all leaf segments
             local leaves = collect_leaves_in_direction(left_child, "row")
             local pos = 0
@@ -1310,7 +1277,6 @@ local function serialize_node(node, cwd_lookup)
             direction = node.direction,
             ratio = node.ratio,
             children = children,
-            last_focused_child_idx = node.last_focused_child_idx,
         }
     end
     return nil
@@ -1359,7 +1325,6 @@ local function deserialize_node(saved, pty_lookup)
             direction = saved.direction,
             ratio = saved.ratio,
             children = children,
-            last_focused_child_idx = saved.last_focused_child_idx,
         }
     end
     return nil
@@ -1522,8 +1487,13 @@ local function move_focus(direction)
     end
 
     if sibling_node then
-        -- Found a sibling tree/pane. Find the preferred leaf.
-        local target_leaf = get_preferred_leaf(sibling_node)
+        -- Found a sibling tree/pane. Move in the indicated direction.
+        local target_leaf
+        if forward then
+            target_leaf = get_first_leaf(sibling_node)
+        else
+            target_leaf = get_last_leaf(sibling_node)
+        end
 
         if target_leaf and target_leaf.id ~= state.focused_id then
             local old_id = state.focused_id

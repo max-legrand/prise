@@ -285,10 +285,9 @@ end
 ---@return table SegmentedSeparator widget
 function M.SegmentedSeparator(opts)
     return {
-        type = "segmented_separator",
+        type = "separator",
         axis = opts.axis or "vertical",
         segments = opts.segments or {},
-        default_style = opts.default_style,
         border = opts.border or "single",
     }
 end
