@@ -1668,8 +1668,6 @@ local function move_focus(direction)
     local forward = (direction == "right" or direction == "down")
 
     local sibling_node = nil
-    local sibling_parent = nil
-    local sibling_idx = nil
 
     -- Traverse up the path to find a split of the correct type where we can move
     -- path is [root, ..., parent, leaf]
@@ -1690,15 +1688,11 @@ local function move_focus(direction)
             if forward then
                 if idx < #node.children then
                     sibling_node = node.children[idx + 1]
-                    sibling_parent = node
-                    sibling_idx = idx + 1
                     break
                 end
             else
                 if idx > 1 then
                     sibling_node = node.children[idx - 1]
-                    sibling_parent = node
-                    sibling_idx = idx - 1
                     break
                 end
             end
@@ -1723,16 +1717,7 @@ local function move_focus(direction)
         end
 
         if target_leaf and target_leaf.id ~= state.focused_id then
-            local old_id = state.focused_id
-            state.focused_id = target_leaf.id
-
-            -- Track that this child was focused in its parent
-            if config.navigation.remember_focus and sibling_parent then
-                ---@cast sibling_parent Split
-                sibling_parent.last_focused_child_idx = sibling_idx
-            end
-
-            update_pty_focus(old_id, state.focused_id)
+            set_focus_and_track(target_leaf.id)
             prise.request_frame()
         end
     end
@@ -2686,7 +2671,6 @@ function M.update(event)
             -- Use set_focus_and_track to register the new pane and track parent splits
             set_focus_and_track(new_pane.id)
             state.pending_split = nil
-            update_pty_focus(old_focused_id, state.focused_id)
             prise.request_frame()
             prise.save() -- Auto-save on pane added
             return
@@ -4276,10 +4260,7 @@ function M.spawn(opts)
         state.pending_split = { direction = get_auto_split_direction() }
     end
 
-    prise.log.info(
-        "M.spawn: calling prise.spawn with cwd="
-            .. (cwd or "nil")
-    )
+    prise.log.info("M.spawn: calling prise.spawn with cwd=" .. (cwd or "nil"))
     prise.spawn({ cwd = cwd })
     prise.log.info("M.spawn: prise.spawn completed")
 end
