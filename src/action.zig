@@ -63,6 +63,11 @@ pub const Action = union(enum) {
     command_palette,
     capture_pane,
 
+    // Floating pane
+    floating_toggle,
+    floating_increase_size,
+    floating_decrease_size,
+
     // Lua function reference (registry ref)
     lua_function: i32,
 
@@ -134,6 +139,9 @@ pub const Action = union(enum) {
             .quit => "Quit",
             .command_palette => "Command Palette",
             .capture_pane => "Capture Pane",
+            .floating_toggle => "Toggle Floating Pane",
+            .floating_increase_size => "Floating Pane: Increase Size",
+            .floating_decrease_size => "Floating Pane: Decrease Size",
             .lua_function => null,
         };
     }
@@ -149,14 +157,19 @@ test "action string roundtrip" {
 test "action from string" {
     try std.testing.expectEqual(@as(Action, .focus_left), Action.fromString("focus_left").?);
     try std.testing.expectEqual(@as(Action, .command_palette), Action.fromString("command_palette").?);
+    try std.testing.expectEqual(@as(Action, .floating_toggle), Action.fromString("floating_toggle").?);
+    try std.testing.expectEqual(@as(Action, .floating_increase_size), Action.fromString("floating_increase_size").?);
+    try std.testing.expectEqual(@as(Action, .floating_decrease_size), Action.fromString("floating_decrease_size").?);
     try std.testing.expect(Action.fromString("invalid_action") == null);
 }
 
 test "action display names" {
     const split: Action = .split_horizontal;
     const palette: Action = .command_palette;
+    const float_toggle: Action = .floating_toggle;
     try std.testing.expectEqualStrings("Split Horizontal", split.displayName().?);
     try std.testing.expectEqualStrings("Command Palette", palette.displayName().?);
+    try std.testing.expectEqualStrings("Toggle Floating Pane", float_toggle.displayName().?);
 }
 
 test "lua_function has no string name" {
