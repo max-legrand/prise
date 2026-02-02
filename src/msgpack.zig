@@ -74,6 +74,39 @@ const Limits = struct {
     const FIXMAP_MAX: usize = 15;
 };
 
+// Batched write helpers to reduce per-byte append overhead.
+// These write multi-byte values in a single appendSlice call.
+
+fn appendU16BigEndian(allocator: Allocator, buf: *std.ArrayList(u8), prefix: u8, value: u16) !void {
+    const bytes = std.mem.toBytes(value);
+    try buf.appendSlice(allocator, &[_]u8{ prefix, bytes[1], bytes[0] });
+}
+
+fn appendU32BigEndian(allocator: Allocator, buf: *std.ArrayList(u8), prefix: u8, value: u32) !void {
+    const bytes = std.mem.toBytes(value);
+    try buf.appendSlice(allocator, &[_]u8{ prefix, bytes[3], bytes[2], bytes[1], bytes[0] });
+}
+
+fn appendU64BigEndian(allocator: Allocator, buf: *std.ArrayList(u8), prefix: u8, value: u64) !void {
+    const bytes = std.mem.toBytes(value);
+    try buf.appendSlice(allocator, &[_]u8{ prefix, bytes[7], bytes[6], bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0] });
+}
+
+fn appendI16BigEndian(allocator: Allocator, buf: *std.ArrayList(u8), prefix: u8, value: i16) !void {
+    const bytes = std.mem.toBytes(value);
+    try buf.appendSlice(allocator, &[_]u8{ prefix, bytes[1], bytes[0] });
+}
+
+fn appendI32BigEndian(allocator: Allocator, buf: *std.ArrayList(u8), prefix: u8, value: i32) !void {
+    const bytes = std.mem.toBytes(value);
+    try buf.appendSlice(allocator, &[_]u8{ prefix, bytes[3], bytes[2], bytes[1], bytes[0] });
+}
+
+fn appendI64BigEndian(allocator: Allocator, buf: *std.ArrayList(u8), prefix: u8, value: i64) !void {
+    const bytes = std.mem.toBytes(value);
+    try buf.appendSlice(allocator, &[_]u8{ prefix, bytes[7], bytes[6], bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0] });
+}
+
 pub const EncodeError = error{
     OutOfMemory,
     IntegerTooLarge,
@@ -120,17 +153,9 @@ fn encodeValueType(allocator: Allocator, buf: *std.ArrayList(u8), value: Value) 
             if (len <= Limits.FIXARRAY_MAX) {
                 try buf.append(allocator, Format.FIXARRAY_PREFIX | @as(u8, @intCast(len)));
             } else if (len <= Limits.UINT16_MAX) {
-                try buf.append(allocator, Format.ARRAY16);
-                const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
-                try buf.append(allocator, bytes[1]);
-                try buf.append(allocator, bytes[0]);
+                try appendU16BigEndian(allocator, buf, Format.ARRAY16, @intCast(len));
             } else {
-                try buf.append(allocator, Format.ARRAY32);
-                const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
-                try buf.append(allocator, bytes[3]);
-                try buf.append(allocator, bytes[2]);
-                try buf.append(allocator, bytes[1]);
-                try buf.append(allocator, bytes[0]);
+                try appendU32BigEndian(allocator, buf, Format.ARRAY32, @intCast(len));
             }
 
             for (arr) |item| {
@@ -144,17 +169,9 @@ fn encodeValueType(allocator: Allocator, buf: *std.ArrayList(u8), value: Value) 
             if (len <= Limits.FIXMAP_MAX) {
                 try buf.append(allocator, Format.FIXMAP_PREFIX | @as(u8, @intCast(len)));
             } else if (len <= Limits.UINT16_MAX) {
-                try buf.append(allocator, Format.MAP16);
-                const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
-                try buf.append(allocator, bytes[1]);
-                try buf.append(allocator, bytes[0]);
+                try appendU16BigEndian(allocator, buf, Format.MAP16, @intCast(len));
             } else {
-                try buf.append(allocator, Format.MAP32);
-                const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
-                try buf.append(allocator, bytes[3]);
-                try buf.append(allocator, bytes[2]);
-                try buf.append(allocator, bytes[1]);
-                try buf.append(allocator, bytes[0]);
+                try appendU32BigEndian(allocator, buf, Format.MAP32, @intCast(len));
             }
 
             for (m) |kv| {
@@ -241,77 +258,32 @@ fn encodeInt(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !voi
         if (uval <= Limits.FIXINT_MAX) {
             try buf.append(allocator, @intCast(uval));
         } else if (uval <= Limits.UINT8_MAX) {
-            try buf.append(allocator, Format.UINT8);
-            try buf.append(allocator, @intCast(uval));
+            try buf.appendSlice(allocator, &[_]u8{ Format.UINT8, @intCast(uval) });
         } else if (uval <= Limits.UINT16_MAX) {
-            try buf.append(allocator, Format.UINT16);
-            const bytes = std.mem.toBytes(@as(u16, @intCast(uval)));
-            try buf.append(allocator, bytes[1]);
-            try buf.append(allocator, bytes[0]);
+            try appendU16BigEndian(allocator, buf, Format.UINT16, @intCast(uval));
         } else if (uval <= Limits.UINT32_MAX) {
-            try buf.append(allocator, Format.UINT32);
-            const bytes = std.mem.toBytes(@as(u32, @intCast(uval)));
-            try buf.append(allocator, bytes[3]);
-            try buf.append(allocator, bytes[2]);
-            try buf.append(allocator, bytes[1]);
-            try buf.append(allocator, bytes[0]);
+            try appendU32BigEndian(allocator, buf, Format.UINT32, @intCast(uval));
         } else {
-            try buf.append(allocator, Format.UINT64);
-            const bytes = std.mem.toBytes(uval);
-            try buf.append(allocator, bytes[7]);
-            try buf.append(allocator, bytes[6]);
-            try buf.append(allocator, bytes[5]);
-            try buf.append(allocator, bytes[4]);
-            try buf.append(allocator, bytes[3]);
-            try buf.append(allocator, bytes[2]);
-            try buf.append(allocator, bytes[1]);
-            try buf.append(allocator, bytes[0]);
+            try appendU64BigEndian(allocator, buf, Format.UINT64, uval);
         }
     } else {
         if (val >= Limits.NEGATIVE_FIXINT_MIN) {
             try buf.append(allocator, @bitCast(@as(i8, @intCast(val))));
         } else if (val >= Limits.INT8_MIN) {
-            try buf.append(allocator, Format.INT8);
-            try buf.append(allocator, @bitCast(@as(i8, @intCast(val))));
+            try buf.appendSlice(allocator, &[_]u8{ Format.INT8, @bitCast(@as(i8, @intCast(val))) });
         } else if (val >= Limits.INT16_MIN) {
-            try buf.append(allocator, Format.INT16);
-            const bytes = std.mem.toBytes(@as(i16, @intCast(val)));
-            try buf.append(allocator, bytes[1]);
-            try buf.append(allocator, bytes[0]);
+            try appendI16BigEndian(allocator, buf, Format.INT16, @intCast(val));
         } else if (val >= Limits.INT32_MIN) {
-            try buf.append(allocator, Format.INT32);
-            const bytes = std.mem.toBytes(@as(i32, @intCast(val)));
-            try buf.append(allocator, bytes[3]);
-            try buf.append(allocator, bytes[2]);
-            try buf.append(allocator, bytes[1]);
-            try buf.append(allocator, bytes[0]);
+            try appendI32BigEndian(allocator, buf, Format.INT32, @intCast(val));
         } else {
-            try buf.append(allocator, Format.INT64);
-            const bytes = std.mem.toBytes(val);
-            try buf.append(allocator, bytes[7]);
-            try buf.append(allocator, bytes[6]);
-            try buf.append(allocator, bytes[5]);
-            try buf.append(allocator, bytes[4]);
-            try buf.append(allocator, bytes[3]);
-            try buf.append(allocator, bytes[2]);
-            try buf.append(allocator, bytes[1]);
-            try buf.append(allocator, bytes[0]);
+            try appendI64BigEndian(allocator, buf, Format.INT64, val);
         }
     }
 }
 
 fn encodeFloat(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !void {
     const val: f64 = @floatCast(value);
-    try buf.append(allocator, Format.FLOAT64);
-    const bytes = std.mem.toBytes(@as(u64, @bitCast(val)));
-    try buf.append(allocator, bytes[7]);
-    try buf.append(allocator, bytes[6]);
-    try buf.append(allocator, bytes[5]);
-    try buf.append(allocator, bytes[4]);
-    try buf.append(allocator, bytes[3]);
-    try buf.append(allocator, bytes[2]);
-    try buf.append(allocator, bytes[1]);
-    try buf.append(allocator, bytes[0]);
+    try appendU64BigEndian(allocator, buf, Format.FLOAT64, @bitCast(val));
 }
 
 fn encodeString(allocator: Allocator, buf: *std.ArrayList(u8), value: []const u8) !void {
@@ -321,20 +293,11 @@ fn encodeString(allocator: Allocator, buf: *std.ArrayList(u8), value: []const u8
     if (len <= Limits.FIXSTR_MAX) {
         try buf.append(allocator, Format.FIXSTR_PREFIX | @as(u8, @intCast(len)));
     } else if (len <= Limits.UINT8_MAX) {
-        try buf.append(allocator, Format.STR8);
-        try buf.append(allocator, @intCast(len));
+        try buf.appendSlice(allocator, &[_]u8{ Format.STR8, @intCast(len) });
     } else if (len <= Limits.UINT16_MAX) {
-        try buf.append(allocator, Format.STR16);
-        const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
-        try buf.append(allocator, bytes[1]);
-        try buf.append(allocator, bytes[0]);
+        try appendU16BigEndian(allocator, buf, Format.STR16, @intCast(len));
     } else {
-        try buf.append(allocator, Format.STR32);
-        const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
-        try buf.append(allocator, bytes[3]);
-        try buf.append(allocator, bytes[2]);
-        try buf.append(allocator, bytes[1]);
-        try buf.append(allocator, bytes[0]);
+        try appendU32BigEndian(allocator, buf, Format.STR32, @intCast(len));
     }
     try buf.appendSlice(allocator, value);
 }
@@ -346,17 +309,9 @@ fn encodeArray(allocator: Allocator, buf: *std.ArrayList(u8), value: anytype) !v
     if (len <= Limits.FIXARRAY_MAX) {
         try buf.append(allocator, Format.FIXARRAY_PREFIX | @as(u8, @intCast(len)));
     } else if (len <= Limits.UINT16_MAX) {
-        try buf.append(allocator, Format.ARRAY16);
-        const bytes = std.mem.toBytes(@as(u16, @intCast(len)));
-        try buf.append(allocator, bytes[1]);
-        try buf.append(allocator, bytes[0]);
+        try appendU16BigEndian(allocator, buf, Format.ARRAY16, @intCast(len));
     } else {
-        try buf.append(allocator, Format.ARRAY32);
-        const bytes = std.mem.toBytes(@as(u32, @intCast(len)));
-        try buf.append(allocator, bytes[3]);
-        try buf.append(allocator, bytes[2]);
-        try buf.append(allocator, bytes[1]);
-        try buf.append(allocator, bytes[0]);
+        try appendU32BigEndian(allocator, buf, Format.ARRAY32, @intCast(len));
     }
 
     inline for (value) |item| {

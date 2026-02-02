@@ -442,10 +442,11 @@ const Pty = struct {
         // Precondition: process master fd must be valid
         std.debug.assert(self.process.master >= 0);
 
-        // 4096 bytes matches typical pipe buffer size and is large enough to
-        // batch multiple VT sequences per read, reducing syscall overhead while
-        // staying small enough for stack allocation.
-        var buffer: [4096]u8 = undefined;
+        // 64KB buffer reduces syscall overhead for high-throughput scenarios like
+        // `cat large_file` or continuous log streams. This matches Kitty's buffer
+        // size and is 16x larger than the typical pipe buffer, allowing us to
+        // drain more data per read syscall.
+        var buffer: [65536]u8 = undefined;
 
         var handler = vt_handler.Handler.init(&self.terminal);
         defer handler.deinit();
@@ -745,6 +746,54 @@ fn getStyleAttributes(style: ghostty_vt.Style) redraw.UIEvent.Style.Attributes {
 /// Captured screen state for building redraw notifications
 pub const RenderMode = enum { full, incremental };
 
+/// Small LRU cache for recently-used styles to avoid repeated hashing.
+/// Most terminals use <5 unique styles per screen, so a small cache provides
+/// high hit rates while avoiding the overhead of a full hash lookup.
+const StyleCache = struct {
+    const CACHE_SIZE = 8;
+
+    styles: [CACHE_SIZE]ghostty_vt.Style = undefined,
+    ids: [CACHE_SIZE]u32 = undefined,
+    len: u8 = 0,
+
+    /// Look up a style in the cache, returning its ID if found.
+    /// Moves found entries to the front (MRU position).
+    fn get(self: *StyleCache, style: ghostty_vt.Style) ?u32 {
+        for (0..self.len) |i| {
+            if (std.meta.eql(self.styles[i], style)) {
+                const id = self.ids[i];
+                // Move to front (MRU) by shifting entries down
+                if (i > 0) {
+                    var j = i;
+                    while (j > 0) : (j -= 1) {
+                        self.styles[j] = self.styles[j - 1];
+                        self.ids[j] = self.ids[j - 1];
+                    }
+                    self.styles[0] = style;
+                    self.ids[0] = id;
+                }
+                return id;
+            }
+        }
+        return null;
+    }
+
+    /// Add a style to the cache at the MRU position.
+    /// Evicts the LRU entry if the cache is full.
+    fn put(self: *StyleCache, style: ghostty_vt.Style, id: u32) void {
+        // Shift everything down to make room at front
+        const shift_count = if (self.len < CACHE_SIZE) self.len else CACHE_SIZE - 1;
+        var j = shift_count;
+        while (j > 0) : (j -= 1) {
+            self.styles[j] = self.styles[j - 1];
+            self.ids[j] = self.ids[j - 1];
+        }
+        self.styles[0] = style;
+        self.ids[0] = id;
+        if (self.len < CACHE_SIZE) self.len += 1;
+    }
+};
+
 /// State passed between redraw helper functions
 const RedrawContext = struct {
     builder: *redraw.RedrawBuilder,
@@ -755,8 +804,7 @@ const RedrawContext = struct {
     default_style: ghostty_vt.Style,
     styles_map: std.AutoHashMap(u64, u32),
     next_style_id: u32,
-    last_style: ?ghostty_vt.Style,
-    last_style_id: u32,
+    style_cache: StyleCache,
 };
 
 fn emitTitle(builder: *redraw.RedrawBuilder, pty_instance: *Pty, mode: RenderMode) !void {
@@ -782,6 +830,10 @@ fn initStylesContext(temp_alloc: std.mem.Allocator, builder: *redraw.RedrawBuild
     try styles_map.put(default_hash, 0);
     try builder.style(0, .{});
 
+    var style_cache: StyleCache = .{};
+    // Pre-populate cache with the default style
+    style_cache.put(default_style, 0);
+
     return .{
         .builder = builder,
         .temp_alloc = temp_alloc,
@@ -791,32 +843,30 @@ fn initStylesContext(temp_alloc: std.mem.Allocator, builder: *redraw.RedrawBuild
         .default_style = default_style,
         .styles_map = styles_map,
         .next_style_id = 1,
-        .last_style = null,
-        .last_style_id = 0,
+        .style_cache = style_cache,
     };
 }
 
 fn resolveStyle(ctx: *RedrawContext, vt_style: ghostty_vt.Style) !u32 {
-    if (ctx.last_style) |last| {
-        if (std.meta.eql(last, vt_style)) {
-            return ctx.last_style_id;
-        }
-    }
-
-    const style_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&vt_style));
-    if (ctx.styles_map.get(style_hash)) |id| {
-        ctx.last_style = vt_style;
-        ctx.last_style_id = id;
+    // Fast path: check LRU cache first (avoids hashing for common styles)
+    if (ctx.style_cache.get(vt_style)) |id| {
         return id;
     }
 
+    // Cache miss: check the full hash map
+    const style_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&vt_style));
+    if (ctx.styles_map.get(style_hash)) |id| {
+        ctx.style_cache.put(vt_style, id);
+        return id;
+    }
+
+    // New style: assign ID and emit style definition
     const style_id = ctx.next_style_id;
     ctx.next_style_id += 1;
     try ctx.styles_map.put(style_hash, style_id);
     const attrs = getStyleAttributes(vt_style);
     try ctx.builder.style(style_id, attrs);
-    ctx.last_style = vt_style;
-    ctx.last_style_id = style_id;
+    ctx.style_cache.put(vt_style, style_id);
     return style_id;
 }
 
