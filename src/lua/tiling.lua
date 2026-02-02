@@ -216,22 +216,6 @@ local POWERLINE_SYMBOLS = {
 ---Optional function to format tab titles for display
 ---@alias TabFormatFunction fun(title: string, tab_index: number): string
 
----Tab info passed to custom render function
----@class TabInfo
----@field index number Tab index (1-based)
----@field title string Tab title (explicit title if set, otherwise auto-derived)
----@field is_explicit_title boolean True if this is an explicit renamed title
----@field is_active boolean True if this is the active tab
----@field is_hovered boolean True if mouse is hovering over this tab
----@field is_close_hovered boolean True if mouse is hovering over close button
-
----Custom render function for tab bar
----Must return an array of segments compatible with prise.Text()
----@alias TabRenderFunction fun(tabs: TabInfo[], screen_width: number, theme: PriseTheme): table[]
-
----Optional function to format tab titles for display
----@alias TabFormatFunction fun(title: string, tab_index: number): string
-
 ---@class PriseTabBarConfig
 ---@field show_single_tab? boolean Show tab bar even with one tab (default: false)
 ---@field render? TabRenderFunction Custom tab bar renderer (overrides default design)
@@ -3406,16 +3390,21 @@ function M.update(event)
             end
         end
 
-        -- Find the split by id and update the child's ratio
+        -- Find the split by id and update child ratios
         local function update_split_ratio(node)
             if not node then
                 return false
             end
             if is_split(node) then
                 if node.split_id == split_id then
-                    -- Found it - update the pane's ratio
+                    -- Found it - update the pane's ratio and its sibling
                     if node.children[pane_index + 1] then
                         node.children[pane_index + 1].ratio = new_ratio
+                        -- For 2-child splits, also update the other child to maintain consistent ratios
+                        if #node.children == 2 then
+                            local other_index = (pane_index + 1 == 1) and 2 or 1
+                            node.children[other_index].ratio = 1.0 - new_ratio
+                        end
                     end
                     return true
                 end

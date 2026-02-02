@@ -2325,10 +2325,44 @@ fn layoutColumnImpl(col: *Column, constraints: BoxConstraints) Size {
     const available = if (total_height > intrinsic_height) total_height - intrinsic_height else 0;
 
     // Pass 2: Allocate ratio children
-    var used_by_ratio: u16 = 0;
+    // First, calculate the sum of all explicit ratios to normalize if needed
+    var ratio_sum: f32 = 0.0;
+    var ratio_count: u16 = 0;
     for (col.children) |*child| {
         if (child.ratio) |r| {
-            const share: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * r);
+            ratio_sum += r;
+            ratio_count += 1;
+        }
+    }
+
+    // If ratios sum > 1.0 (or close to it, leaving no room for nil children),
+    // scale them down. Reserve at least 10% for nil children if any exist.
+    const max_ratio_sum: f32 = if (nil_count > 0) 0.9 else 1.0;
+    const ratio_scale: f32 = if (ratio_sum > max_ratio_sum and ratio_sum > 0.0)
+        max_ratio_sum / ratio_sum
+    else
+        1.0;
+
+    // When ratios sum to ~1.0 (after scaling) and there are no nil children,
+    // ensure ratio children consume all available space to avoid rounding errors
+    // that would affect sibling positioning.
+    const scaled_sum = ratio_sum * ratio_scale;
+    const should_fill_space = nil_count == 0 and ratio_count > 0 and scaled_sum >= 0.99;
+
+    var used_by_ratio: u16 = 0;
+    var ratio_children_remaining: u16 = ratio_count;
+    for (col.children) |*child| {
+        if (child.ratio) |r| {
+            ratio_children_remaining -= 1;
+
+            // Last ratio child gets remaining space when ratios should fill the container
+            const share: u16 = if (should_fill_space and ratio_children_remaining == 0)
+                available - used_by_ratio
+            else blk: {
+                const scaled_ratio = r * ratio_scale;
+                break :blk @intFromFloat(@as(f32, @floatFromInt(available)) * scaled_ratio);
+            };
+
             const child_constraints: BoxConstraints = .{
                 .min_width = 0,
                 .max_width = constraints.max_width,
@@ -2434,10 +2468,44 @@ fn layoutRowImpl(row: *Row, constraints: BoxConstraints) Size {
     const available = if (total_width > intrinsic_width) total_width - intrinsic_width else 0;
 
     // Pass 2: Allocate ratio children
-    var used_by_ratio: u16 = 0;
+    // First, calculate the sum of all explicit ratios to normalize if needed
+    var ratio_sum: f32 = 0.0;
+    var ratio_count: u16 = 0;
     for (row.children) |*child| {
         if (child.ratio) |r| {
-            const share: u16 = @intFromFloat(@as(f32, @floatFromInt(available)) * r);
+            ratio_sum += r;
+            ratio_count += 1;
+        }
+    }
+
+    // If ratios sum > 1.0 (or close to it, leaving no room for nil children),
+    // scale them down. Reserve at least 10% for nil children if any exist.
+    const max_ratio_sum: f32 = if (nil_count > 0) 0.9 else 1.0;
+    const ratio_scale: f32 = if (ratio_sum > max_ratio_sum and ratio_sum > 0.0)
+        max_ratio_sum / ratio_sum
+    else
+        1.0;
+
+    // When ratios sum to ~1.0 (after scaling) and there are no nil children,
+    // ensure ratio children consume all available space to avoid rounding errors
+    // that would affect sibling positioning.
+    const scaled_sum = ratio_sum * ratio_scale;
+    const should_fill_space = nil_count == 0 and ratio_count > 0 and scaled_sum >= 0.99;
+
+    var used_by_ratio: u16 = 0;
+    var ratio_children_remaining: u16 = ratio_count;
+    for (row.children) |*child| {
+        if (child.ratio) |r| {
+            ratio_children_remaining -= 1;
+
+            // Last ratio child gets remaining space when ratios should fill the container
+            const share: u16 = if (should_fill_space and ratio_children_remaining == 0)
+                available - used_by_ratio
+            else blk: {
+                const scaled_ratio = r * ratio_scale;
+                break :blk @intFromFloat(@as(f32, @floatFromInt(available)) * scaled_ratio);
+            };
+
             const child_constraints: BoxConstraints = .{
                 .min_width = share,
                 .max_width = share,
@@ -4639,4 +4707,257 @@ test "render Positioned - anchor bottom_right" {
         \\     
         \\    Z
     , ascii);
+}
+
+// ============================================================================
+// Ratio Normalization Tests
+// ============================================================================
+
+test "layout Column - ratio normalization when sum exceeds 1.0" {
+    // When explicit ratios sum > 1.0, they should be normalized to prevent
+    // overflow and ensure all children fit within the container.
+    // Use surface widgets which expand to fill their allocated space.
+    var children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.7 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.7 },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .column = .{ .children = &children } },
+    };
+
+    const size = w.layout(boundsConstraints(10, 20));
+
+    // Total ratio is 1.4, so each child should get 0.7/1.4 = 0.5 of the space
+    // With height 20, each child gets 10 rows
+    try std.testing.expectEqual(@as(u16, 10), children[0].height);
+    try std.testing.expectEqual(@as(u16, 10), children[1].height);
+    try std.testing.expectEqual(@as(u16, 0), children[0].y);
+    try std.testing.expectEqual(@as(u16, 10), children[1].y);
+    try std.testing.expectEqual(@as(u16, 20), size.height);
+}
+
+test "layout Column - ratio normalization preserves space for nil-ratio children" {
+    // When there are children without explicit ratios, the ratio children
+    // should leave room for them (at least 10% of available space).
+    // Use surface widgets which expand to fill their allocated space.
+    var children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.6 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.6 },
+        .{ .kind = .{ .surface = .{ .pty_id = 3, .surface = undefined } }, .ratio = null },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .column = .{ .children = &children } },
+    };
+
+    const size = w.layout(boundsConstraints(10, 20));
+
+    // Total explicit ratio is 1.2, but with a nil-ratio child, we cap at 0.9
+    // So ratios are scaled: 0.6 * (0.9/1.2) = 0.45 each
+    // Child 0: 20 * 0.45 = 9 rows
+    // Child 1: 20 * 0.45 = 9 rows
+    // Child 2: remaining space split among nil-ratio children (2 rows)
+    try std.testing.expectEqual(@as(u16, 9), children[0].height);
+    try std.testing.expectEqual(@as(u16, 9), children[1].height);
+    try std.testing.expectEqual(@as(u16, 2), children[2].height);
+    // The nil-ratio child should be positioned after the ratio children
+    try std.testing.expectEqual(@as(u16, 0), children[0].y);
+    try std.testing.expectEqual(@as(u16, 9), children[1].y);
+    try std.testing.expectEqual(@as(u16, 18), children[2].y);
+    try std.testing.expectEqual(@as(u16, 20), size.height);
+}
+
+test "layout Row - ratio normalization when sum exceeds 1.0" {
+    // When explicit ratios sum > 1.0, they should be normalized to prevent
+    // overflow and ensure all children fit within the container.
+    // Use surface widgets which expand to fill their allocated space.
+    var children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.8 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.8 },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .row = .{ .children = &children } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    // Total ratio is 1.6, so each child should get 0.8/1.6 = 0.5 of the space
+    // With width 20, each child gets 10 columns
+    try std.testing.expectEqual(@as(u16, 10), children[0].width);
+    try std.testing.expectEqual(@as(u16, 10), children[1].width);
+    try std.testing.expectEqual(@as(u16, 0), children[0].x);
+    try std.testing.expectEqual(@as(u16, 10), children[1].x);
+    try std.testing.expectEqual(@as(u16, 20), size.width);
+}
+
+test "layout Row - ratio normalization preserves space for nil-ratio children" {
+    // When there are children without explicit ratios, the ratio children
+    // should leave room for them (at least 10% of available space).
+    // Use surface widgets which expand to fill their allocated space.
+    var children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.6 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.6 },
+        .{ .kind = .{ .surface = .{ .pty_id = 3, .surface = undefined } }, .ratio = null },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .row = .{ .children = &children } },
+    };
+
+    const size = w.layout(boundsConstraints(20, 10));
+
+    // Total explicit ratio is 1.2, but with a nil-ratio child, we cap at 0.9
+    // So ratios are scaled: 0.6 * (0.9/1.2) = 0.45 each
+    // Child 0: 20 * 0.45 = 9 columns
+    // Child 1: 20 * 0.45 = 9 columns
+    // Child 2: remaining space split among nil-ratio children (2 columns)
+    try std.testing.expectEqual(@as(u16, 9), children[0].width);
+    try std.testing.expectEqual(@as(u16, 9), children[1].width);
+    try std.testing.expectEqual(@as(u16, 2), children[2].width);
+    // The nil-ratio child should be positioned after the ratio children
+    try std.testing.expectEqual(@as(u16, 0), children[0].x);
+    try std.testing.expectEqual(@as(u16, 9), children[1].x);
+    try std.testing.expectEqual(@as(u16, 18), children[2].x);
+    try std.testing.expectEqual(@as(u16, 20), size.width);
+}
+
+test "layout Column - ratios under 1.0 are not scaled" {
+    // When ratios sum to <= 1.0, they should not be modified.
+    // Use surface widgets which expand to fill their allocated space.
+    var children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.3 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.4 },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .column = .{ .children = &children } },
+    };
+
+    _ = w.layout(boundsConstraints(10, 20));
+
+    // Ratios sum to 0.7, so they should not be scaled
+    // Child 0: 20 * 0.3 = 6 rows
+    // Child 1: 20 * 0.4 = 8 rows
+    try std.testing.expectEqual(@as(u16, 6), children[0].height);
+    try std.testing.expectEqual(@as(u16, 8), children[1].height);
+}
+
+test "layout Row - ratios under 1.0 are not scaled" {
+    // When ratios sum to <= 1.0, they should not be modified.
+    // Use surface widgets which expand to fill their allocated space.
+    var children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.3 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.4 },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .row = .{ .children = &children } },
+    };
+
+    _ = w.layout(boundsConstraints(20, 10));
+
+    // Ratios sum to 0.7, so they should not be scaled
+    // Child 0: 20 * 0.3 = 6 columns
+    // Child 1: 20 * 0.4 = 8 columns
+    try std.testing.expectEqual(@as(u16, 6), children[0].width);
+    try std.testing.expectEqual(@as(u16, 8), children[1].width);
+}
+
+test "layout Column - ratios summing to 1.0 fill entire space" {
+    // When ratios sum to 1.0, children should fill ALL available space.
+    // This prevents rounding errors from affecting sibling positioning.
+    var children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.4 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.6 },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .column = .{ .children = &children } },
+    };
+
+    // 23 rows - 0.4*23=9.2, 0.6*23=13.8
+    // Without fix: 9+13=22, losing 1 row
+    // With fix: last child gets 23-9=14
+    _ = w.layout(boundsConstraints(10, 23));
+
+    try std.testing.expectEqual(@as(u16, 9), children[0].height);
+    try std.testing.expectEqual(@as(u16, 14), children[1].height);
+
+    // Total must equal available
+    try std.testing.expectEqual(@as(u16, 23), children[0].height + children[1].height);
+}
+
+test "layout Row - ratios summing to 1.0 fill entire space" {
+    // When ratios sum to 1.0, children should fill ALL available space.
+    // This prevents rounding errors from affecting sibling positioning.
+    var children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.4 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.6 },
+    };
+
+    var w: Widget = .{
+        .kind = .{ .row = .{ .children = &children } },
+    };
+
+    // 23 columns - 0.4*23=9.2, 0.6*23=13.8
+    // Without fix: 9+13=22, losing 1 column
+    // With fix: last child gets 23-9=14
+    _ = w.layout(boundsConstraints(23, 10));
+
+    try std.testing.expectEqual(@as(u16, 9), children[0].width);
+    try std.testing.expectEqual(@as(u16, 14), children[1].width);
+
+    // Total must equal available
+    try std.testing.expectEqual(@as(u16, 23), children[0].width + children[1].width);
+}
+
+test "layout Column - status bar not affected by pane ratio rounding" {
+    // Simulates the real-world layout: Column with panes (as nested Column) and status bar.
+    // The status bar should stay at the bottom regardless of ratio rounding.
+    const allocator = std.testing.allocator;
+
+    // Create pane widgets with ratios that will cause rounding
+    var pane_children = [_]Widget{
+        .{ .kind = .{ .surface = .{ .pty_id = 1, .surface = undefined } }, .ratio = 0.4 },
+        .{ .kind = .{ .surface = .{ .pty_id = 2, .surface = undefined } }, .ratio = 0.6 },
+    };
+
+    // Status bar text (1 row intrinsic height)
+    var status_spans = [_]Text.Span{.{ .text = "Status", .style = .{} }};
+
+    // Main UI Column with panes column and status bar
+    var main_children = [_]Widget{
+        .{
+            .kind = .{ .column = .{
+                .children = &pane_children,
+                .cross_axis_align = .stretch,
+            } },
+        },
+        .{
+            .kind = .{ .text = .{ .spans = &status_spans } },
+        },
+    };
+    var main_ui: Widget = .{
+        .kind = .{ .column = .{
+            .children = &main_children,
+            .cross_axis_align = .stretch,
+        } },
+    };
+
+    // Layout in 24-row screen (23 for panes + 1 for status bar)
+    _ = main_ui.layout(boundsConstraints(80, 24));
+
+    // Panes column should get 23 rows (24 - 1 for status bar)
+    try std.testing.expectEqual(@as(u16, 23), main_children[0].height);
+
+    // Status bar should be at row 23 (0-indexed), which is the 24th row
+    try std.testing.expectEqual(@as(u16, 23), main_children[1].y);
+    try std.testing.expectEqual(@as(u16, 1), main_children[1].height);
+
+    // Pane children should fill the entire panes column
+    try std.testing.expectEqual(@as(u16, 23), pane_children[0].height + pane_children[1].height);
+
+    _ = allocator; // unused but consistent with other tests
 }
