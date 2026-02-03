@@ -22,6 +22,7 @@ local utils = require("utils")
 ---@field title? string
 ---@field root? Node
 ---@field last_focused_id? number
+---@field last_zoomed_id? number Pane ID that was zoomed in this tab
 ---@field return_to_tab? integer Tab index to return to when this tab is closed
 ---@field floating? FloatingPane Floating pane for this tab (if any)
 
@@ -235,6 +236,7 @@ local POWERLINE_SYMBOLS = {
 
 ---@class PriseNavigationConfig
 ---@field remember_focus? boolean Remember last-focused child when navigating into a split (default: false)
+---@field persist_zoom? boolean Preserve zoom state when switching tabs (default: false)
 
 ---@class PriseFloatingConfig
 ---@field width? number Width in columns (default: 100)
@@ -308,6 +310,7 @@ local config = {
     },
     navigation = {
         remember_focus = false, -- When true, navigating into a split remembers which child had focus
+        persist_zoom = false, -- When true, zoom state is preserved when switching tabs
     },
     floating = {
         width = 100,
@@ -950,21 +953,33 @@ local function set_active_tab_index(new_index)
         return
     end
 
-    -- Clear zoom when switching tabs
-    state.zoomed_pane_id = nil
-
     local old_tab = state.tabs[state.active_tab]
     local old_focused = state.focused_id
 
-    -- Remember focus in old tab
+    -- Remember focus in old tab (and zoom if configured)
     if old_tab then
         old_tab.last_focused_id = state.focused_id
+        if config.navigation.persist_zoom then
+            old_tab.last_zoomed_id = state.zoomed_pane_id
+        end
     end
 
     state.active_tab = new_index
     local new_tab = state.tabs[new_index]
     if not new_tab then
+        state.zoomed_pane_id = nil
         return
+    end
+
+    -- Restore zoom state from new tab if configured, otherwise clear it
+    if config.navigation.persist_zoom then
+        local restored_zoom_id = new_tab.last_zoomed_id
+        if restored_zoom_id and not find_node_path(new_tab.root, restored_zoom_id) then
+            restored_zoom_id = nil
+        end
+        state.zoomed_pane_id = restored_zoom_id
+    else
+        state.zoomed_pane_id = nil
     end
 
     -- Pick new focused pane in this tab
