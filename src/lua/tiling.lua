@@ -69,6 +69,14 @@ local utils = require("utils")
 ---@field pending boolean Whether a floating pane spawn is pending
 ---@field resize_mode boolean Whether resize mode is active (shows size indicator)
 
+---@class CopyModeState
+---@field active boolean Whether copy mode is active
+---@field cursor_row integer Cursor row in viewport coordinates
+---@field cursor_col integer Cursor column in viewport coordinates
+---@field selecting boolean Whether visual selection is active
+---@field select_start_row? integer Start row of selection (viewport coords)
+---@field select_start_col? integer Start col of selection (viewport coords)
+
 ---@class State
 ---@field tabs Tab[]
 ---@field active_tab integer
@@ -90,6 +98,7 @@ local utils = require("utils")
 ---@field screen_rows number
 ---@field keybind_matcher? KeybindMatcher
 ---@field floating FloatingPaneState
+---@field copy_mode CopyModeState
 
 ---@class Command
 ---@field name string|fun(): string
@@ -356,6 +365,7 @@ local config = {
         ["<leader>f"] = "floating_toggle",
         ["<leader>+"] = "floating_increase_size",
         ["<leader>-"] = "floating_decrease_size",
+        ["<leader>["] = "enter_copy_mode",
     },
     macos_option_as_alt = "false",
 }
@@ -444,6 +454,15 @@ local state = {
         height = 30,
         pending = false,
         resize_mode = false,
+    },
+    -- Copy mode state (vim-style scrolling and selection)
+    copy_mode = {
+        active = false,
+        cursor_row = 0,
+        cursor_col = 0,
+        selecting = false,
+        select_start_row = nil,
+        select_start_col = nil,
     },
 }
 
@@ -1988,6 +2007,10 @@ local open_rename
 ---@type fun()
 local open_session_picker
 
+---Forward declaration for enter_copy_mode
+---@type fun()
+local enter_copy_mode
+
 ---Command palette commands
 ---@type Command[]
 local commands = {
@@ -2372,6 +2395,13 @@ local commands = {
             action_handlers.floating_toggle()
         end,
     },
+    {
+        name = "Enter Copy Mode",
+        shortcut = key_prefix .. " [",
+        action = function()
+            enter_copy_mode()
+        end,
+    },
 }
 
 -- Action handlers for keybind system
@@ -2562,6 +2592,9 @@ action_handlers = {
         state.floating.resize_mode = true
         prise.request_frame()
     end,
+    enter_copy_mode = function()
+        enter_copy_mode()
+    end,
     -- command_palette is added after open_palette is defined
 }
 
@@ -2729,6 +2762,245 @@ local function execute_session_rename()
     close_session_rename()
 end
 
+-- --- Copy Mode ---
+
+---Update the terminal selection to match copy mode cursor state.
+---When not selecting, highlights just the cursor cell.
+---When selecting, highlights from selection start to cursor.
+local function update_copy_mode_selection()
+    local pty = get_focused_pty()
+    if not pty then
+        return
+    end
+
+    if state.copy_mode.selecting and state.copy_mode.select_start_row then
+        pty:select_viewport(
+            state.copy_mode.select_start_row,
+            state.copy_mode.select_start_col,
+            state.copy_mode.cursor_row,
+            state.copy_mode.cursor_col
+        )
+    else
+        -- Highlight just the cursor cell as a single-cell selection
+        pty:select_viewport(
+            state.copy_mode.cursor_row,
+            state.copy_mode.cursor_col,
+            state.copy_mode.cursor_row,
+            state.copy_mode.cursor_col
+        )
+    end
+end
+
+---Enter copy mode: freeze the viewport and show a cursor for navigation
+enter_copy_mode = function()
+    local pty = get_focused_pty()
+    if not pty then
+        return
+    end
+    local size = pty:size()
+    -- Place cursor in the center of the viewport
+    state.copy_mode = {
+        active = true,
+        cursor_row = math.floor(size.rows / 2),
+        cursor_col = 0,
+        selecting = false,
+        select_start_row = nil,
+        select_start_col = nil,
+    }
+    -- Show cursor position immediately as a single-cell selection
+    update_copy_mode_selection()
+    prise.request_frame()
+end
+
+---Exit copy mode: scroll back to bottom and clear any selection
+local function exit_copy_mode()
+    if not state.copy_mode.active then
+        return
+    end
+    local pty = get_focused_pty()
+    if pty then
+        pty:scroll_viewport("bottom")
+        pty:clear_selection()
+    end
+    state.copy_mode = {
+        active = false,
+        cursor_row = 0,
+        cursor_col = 0,
+        selecting = false,
+        select_start_row = nil,
+        select_start_col = nil,
+    }
+    prise.request_frame()
+end
+
+---Handle a key press while in copy mode
+---@param key_data PtyKeyData
+---@return boolean handled
+local function handle_copy_mode_key(key_data)
+    local k = key_data.key
+    local ctrl = key_data.ctrl
+    local shift = key_data.shift
+    local pty = get_focused_pty()
+    if not pty then
+        exit_copy_mode()
+        return true
+    end
+
+    local size = pty:size()
+    local max_row = size.rows - 1
+    local max_col = size.cols - 1
+
+    -- Exit copy mode
+    if k == "Escape" or k == "q" then
+        exit_copy_mode()
+        return true
+    end
+
+    -- Movement: h j k l
+    if k == "h" then
+        state.copy_mode.cursor_col = math.max(0, state.copy_mode.cursor_col - 1)
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    elseif k == "l" then
+        state.copy_mode.cursor_col = math.min(max_col, state.copy_mode.cursor_col + 1)
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    elseif k == "j" then
+        if state.copy_mode.cursor_row < max_row then
+            state.copy_mode.cursor_row = state.copy_mode.cursor_row + 1
+        else
+            -- At bottom of viewport, scroll down
+            pty:scroll_viewport(1)
+        end
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    elseif k == "k" then
+        if state.copy_mode.cursor_row > 0 then
+            state.copy_mode.cursor_row = state.copy_mode.cursor_row - 1
+        else
+            -- At top of viewport, scroll up
+            pty:scroll_viewport(-1)
+        end
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Word movement: w (next word), b (prev word), e (end of word)
+    if k == "w" then
+        state.copy_mode.cursor_col = math.min(max_col, state.copy_mode.cursor_col + 5)
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    elseif k == "b" then
+        state.copy_mode.cursor_col = math.max(0, state.copy_mode.cursor_col - 5)
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Line start/end: 0 and $
+    if k == "0" then
+        state.copy_mode.cursor_col = 0
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    elseif k == "$" or (k == "4" and shift) then
+        state.copy_mode.cursor_col = max_col
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Half-page scroll: Ctrl+u (up), Ctrl+d (down)
+    if k == "u" and ctrl then
+        local half = math.floor(size.rows / 2)
+        pty:scroll_viewport(-half)
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    elseif k == "d" and ctrl then
+        local half = math.floor(size.rows / 2)
+        pty:scroll_viewport(half)
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Full-page scroll: Ctrl+b (up), Ctrl+f (down)
+    if k == "b" and ctrl then
+        pty:scroll_viewport(-size.rows)
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    elseif k == "f" and ctrl then
+        pty:scroll_viewport(size.rows)
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Jump to top/bottom: g/G
+    if k == "g" and not ctrl then
+        pty:scroll_viewport("top")
+        state.copy_mode.cursor_row = 0
+        state.copy_mode.cursor_col = 0
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    elseif k == "G" or (k == "g" and shift) then
+        pty:scroll_viewport("bottom")
+        state.copy_mode.cursor_row = max_row
+        state.copy_mode.cursor_col = 0
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Visual selection toggle: v
+    if k == "v" and not ctrl then
+        if state.copy_mode.selecting then
+            -- Cancel selection
+            state.copy_mode.selecting = false
+            state.copy_mode.select_start_row = nil
+            state.copy_mode.select_start_col = nil
+            pty:clear_selection()
+        else
+            -- Start selection at current cursor position
+            state.copy_mode.selecting = true
+            state.copy_mode.select_start_row = state.copy_mode.cursor_row
+            state.copy_mode.select_start_col = state.copy_mode.cursor_col
+        end
+        prise.request_frame()
+        return true
+    end
+
+    -- Yank (copy) selection: y
+    if k == "y" then
+        if state.copy_mode.selecting then
+            -- Copy the selection to clipboard and exit copy mode
+            pty:copy_selection()
+            exit_copy_mode()
+        end
+        return true
+    end
+
+    -- Enter also copies selection and exits
+    if k == "Enter" then
+        if state.copy_mode.selecting then
+            pty:copy_selection()
+        end
+        exit_copy_mode()
+        return true
+    end
+
+    -- Consume all other keys in copy mode (don't pass to PTY)
+    return true
+end
+
 -- --- Main Functions ---
 
 ---@param event Event
@@ -2843,6 +3115,12 @@ function M.update(event)
         prise.request_frame()
         prise.save() -- Auto-save on pane added
     elseif event.type == "key_press" then
+        -- Handle copy mode (intercepts all keys when active)
+        if state.copy_mode.active then
+            handle_copy_mode_key(event.data)
+            return
+        end
+
         -- Handle command palette
         if state.palette.visible then
             ---@type string
@@ -4169,9 +4447,23 @@ end
 ---Build the powerline-style status bar
 ---@return table
 local function build_status_bar()
-    local mode_color = state.pending_command and THEME.mode_command or THEME.mode_normal
+    local mode_color
     local session_name = (prise.get_session_name() or "prise"):upper()
-    local mode_text = state.pending_command and " CMD " or (" " .. session_name .. " ")
+    local mode_text
+    if state.copy_mode.active then
+        mode_color = THEME.yellow
+        if state.copy_mode.selecting then
+            mode_text = " VISUAL "
+        else
+            mode_text = " COPY "
+        end
+    elseif state.pending_command then
+        mode_color = THEME.mode_command
+        mode_text = " CMD "
+    else
+        mode_color = THEME.mode_normal
+        mode_text = " " .. session_name .. " "
+    end
 
     -- Get current time
     local time_str = prise.get_time()

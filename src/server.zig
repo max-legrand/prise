@@ -1351,6 +1351,12 @@ const Client = struct {
             try self.handleFocusEvent(notif);
         } else if (std.mem.eql(u8, notif.method, "color_response")) {
             try self.handleColorResponse(notif);
+        } else if (std.mem.eql(u8, notif.method, "scroll_viewport")) {
+            try self.handleScrollViewport(notif);
+        } else if (std.mem.eql(u8, notif.method, "select_viewport")) {
+            try self.handleSelectViewport(notif);
+        } else if (std.mem.eql(u8, notif.method, "clear_selection_notify")) {
+            try self.handleClearSelectionNotify(notif);
         }
     }
 
@@ -1715,6 +1721,124 @@ const Client = struct {
                 log.err("Write to PTY failed: {}", .{err});
             };
         }
+    }
+
+    /// Scroll viewport by a delta (positive = down, negative = up) or to top/bottom.
+    fn handleScrollViewport(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 2) {
+            log.warn("scroll_viewport notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("scroll_viewport notification: invalid pty_id type", .{});
+            return;
+        };
+
+        const pty_instance = self.server.ptys.get(pty_id) orelse {
+            log.warn("scroll_viewport notification: PTY {} not found", .{pty_id});
+            return;
+        };
+
+        pty_instance.terminal_mutex.lock();
+        defer pty_instance.terminal_mutex.unlock();
+
+        // Second param: integer delta, or string "top"/"bottom"
+        const param = notif.params.array[1];
+        if (param == .string) {
+            if (std.mem.eql(u8, param.string, "top")) {
+                pty_instance.terminal.scrollViewport(.top) catch |err| {
+                    log.err("Failed to scroll viewport: {}", .{err});
+                };
+            } else if (std.mem.eql(u8, param.string, "bottom")) {
+                pty_instance.terminal.scrollViewport(.bottom) catch |err| {
+                    log.err("Failed to scroll viewport: {}", .{err});
+                };
+            }
+        } else {
+            const delta: isize = switch (param) {
+                .integer => |i| @intCast(i),
+                .unsigned => |u| @intCast(u),
+                else => return,
+            };
+            if (delta != 0) {
+                pty_instance.terminal.scrollViewport(.{ .delta = delta }) catch |err| {
+                    log.err("Failed to scroll viewport: {}", .{err});
+                };
+            }
+        }
+        _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
+    }
+
+    /// Set selection on a PTY by viewport coordinates.
+    /// Params: [pty_id, start_row, start_col, end_row, end_col]
+    fn handleSelectViewport(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 5) {
+            log.warn("select_viewport notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("select_viewport notification: invalid pty_id type", .{});
+            return;
+        };
+
+        const pty_instance = self.server.ptys.get(pty_id) orelse {
+            log.warn("select_viewport notification: PTY {} not found", .{pty_id});
+            return;
+        };
+
+        const start_row = parseU16(notif.params.array[1]) orelse return;
+        const start_col = parseU16(notif.params.array[2]) orelse return;
+        const end_row = parseU16(notif.params.array[3]) orelse return;
+        const end_col = parseU16(notif.params.array[4]) orelse return;
+
+        pty_instance.terminal_mutex.lock();
+        defer pty_instance.terminal_mutex.unlock();
+
+        const screen = pty_instance.terminal.screens.active;
+        const clamped_start_col = @min(start_col, pty_instance.terminal.cols -| 1);
+        const clamped_start_row = @min(start_row, pty_instance.terminal.rows -| 1);
+        const clamped_end_col = @min(end_col, pty_instance.terminal.cols -| 1);
+        const clamped_end_row = @min(end_row, pty_instance.terminal.rows -| 1);
+
+        const start_pin = screen.pages.pin(.{ .viewport = .{
+            .x = clamped_start_col,
+            .y = clamped_start_row,
+        } }) orelse return;
+
+        const end_pin = screen.pages.pin(.{ .viewport = .{
+            .x = clamped_end_col,
+            .y = clamped_end_row,
+        } }) orelse return;
+
+        const sel = ghostty_vt.Selection.init(start_pin, end_pin, false);
+        screen.select(sel) catch {};
+        _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
+    }
+
+    /// Clear selection on a PTY (notification variant).
+    fn handleClearSelectionNotify(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 1) {
+            log.warn("clear_selection_notify notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("clear_selection_notify notification: invalid pty_id type", .{});
+            return;
+        };
+
+        const pty_instance = self.server.ptys.get(pty_id) orelse {
+            log.warn("clear_selection_notify notification: PTY {} not found", .{pty_id});
+            return;
+        };
+
+        pty_instance.terminal_mutex.lock();
+        const screen = pty_instance.terminal.screens.active;
+        screen.select(null) catch {};
+        pty_instance.terminal_mutex.unlock();
+        _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
     }
 
     /// Resize PTY and update terminal dimensions.

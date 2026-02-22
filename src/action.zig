@@ -68,6 +68,9 @@ pub const Action = union(enum) {
     floating_increase_size,
     floating_decrease_size,
 
+    // Copy mode (vim-style scrolling and selection)
+    enter_copy_mode,
+
     // Lua function reference (registry ref)
     lua_function: i32,
 
@@ -142,6 +145,7 @@ pub const Action = union(enum) {
             .floating_toggle => "Toggle Floating Pane",
             .floating_increase_size => "Floating Pane: Increase Size",
             .floating_decrease_size => "Floating Pane: Decrease Size",
+            .enter_copy_mode => "Enter Copy Mode",
             .lua_function => null,
         };
     }

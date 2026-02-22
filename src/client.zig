@@ -2341,6 +2341,24 @@ pub const App = struct {
                                                         };
                                                     }
                                                 }.appGetCellSize,
+                                                .scroll_viewport_fn = struct {
+                                                    fn appScrollViewport(ctx: *anyopaque, id: u32, delta: lua_event.ScrollDelta) anyerror!void {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
+                                                        try self.scrollViewport(id, delta);
+                                                    }
+                                                }.appScrollViewport,
+                                                .select_viewport_fn = struct {
+                                                    fn appSelectViewport(ctx: *anyopaque, id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
+                                                        try self.selectViewport(id, start_row, start_col, end_row, end_col);
+                                                    }
+                                                }.appSelectViewport,
+                                                .clear_selection_fn = struct {
+                                                    fn appClearSelection(ctx: *anyopaque, id: u32) anyerror!void {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
+                                                        try self.clearSelectionNotify(id);
+                                                    }
+                                                }.appClearSelection,
                                             },
                                         }) catch |err| {
                                             log.err("Failed to update UI with pty_attach: {}", .{err});
@@ -2661,6 +2679,69 @@ pub const App = struct {
         defer self.allocator.free(msg);
 
         try self.sendDirect(msg);
+    }
+
+    /// Send a scroll_viewport notification to the server.
+    pub fn scrollViewport(self: *App, pty_id: u32, delta: lua_event.ScrollDelta) !void {
+        var params = try self.allocator.alloc(msgpack.Value, 2);
+        defer self.allocator.free(params);
+        params[0] = .{ .unsigned = pty_id };
+        params[1] = switch (delta) {
+            .delta => |d| msgpack.Value{ .integer = @intCast(d) },
+            .top => msgpack.Value{ .string = "top" },
+            .bottom => msgpack.Value{ .string = "bottom" },
+        };
+
+        var arr = try self.allocator.alloc(msgpack.Value, 3);
+        defer self.allocator.free(arr);
+        arr[0] = .{ .unsigned = 2 }; // notification
+        arr[1] = .{ .string = "scroll_viewport" };
+        arr[2] = .{ .array = params };
+
+        const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+        defer self.allocator.free(encoded_msg);
+
+        try self.sendDirect(encoded_msg);
+    }
+
+    /// Send a select_viewport notification to the server.
+    pub fn selectViewport(self: *App, pty_id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) !void {
+        var params = try self.allocator.alloc(msgpack.Value, 5);
+        defer self.allocator.free(params);
+        params[0] = .{ .unsigned = pty_id };
+        params[1] = .{ .unsigned = start_row };
+        params[2] = .{ .unsigned = start_col };
+        params[3] = .{ .unsigned = end_row };
+        params[4] = .{ .unsigned = end_col };
+
+        var arr = try self.allocator.alloc(msgpack.Value, 3);
+        defer self.allocator.free(arr);
+        arr[0] = .{ .unsigned = 2 }; // notification
+        arr[1] = .{ .string = "select_viewport" };
+        arr[2] = .{ .array = params };
+
+        const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+        defer self.allocator.free(encoded_msg);
+
+        try self.sendDirect(encoded_msg);
+    }
+
+    /// Send a clear_selection notification to the server.
+    pub fn clearSelectionNotify(self: *App, pty_id: u32) !void {
+        var params = try self.allocator.alloc(msgpack.Value, 1);
+        defer self.allocator.free(params);
+        params[0] = .{ .unsigned = pty_id };
+
+        var arr = try self.allocator.alloc(msgpack.Value, 3);
+        defer self.allocator.free(arr);
+        arr[0] = .{ .unsigned = 2 }; // notification
+        arr[1] = .{ .string = "clear_selection_notify" };
+        arr[2] = .{ .array = params };
+
+        const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+        defer self.allocator.free(encoded_msg);
+
+        try self.sendDirect(encoded_msg);
     }
 
     fn copyToClipboard(self: *App, text: []const u8) void {
@@ -3252,6 +3333,24 @@ pub const App = struct {
                     };
                 }
             }.getCellSize,
+            .scroll_viewport_fn = struct {
+                fn scrollViewport(app_ctx: *anyopaque, pty_id: u32, delta: lua_event.ScrollDelta) anyerror!void {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+                    try app.scrollViewport(pty_id, delta);
+                }
+            }.scrollViewport,
+            .select_viewport_fn = struct {
+                fn selectViewport(app_ctx: *anyopaque, pty_id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+                    try app.selectViewport(pty_id, start_row, start_col, end_row, end_col);
+                }
+            }.selectViewport,
+            .clear_selection_fn = struct {
+                fn clearSelection(app_ctx: *anyopaque, pty_id: u32) anyerror!void {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+                    try app.clearSelectionNotify(pty_id);
+                }
+            }.clearSelection,
         };
     }
 };

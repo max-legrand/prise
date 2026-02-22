@@ -71,3 +71,17 @@ function Pty:copy_selection() end
 
 ---Capture the current pane content (triggers capture_pane_complete event)
 function Pty:capture_pane() end
+
+---Scroll the viewport by delta lines (positive=down, negative=up) or "top"/"bottom"
+---@param delta integer|string Delta lines or "top"/"bottom"
+function Pty:scroll_viewport(delta) end
+
+---Set selection by viewport coordinates
+---@param start_row integer
+---@param start_col integer
+---@param end_row integer
+---@param end_col integer
+function Pty:select_viewport(start_row, start_col, end_row, end_col) end
+
+---Clear the current selection
+function Pty:clear_selection() end

@@ -30,6 +30,15 @@ pub const PtyAttachInfo = struct {
     copy_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     capture_pane_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     cell_size_fn: *const fn (app: *anyopaque) CellSize,
+    scroll_viewport_fn: *const fn (app: *anyopaque, id: u32, delta: ScrollDelta) anyerror!void,
+    select_viewport_fn: *const fn (app: *anyopaque, id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void,
+    clear_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
+};
+
+pub const ScrollDelta = union(enum) {
+    delta: isize,
+    top: void,
+    bottom: void,
 };
 
 pub const PtyExitedInfo = struct {
@@ -147,6 +156,9 @@ fn pushPtyAttachEvent(lua: *ziglua.Lua, info: PtyAttachInfo) void {
         .copy_selection_fn = info.copy_selection_fn,
         .capture_pane_fn = info.capture_pane_fn,
         .cell_size_fn = info.cell_size_fn,
+        .scroll_viewport_fn = info.scroll_viewport_fn,
+        .select_viewport_fn = info.select_viewport_fn,
+        .clear_selection_fn = info.clear_selection_fn,
     };
 
     _ = lua.getMetatableRegistry("PrisePty");
@@ -413,6 +425,9 @@ const PtyHandle = struct {
     copy_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     capture_pane_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     cell_size_fn: *const fn (app: *anyopaque) CellSize,
+    scroll_viewport_fn: *const fn (app: *anyopaque, id: u32, delta: ScrollDelta) anyerror!void,
+    select_viewport_fn: *const fn (app: *anyopaque, id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void,
+    clear_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
 };
 
 fn ptyIndex(lua: *ziglua.Lua) i32 {
@@ -459,6 +474,18 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
     }
     if (std.mem.eql(u8, key, "capture_pane")) {
         lua.pushFunction(ziglua.wrap(ptyCapturePaneRequest));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "scroll_viewport")) {
+        lua.pushFunction(ziglua.wrap(ptyScrollViewport));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "select_viewport")) {
+        lua.pushFunction(ziglua.wrap(ptySelectViewport));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "clear_selection")) {
+        lua.pushFunction(ziglua.wrap(ptyClearSelection));
         return 1;
     }
     return 0;
@@ -515,6 +542,51 @@ fn ptyCapturePaneRequest(lua: *ziglua.Lua) i32 {
     log.info("ptyCapturePaneRequest: calling capture_pane_fn for pty {}", .{pty.id});
     pty.capture_pane_fn(pty.app, pty.id) catch |err| {
         log.err("Failed to capture pane: {}", .{err});
+    };
+    return 0;
+}
+
+/// pty:scroll_viewport(delta) - delta is integer, or "top"/"bottom" string
+fn ptyScrollViewport(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+
+    const scroll_delta: ScrollDelta = blk: {
+        if (lua.typeOf(2) == .string) {
+            const str = lua.toString(2) catch "";
+            if (std.mem.eql(u8, str, "top")) break :blk .top;
+            if (std.mem.eql(u8, str, "bottom")) break :blk .bottom;
+            break :blk .{ .delta = 0 };
+        } else {
+            const d = lua.checkInteger(2);
+            break :blk .{ .delta = @intCast(d) };
+        }
+    };
+
+    pty.scroll_viewport_fn(pty.app, pty.id, scroll_delta) catch |err| {
+        log.err("Failed to scroll viewport: {}", .{err});
+    };
+    return 0;
+}
+
+/// pty:select_viewport(start_row, start_col, end_row, end_col)
+fn ptySelectViewport(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const start_row: u16 = @intCast(lua.checkInteger(2));
+    const start_col: u16 = @intCast(lua.checkInteger(3));
+    const end_row: u16 = @intCast(lua.checkInteger(4));
+    const end_col: u16 = @intCast(lua.checkInteger(5));
+
+    pty.select_viewport_fn(pty.app, pty.id, start_row, start_col, end_row, end_col) catch |err| {
+        log.err("Failed to select viewport: {}", .{err});
+    };
+    return 0;
+}
+
+/// pty:clear_selection()
+fn ptyClearSelection(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    pty.clear_selection_fn(pty.app, pty.id) catch |err| {
+        log.err("Failed to clear selection: {}", .{err});
     };
     return 0;
 }
@@ -773,6 +845,9 @@ pub fn pushPtyUserdata(
     copy_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     capture_pane_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     cell_size_fn: *const fn (app: *anyopaque) CellSize,
+    scroll_viewport_fn: *const fn (app: *anyopaque, id: u32, delta: ScrollDelta) anyerror!void,
+    select_viewport_fn: *const fn (app: *anyopaque, id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void,
+    clear_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
 ) !void {
     const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
     pty.* = .{
@@ -788,6 +863,9 @@ pub fn pushPtyUserdata(
         .copy_selection_fn = copy_selection_fn,
         .capture_pane_fn = capture_pane_fn,
         .cell_size_fn = cell_size_fn,
+        .scroll_viewport_fn = scroll_viewport_fn,
+        .select_viewport_fn = select_viewport_fn,
+        .clear_selection_fn = clear_selection_fn,
     };
 
     _ = lua.getMetatableRegistry("PrisePty");
