@@ -179,6 +179,7 @@ local POWERLINE_SYMBOLS = {
 ---@field accent? string Accent color
 ---@field green? string Success/connected color
 ---@field yellow? string Warning color
+---@field selection_bg? string Selection/copy mode cursor background color (default: "#264f78")
 
 ---@class PriseTheme
 ---@field mode_normal string
@@ -193,6 +194,7 @@ local POWERLINE_SYMBOLS = {
 ---@field accent string
 ---@field green string
 ---@field yellow string
+---@field selection_bg string
 
 ---@class StatusSegmentStyle
 ---@field fg? string Foreground color (hex string)
@@ -293,6 +295,9 @@ local config = {
         accent = "#89b4fa", -- Blue accent
         green = "#a6e3a1", -- Success/connected
         yellow = "#f9e2af", -- Warning
+
+        -- Selection/copy mode cursor background
+        selection_bg = "#264f78", -- Navy blue (default)
     },
     borders = {
         enabled = false,
@@ -498,6 +503,12 @@ end
 ---@return string
 function M.get_macos_option_as_alt()
     return config.macos_option_as_alt or "false"
+end
+
+---Get the selection background color from theme config
+---@return string hex color string (e.g. "#264f78")
+function M.get_selection_bg_color()
+    return config.theme.selection_bg or "#264f78"
 end
 
 local RESIZE_STEP = 0.05 -- 5% step for keyboard resize

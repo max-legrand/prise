@@ -1136,6 +1136,34 @@ pub const UI = struct {
         return "false";
     }
 
+    /// Query the selection background color from Lua theme config.
+    /// Returns the parsed RGB value, or the default if not configured or invalid.
+    pub fn getSelectionBgColor(self: *UI) [3]u8 {
+        _ = self.lua.getField(ziglua.registry_index, "prise_ui");
+        defer self.lua.pop(1);
+
+        _ = self.lua.getField(-1, "get_selection_bg_color");
+        if (self.lua.typeOf(-1) != .function) {
+            self.lua.pop(1);
+            return Surface.DEFAULT_SELECTION_BG;
+        }
+
+        self.lua.call(.{ .args = 0, .results = 1 });
+        defer self.lua.pop(1);
+
+        const hex = self.lua.toString(-1) catch return Surface.DEFAULT_SELECTION_BG;
+        return parseHexColor(hex) orelse Surface.DEFAULT_SELECTION_BG;
+    }
+
+    /// Parse a hex color string like "#264f78" into an RGB byte array.
+    fn parseHexColor(hex: []const u8) ?[3]u8 {
+        if (hex.len != 7 or hex[0] != '#') return null;
+        const r = std.fmt.parseInt(u8, hex[1..3], 16) catch return null;
+        const g = std.fmt.parseInt(u8, hex[3..5], 16) catch return null;
+        const b = std.fmt.parseInt(u8, hex[5..7], 16) catch return null;
+        return .{ r, g, b };
+    }
+
     pub fn update(self: *UI, event: lua_event.Event) !void {
         _ = self.lua.getField(ziglua.registry_index, "prise_ui");
         defer self.lua.pop(1);

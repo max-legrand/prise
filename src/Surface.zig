@@ -10,12 +10,13 @@ const log = std.log.scoped(.surface);
 
 const Surface = @This();
 
-const SELECTION_BG_COLOR: [3]u8 = .{ 0x26, 0x4f, 0x78 };
+pub const DEFAULT_SELECTION_BG: [3]u8 = .{ 0x26, 0x4f, 0x78 };
 
 pub const TerminalColors = struct {
     fg: ?vaxis.Cell.Color = null,
     bg: ?vaxis.Cell.Color = null,
     cursor: ?vaxis.Cell.Color = null,
+    selection_bg: [3]u8 = DEFAULT_SELECTION_BG,
     palette: [256]?vaxis.Cell.Color = .{null} ** 256,
 
     pub fn isDark(rgb: [3]u8) bool {
@@ -600,7 +601,7 @@ pub fn render(self: *const Surface, win: vaxis.Window, focused: bool, colors: ?*
             var cell = self.front.readCell(@intCast(col), @intCast(row)) orelse continue;
 
             if (self.isCellSelected(@intCast(row), @intCast(col))) {
-                cell.style.bg = .{ .rgb = SELECTION_BG_COLOR };
+                cell.style.bg = .{ .rgb = self.colors.selection_bg };
             }
 
             if (dim_factor > 0.0) {

@@ -730,6 +730,9 @@ pub const App = struct {
         }
         log.info("Lua UI initialized", .{});
 
+        // Apply selection background color from Lua theme config
+        app.colors.selection_bg = app.ui.getSelectionBgColor();
+
         // Create pipe for TTY thread -> Main thread communication
         const fds = posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true }) catch |err| {
             return .{ .err = .{ .err = err, .lua_msg = null } };
