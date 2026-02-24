@@ -85,3 +85,19 @@ function Pty:select_viewport(start_row, start_col, end_row, end_col) end
 
 ---Clear the current selection
 function Pty:clear_selection() end
+
+---Get the text content of a viewport row
+---@param row integer Row number (0-indexed)
+---@return string
+function Pty:get_viewport_text(row) end
+
+---Get the terminal cursor position (from the front buffer)
+---@return { row: integer, col: integer }
+function Pty:cursor_position() end
+
+---Set search highlight regions for rendering
+---@param highlights { row: integer, col: integer, len: integer }[]
+function Pty:set_search_highlights(highlights) end
+
+---Clear all search highlight regions
+function Pty:clear_search_highlights() end

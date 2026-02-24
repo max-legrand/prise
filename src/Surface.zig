@@ -11,6 +11,15 @@ const log = std.log.scoped(.surface);
 const Surface = @This();
 
 pub const DEFAULT_SELECTION_BG: [3]u8 = .{ 0x26, 0x4f, 0x78 };
+/// Color for search match highlights (orange/amber tone to distinguish from selection)
+pub const SEARCH_HIGHLIGHT_BG: [3]u8 = .{ 0x6e, 0x4b, 0x15 };
+pub const MAX_SEARCH_HIGHLIGHTS = 256;
+
+pub const SearchHighlight = struct {
+    row: u16,
+    col: u16,
+    len: u16,
+};
 
 pub const TerminalColors = struct {
     fg: ?vaxis.Cell.Color = null,
@@ -69,6 +78,10 @@ selection: ?struct {
     end_row: u16,
     end_col: u16,
 } = null,
+
+// Search highlight regions (set from copy mode search)
+search_highlights: [MAX_SEARCH_HIGHLIGHTS]SearchHighlight = undefined,
+search_highlight_count: u16 = 0,
 
 pub fn init(allocator: std.mem.Allocator, pty_id: u32, rows: u16, cols: u16, colors: TerminalColors) !Surface {
     // Precondition: dimensions must be positive to create valid screen buffers
@@ -138,6 +151,16 @@ pub fn isCellSelected(self: *const Surface, row: u16, col: u16) bool {
         // Middle rows: entire row is selected
         return true;
     }
+}
+
+/// Check if a cell at (row, col) is within any search highlight region
+pub fn isCellSearchHighlighted(self: *const Surface, row: u16, col: u16) bool {
+    for (self.search_highlights[0..self.search_highlight_count]) |hl| {
+        if (row == hl.row and col >= hl.col and col < hl.col + hl.len) {
+            return true;
+        }
+    }
+    return false;
 }
 
 pub fn resize(self: *Surface, rows: u16, cols: u16) !void {
@@ -602,6 +625,8 @@ pub fn render(self: *const Surface, win: vaxis.Window, focused: bool, colors: ?*
 
             if (self.isCellSelected(@intCast(row), @intCast(col))) {
                 cell.style.bg = .{ .rgb = self.colors.selection_bg };
+            } else if (self.isCellSearchHighlighted(@intCast(row), @intCast(col))) {
+                cell.style.bg = .{ .rgb = SEARCH_HIGHLIGHT_BG };
             }
 
             if (dim_factor > 0.0) {

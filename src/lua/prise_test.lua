@@ -23,6 +23,18 @@ local function mock_pty()
         set_focus = function() end,
         close = function() end,
         copy_selection = function() end,
+        capture_pane = function() end,
+        select_viewport = function() end,
+        scroll_viewport = function() end,
+        clear_selection = function() end,
+        get_viewport_text = function()
+            return ""
+        end,
+        cursor_position = function()
+            return { row = 0, col = 0 }
+        end,
+        set_search_highlights = function() end,
+        clear_search_highlights = function() end,
     }
     return pty
 end

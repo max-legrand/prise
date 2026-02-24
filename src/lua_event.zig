@@ -488,6 +488,22 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
         lua.pushFunction(ziglua.wrap(ptyClearSelection));
         return 1;
     }
+    if (std.mem.eql(u8, key, "get_viewport_text")) {
+        lua.pushFunction(ziglua.wrap(ptyGetViewportText));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "cursor_position")) {
+        lua.pushFunction(ziglua.wrap(ptyCursorPosition));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "set_search_highlights")) {
+        lua.pushFunction(ziglua.wrap(ptySetSearchHighlights));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "clear_search_highlights")) {
+        lua.pushFunction(ziglua.wrap(ptyClearSearchHighlights));
+        return 1;
+    }
     return 0;
 }
 
@@ -588,6 +604,103 @@ fn ptyClearSelection(lua: *ziglua.Lua) i32 {
     pty.clear_selection_fn(pty.app, pty.id) catch |err| {
         log.err("Failed to clear selection: {}", .{err});
     };
+    return 0;
+}
+
+/// pty:get_viewport_text(row) - returns the text content of a viewport row as a string
+fn ptyGetViewportText(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const row_raw = lua.checkInteger(2);
+    const row: u16 = if (row_raw < 0) 0 else @intCast(@min(row_raw, std.math.maxInt(u16)));
+
+    if (row >= pty.surface.rows) {
+        _ = lua.pushString("");
+        return 1;
+    }
+
+    // Build the line text by reading each cell's grapheme from the front buffer
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+
+    for (0..pty.surface.cols) |col| {
+        const cell = pty.surface.front.readCell(@intCast(col), row) orelse continue;
+        const grapheme = cell.char.grapheme;
+        if (len + grapheme.len <= buf.len) {
+            @memcpy(buf[len..][0..grapheme.len], grapheme);
+            len += grapheme.len;
+        }
+    }
+
+    // Trim trailing spaces
+    while (len > 0 and buf[len - 1] == ' ') {
+        len -= 1;
+    }
+
+    _ = lua.pushString(buf[0..len]);
+    return 1;
+}
+
+/// pty:cursor_position() - returns { row = cursor_row, col = cursor_col }
+fn ptyCursorPosition(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    lua.createTable(0, 2);
+    lua.pushInteger(@intCast(pty.surface.front.cursor_row));
+    lua.setField(-2, "row");
+    lua.pushInteger(@intCast(pty.surface.front.cursor_col));
+    lua.setField(-2, "col");
+    return 1;
+}
+
+/// pty:set_search_highlights(highlights) - highlights is an array of {row, col, len}
+fn ptySetSearchHighlights(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    lua.checkType(2, .table);
+
+    // Clear existing highlights
+    pty.surface.search_highlight_count = 0;
+
+    // Iterate the array table
+    const table_len = lua.rawLen(2);
+    var i: u32 = 1;
+    while (i <= table_len and pty.surface.search_highlight_count < Surface.MAX_SEARCH_HIGHLIGHTS) : (i += 1) {
+        _ = lua.rawGetIndex(2, @intCast(i));
+        if (lua.typeOf(-1) != .table) {
+            lua.pop(1);
+            continue;
+        }
+
+        _ = lua.getField(-1, "row");
+        const row_val = lua.toInteger(-1) catch 0;
+        lua.pop(1);
+
+        _ = lua.getField(-1, "col");
+        const col_val = lua.toInteger(-1) catch 0;
+        lua.pop(1);
+
+        _ = lua.getField(-1, "len");
+        const len_val = lua.toInteger(-1) catch 0;
+        lua.pop(1);
+
+        lua.pop(1); // pop the inner table
+
+        const idx = pty.surface.search_highlight_count;
+        pty.surface.search_highlights[idx] = .{
+            .row = if (row_val < 0) 0 else @intCast(@min(row_val, std.math.maxInt(u16))),
+            .col = if (col_val < 0) 0 else @intCast(@min(col_val, std.math.maxInt(u16))),
+            .len = if (len_val < 0) 0 else @intCast(@min(len_val, std.math.maxInt(u16))),
+        };
+        pty.surface.search_highlight_count += 1;
+    }
+
+    pty.surface.dirty = true;
+    return 0;
+}
+
+/// pty:clear_search_highlights()
+fn ptyClearSearchHighlights(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    pty.surface.search_highlight_count = 0;
+    pty.surface.dirty = true;
     return 0;
 }
 

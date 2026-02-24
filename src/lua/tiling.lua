@@ -69,6 +69,24 @@ local utils = require("utils")
 ---@field pending boolean Whether a floating pane spawn is pending
 ---@field resize_mode boolean Whether resize mode is active (shows size indicator)
 
+---@class CopyModeSearchMatch
+---@field row integer Absolute line number in scrollback (0-based from top)
+---@field col integer Start column
+---@field len integer Length of match
+
+---@class CopyModeSearchState
+---@field active boolean Whether search input is active
+---@field direction "forward"|"backward" Search direction
+---@field query string Current search query
+---@field input? TextInput Text input for search
+---@field matches CopyModeSearchMatch[] Found matches (absolute line positions)
+---@field match_index integer Current match index (1-based, 0 = none)
+---@field last_query string Last successful search query (for n/N)
+---@field last_direction "forward"|"backward" Last search direction
+---@field scrollback_lines? string[] Full scrollback split into lines (captured on copy mode entry)
+---@field scrollback_total integer Total number of lines in scrollback
+---@field viewport_top integer Absolute line number of the viewport top row
+
 ---@class CopyModeState
 ---@field active boolean Whether copy mode is active
 ---@field cursor_row integer Cursor row in viewport coordinates
@@ -76,6 +94,10 @@ local utils = require("utils")
 ---@field selecting boolean Whether visual selection is active
 ---@field select_start_row? integer Start row of selection (viewport coords)
 ---@field select_start_col? integer Start col of selection (viewport coords)
+---@field count_prefix integer Accumulated count prefix (0 means no count)
+---@field pending_g boolean Whether 'g' key was pressed, waiting for second key
+---@field search CopyModeSearchState Search state
+---@field pty_id? integer PTY ID for matching capture_pane_complete events
 
 ---@class State
 ---@field tabs Tab[]
@@ -468,6 +490,22 @@ local state = {
         selecting = false,
         select_start_row = nil,
         select_start_col = nil,
+        count_prefix = 0,
+        pending_g = false,
+        pty_id = nil,
+        search = {
+            active = false,
+            direction = "forward",
+            query = "",
+            input = nil,
+            matches = {},
+            match_index = 0,
+            last_query = "",
+            last_direction = "forward",
+            scrollback_lines = nil,
+            scrollback_total = 0,
+            viewport_top = 0,
+        },
     },
 }
 
@@ -2802,28 +2840,49 @@ local function update_copy_mode_selection()
     end
 end
 
----Enter copy mode: freeze the viewport and show a cursor for navigation
+---Enter copy mode: freeze the viewport and show a cursor at the terminal's cursor position
 enter_copy_mode = function()
     local pty = get_focused_pty()
     if not pty then
         return
     end
     local size = pty:size()
-    -- Place cursor in the center of the viewport
+    -- Start at the terminal's actual cursor position
+    local cursor = pty:cursor_position()
+    local start_row = math.min(cursor.row, size.rows - 1)
+    local start_col = math.min(cursor.col, size.cols - 1)
     state.copy_mode = {
         active = true,
-        cursor_row = math.floor(size.rows / 2),
-        cursor_col = 0,
+        cursor_row = start_row,
+        cursor_col = start_col,
         selecting = false,
         select_start_row = nil,
         select_start_col = nil,
+        count_prefix = 0,
+        pending_g = false,
+        pty_id = pty:id(),
+        search = {
+            active = false,
+            direction = "forward",
+            query = "",
+            input = nil,
+            matches = {},
+            match_index = 0,
+            last_query = "",
+            last_direction = "forward",
+            scrollback_lines = nil,
+            scrollback_total = 0,
+            viewport_top = 0,
+        },
     }
+    -- Pre-capture scrollback for search
+    pty:capture_pane()
     -- Show cursor position immediately as a single-cell selection
     update_copy_mode_selection()
     prise.request_frame()
 end
 
----Exit copy mode: scroll back to bottom and clear any selection
+---Exit copy mode: scroll back to bottom and clear any selection and highlights
 local function exit_copy_mode()
     if not state.copy_mode.active then
         return
@@ -2832,6 +2891,7 @@ local function exit_copy_mode()
     if pty then
         pty:scroll_viewport("bottom")
         pty:clear_selection()
+        pty:clear_search_highlights()
     end
     state.copy_mode = {
         active = false,
@@ -2840,8 +2900,307 @@ local function exit_copy_mode()
         selecting = false,
         select_start_row = nil,
         select_start_col = nil,
+        count_prefix = 0,
+        pending_g = false,
+        pty_id = nil,
+        search = {
+            active = false,
+            direction = "forward",
+            query = "",
+            input = nil,
+            matches = {},
+            match_index = 0,
+            last_query = "",
+            last_direction = "forward",
+            scrollback_lines = nil,
+            scrollback_total = 0,
+            viewport_top = 0,
+        },
     }
     prise.request_frame()
+end
+
+---Get text content of a viewport row from the PTY surface
+---@param pty Pty
+---@param row integer
+---@return string
+local function get_viewport_line(pty, row)
+    return pty:get_viewport_text(row)
+end
+
+---Find next word start position on the current line (or wrap to next line)
+---@param pty Pty
+---@param row integer Current row
+---@param col integer Current column
+---@param max_row integer Maximum row
+---@param max_col integer Maximum column
+---@return integer row, integer col
+local function find_next_word(pty, row, col, max_row, max_col)
+    local line = get_viewport_line(pty, row)
+    local pos = col + 1 -- convert to 1-based
+    local len = #line
+
+    if pos > len then
+        -- Past end of line, go to next line
+        if row < max_row then
+            return row + 1, 0
+        end
+        return row, col
+    end
+
+    -- Skip current word (non-space characters)
+    while pos <= len and line:sub(pos, pos) ~= " " do
+        pos = pos + 1
+    end
+    -- Skip spaces
+    while pos <= len and line:sub(pos, pos) == " " do
+        pos = pos + 1
+    end
+
+    if pos > len then
+        -- Reached end of line, go to next line start
+        if row < max_row then
+            return row + 1, 0
+        end
+        return row, math.min(max_col, len - 1)
+    end
+
+    return row, pos - 1 -- convert back to 0-based
+end
+
+---Find previous word start position
+---@param pty Pty
+---@param row integer
+---@param col integer
+---@return integer row, integer col
+local function find_prev_word(pty, row, col)
+    local line = get_viewport_line(pty, row)
+    local pos = col + 1 -- 1-based
+
+    if pos <= 1 then
+        -- At start of line, go to previous line
+        if row > 0 then
+            local prev_line = get_viewport_line(pty, row - 1)
+            return row - 1, math.max(0, #prev_line - 1)
+        end
+        return row, col
+    end
+
+    -- Move back one position
+    pos = pos - 1
+    -- Skip spaces backward
+    while pos >= 1 and line:sub(pos, pos) == " " do
+        pos = pos - 1
+    end
+
+    if pos < 1 then
+        if row > 0 then
+            local prev_line = get_viewport_line(pty, row - 1)
+            return row - 1, math.max(0, #prev_line - 1)
+        end
+        return row, 0
+    end
+
+    -- Skip word characters backward
+    while pos > 1 and line:sub(pos - 1, pos - 1) ~= " " do
+        pos = pos - 1
+    end
+
+    return row, pos - 1 -- 0-based
+end
+
+---Find end of current/next word
+---@param pty Pty
+---@param row integer
+---@param col integer
+---@param max_row integer
+---@return integer row, integer col
+local function find_word_end(pty, row, col, max_row)
+    local line = get_viewport_line(pty, row)
+    local pos = col + 1 -- 1-based
+    local len = #line
+
+    -- Move forward at least one
+    pos = pos + 1
+    if pos > len then
+        if row < max_row then
+            local next_line = get_viewport_line(pty, row + 1)
+            -- Skip leading spaces on next line
+            local npos = 1
+            while npos <= #next_line and next_line:sub(npos, npos) == " " do
+                npos = npos + 1
+            end
+            -- Find end of word
+            while npos <= #next_line and next_line:sub(npos, npos) ~= " " do
+                npos = npos + 1
+            end
+            return row + 1, math.max(0, npos - 2) -- 0-based, end of word
+        end
+        return row, math.max(0, len - 1)
+    end
+
+    -- Skip spaces forward
+    while pos <= len and line:sub(pos, pos) == " " do
+        pos = pos + 1
+    end
+    -- Skip to end of word
+    while pos <= len and line:sub(pos, pos) ~= " " do
+        pos = pos + 1
+    end
+
+    return row, math.max(0, pos - 2) -- 0-based, point to last char of word
+end
+
+---Search for pattern across all scrollback lines (if available) or fall back to viewport
+---@param pty Pty
+---@param query string
+---@param max_row integer
+---@return CopyModeSearchMatch[]
+local function search_scrollback(pty, query, max_row)
+    local matches = {}
+    if #query == 0 then
+        return matches
+    end
+
+    -- Escape pattern special characters for plain text search
+    local escaped = query:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+
+    local lines = state.copy_mode.search.scrollback_lines
+    if lines then
+        -- Search through full scrollback (absolute line numbers)
+        for row_idx, line in ipairs(lines) do
+            local start = 1
+            while true do
+                local s, e = line:find(escaped, start)
+                if not s then
+                    break
+                end
+                table.insert(matches, { row = row_idx - 1, col = s - 1, len = e - s + 1 })
+                start = e + 1
+            end
+        end
+    else
+        -- Fallback: search only visible viewport
+        for row = 0, max_row do
+            local line = get_viewport_line(pty, row)
+            local start = 1
+            while true do
+                local s, e = line:find(escaped, start)
+                if not s then
+                    break
+                end
+                table.insert(matches, { row = row, col = s - 1, len = e - s + 1 })
+                start = e + 1
+            end
+        end
+    end
+    return matches
+end
+
+---Convert absolute scrollback matches to viewport-relative highlights and sync to surface
+---Only highlights that are currently visible in the viewport are sent
+---@param pty Pty
+---@param matches CopyModeSearchMatch[]
+local function sync_search_highlights(pty, matches)
+    if #matches == 0 then
+        pty:clear_search_highlights()
+        return
+    end
+
+    local viewport_top = state.copy_mode.search.viewport_top
+    local size = pty:size()
+    local viewport_bottom = viewport_top + size.rows - 1
+
+    local visible_highlights = {}
+    for _, m in ipairs(matches) do
+        if m.row >= viewport_top and m.row <= viewport_bottom then
+            table.insert(visible_highlights, {
+                row = m.row - viewport_top,
+                col = m.col,
+                len = m.len,
+            })
+        end
+    end
+
+    if #visible_highlights == 0 then
+        pty:clear_search_highlights()
+    else
+        pty:set_search_highlights(visible_highlights)
+    end
+end
+
+---Navigate to a search match: scroll viewport so the match is visible, set cursor
+---@param pty Pty
+---@param match CopyModeSearchMatch
+local function navigate_to_match(pty, match)
+    local size = pty:size()
+    local has_scrollback = state.copy_mode.search.scrollback_lines ~= nil
+
+    if has_scrollback then
+        -- Calculate target viewport_top so the match row is centered in the viewport
+        local half = math.floor(size.rows / 2)
+        local target_top = math.max(0, match.row - half)
+        local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
+        target_top = math.min(target_top, max_top)
+
+        -- Scroll to the target position: go to top first, then scroll down
+        pty:scroll_viewport("top")
+        if target_top > 0 then
+            pty:scroll_viewport(target_top)
+        end
+
+        state.copy_mode.search.viewport_top = target_top
+        state.copy_mode.cursor_row = match.row - target_top
+        state.copy_mode.cursor_col = match.col
+    else
+        -- No scrollback data, match rows are viewport-relative
+        state.copy_mode.cursor_row = math.min(match.row, size.rows - 1)
+        state.copy_mode.cursor_col = match.col
+    end
+end
+
+---Get the absolute cursor position (scrollback line number)
+---@return integer absolute_row, integer col
+local function get_absolute_cursor_position()
+    local viewport_top = state.copy_mode.search.viewport_top
+    return viewport_top + state.copy_mode.cursor_row, state.copy_mode.cursor_col
+end
+
+---Find the next match after cursor position (forward search)
+---@param matches CopyModeSearchMatch[]
+---@param cursor_row integer Absolute row in scrollback
+---@param cursor_col integer
+---@return integer match_index (1-based, 0 if none)
+local function find_next_match(matches, cursor_row, cursor_col)
+    for i, m in ipairs(matches) do
+        if m.row > cursor_row or (m.row == cursor_row and m.col > cursor_col) then
+            return i
+        end
+    end
+    -- Wrap around
+    if #matches > 0 then
+        return 1
+    end
+    return 0
+end
+
+---Find the previous match before cursor position (backward search)
+---@param matches CopyModeSearchMatch[]
+---@param cursor_row integer Absolute row in scrollback
+---@param cursor_col integer
+---@return integer match_index (1-based, 0 if none)
+local function find_prev_match(matches, cursor_row, cursor_col)
+    for i = #matches, 1, -1 do
+        local m = matches[i]
+        if m.row < cursor_row or (m.row == cursor_row and m.col < cursor_col) then
+            return i
+        end
+    end
+    -- Wrap around
+    if #matches > 0 then
+        return #matches
+    end
+    return 0
 end
 
 ---Handle a key press while in copy mode
@@ -2861,65 +3220,190 @@ local function handle_copy_mode_key(key_data)
     local max_row = size.rows - 1
     local max_col = size.cols - 1
 
+    -- If search input is active, handle it specially
+    if state.copy_mode.search.active then
+        if k == "Escape" then
+            -- Cancel search
+            state.copy_mode.search.active = false
+            state.copy_mode.search.input = nil
+            prise.request_frame()
+            return true
+        elseif k == "Enter" then
+            -- Execute search
+            local query = state.copy_mode.search.input:text()
+            state.copy_mode.search.active = false
+            state.copy_mode.search.input = nil
+            if #query > 0 then
+                state.copy_mode.search.query = query
+                state.copy_mode.search.last_query = query
+                state.copy_mode.search.last_direction = state.copy_mode.search.direction
+                state.copy_mode.search.matches = search_scrollback(pty, query, max_row)
+                if #state.copy_mode.search.matches > 0 then
+                    local abs_row, abs_col = get_absolute_cursor_position()
+                    local find_fn = state.copy_mode.search.direction == "forward" and find_next_match or find_prev_match
+                    state.copy_mode.search.match_index = find_fn(state.copy_mode.search.matches, abs_row, abs_col)
+                    if state.copy_mode.search.match_index > 0 then
+                        local m = state.copy_mode.search.matches[state.copy_mode.search.match_index]
+                        navigate_to_match(pty, m)
+                    end
+                end
+                sync_search_highlights(pty, state.copy_mode.search.matches)
+            end
+            update_copy_mode_selection()
+            prise.request_frame()
+            return true
+        end
+        -- Delegate all other keys to the text input handler
+        handle_text_input_key(state.copy_mode.search.input, key_data)
+        prise.request_frame()
+        return true
+    end
+
     -- Exit copy mode
     if k == "Escape" or k == "q" then
         exit_copy_mode()
         return true
     end
 
-    -- Movement: h j k l
-    if k == "h" then
-        state.copy_mode.cursor_col = math.max(0, state.copy_mode.cursor_col - 1)
+    -- Handle pending 'g' key
+    if state.copy_mode.pending_g then
+        state.copy_mode.pending_g = false
+        if k == "g" then
+            -- gg = go to top
+            pty:scroll_viewport("top")
+            state.copy_mode.search.viewport_top = 0
+            state.copy_mode.cursor_row = 0
+            state.copy_mode.cursor_col = 0
+            state.copy_mode.count_prefix = 0
+            update_copy_mode_selection()
+            sync_search_highlights(pty, state.copy_mode.search.matches)
+            prise.request_frame()
+            return true
+        end
+        -- g followed by anything else: ignore the g, process the key normally below
+        state.copy_mode.count_prefix = 0
+    end
+
+    -- Accumulate count prefix (digits)
+    -- '0' is special: if we already have a count, it's part of the number; otherwise it's line-start
+    if k:match("^%d$") then
+        local digit = tonumber(k) --[[@as integer]]
+        if digit == 0 and state.copy_mode.count_prefix == 0 then
+            -- '0' with no count prefix = go to line start
+            state.copy_mode.cursor_col = 0
+            update_copy_mode_selection()
+            prise.request_frame()
+            return true
+        end
+        state.copy_mode.count_prefix = state.copy_mode.count_prefix * 10 + digit
+        -- Cap at reasonable maximum
+        if state.copy_mode.count_prefix > 99999 then
+            state.copy_mode.count_prefix = 99999
+        end
+        return true
+    end
+
+    local count = math.max(1, state.copy_mode.count_prefix)
+    state.copy_mode.count_prefix = 0
+
+    -- Movement: h (left)
+    if k == "h" and not shift then
+        state.copy_mode.cursor_col = math.max(0, state.copy_mode.cursor_col - count)
         update_copy_mode_selection()
         prise.request_frame()
         return true
-    elseif k == "l" then
-        state.copy_mode.cursor_col = math.min(max_col, state.copy_mode.cursor_col + 1)
+    end
+
+    -- Movement: l (right)
+    if k == "l" and not shift then
+        state.copy_mode.cursor_col = math.min(max_col, state.copy_mode.cursor_col + count)
         update_copy_mode_selection()
         prise.request_frame()
         return true
-    elseif k == "j" then
-        if state.copy_mode.cursor_row < max_row then
-            state.copy_mode.cursor_row = state.copy_mode.cursor_row + 1
-        else
-            -- At bottom of viewport, scroll down
-            pty:scroll_viewport(1)
+    end
+
+    -- Movement: j (down)
+    if k == "j" then
+        local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
+        for _ = 1, count do
+            if state.copy_mode.cursor_row < max_row then
+                state.copy_mode.cursor_row = state.copy_mode.cursor_row + 1
+            else
+                pty:scroll_viewport(1)
+                state.copy_mode.search.viewport_top = math.min(max_top, state.copy_mode.search.viewport_top + 1)
+            end
         end
         update_copy_mode_selection()
+        sync_search_highlights(pty, state.copy_mode.search.matches)
         prise.request_frame()
         return true
-    elseif k == "k" then
-        if state.copy_mode.cursor_row > 0 then
-            state.copy_mode.cursor_row = state.copy_mode.cursor_row - 1
-        else
-            -- At top of viewport, scroll up
-            pty:scroll_viewport(-1)
+    end
+
+    -- Movement: k (up)
+    if k == "k" then
+        for _ = 1, count do
+            if state.copy_mode.cursor_row > 0 then
+                state.copy_mode.cursor_row = state.copy_mode.cursor_row - 1
+            else
+                pty:scroll_viewport(-1)
+                state.copy_mode.search.viewport_top = math.max(0, state.copy_mode.search.viewport_top - 1)
+            end
+        end
+        update_copy_mode_selection()
+        sync_search_highlights(pty, state.copy_mode.search.matches)
+        prise.request_frame()
+        return true
+    end
+
+    -- Word forward: w
+    if k == "w" and not ctrl then
+        for _ = 1, count do
+            local new_row, new_col =
+                find_next_word(pty, state.copy_mode.cursor_row, state.copy_mode.cursor_col, max_row, max_col)
+            state.copy_mode.cursor_row = new_row
+            state.copy_mode.cursor_col = new_col
         end
         update_copy_mode_selection()
         prise.request_frame()
         return true
     end
 
-    -- Word movement: w (next word), b (prev word), e (end of word)
-    if k == "w" then
-        state.copy_mode.cursor_col = math.min(max_col, state.copy_mode.cursor_col + 5)
-        update_copy_mode_selection()
-        prise.request_frame()
-        return true
-    elseif k == "b" then
-        state.copy_mode.cursor_col = math.max(0, state.copy_mode.cursor_col - 5)
+    -- Word backward: b
+    if k == "b" and not ctrl then
+        for _ = 1, count do
+            local new_row, new_col = find_prev_word(pty, state.copy_mode.cursor_row, state.copy_mode.cursor_col)
+            state.copy_mode.cursor_row = new_row
+            state.copy_mode.cursor_col = new_col
+        end
         update_copy_mode_selection()
         prise.request_frame()
         return true
     end
 
-    -- Line start/end: 0 and $
-    if k == "0" then
-        state.copy_mode.cursor_col = 0
+    -- Word end: e
+    if k == "e" and not ctrl then
+        for _ = 1, count do
+            local new_row, new_col = find_word_end(pty, state.copy_mode.cursor_row, state.copy_mode.cursor_col, max_row)
+            state.copy_mode.cursor_row = new_row
+            state.copy_mode.cursor_col = new_col
+        end
         update_copy_mode_selection()
         prise.request_frame()
         return true
-    elseif k == "$" or (k == "4" and shift) then
+    end
+
+    -- Line start: ^ (first non-blank)
+    if k == "^" or (k == "6" and shift) then
+        local line = get_viewport_line(pty, state.copy_mode.cursor_row)
+        local first_non_blank = line:find("%S")
+        state.copy_mode.cursor_col = first_non_blank and (first_non_blank - 1) or 0
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Line end: $
+    if k == "$" or (k == "4" and shift) then
         state.copy_mode.cursor_col = max_col
         update_copy_mode_selection()
         prise.request_frame()
@@ -2930,13 +3414,19 @@ local function handle_copy_mode_key(key_data)
     if k == "u" and ctrl then
         local half = math.floor(size.rows / 2)
         pty:scroll_viewport(-half)
+        state.copy_mode.search.viewport_top = math.max(0, state.copy_mode.search.viewport_top - half)
         update_copy_mode_selection()
+        sync_search_highlights(pty, state.copy_mode.search.matches)
         prise.request_frame()
         return true
-    elseif k == "d" and ctrl then
+    end
+    if k == "d" and ctrl then
         local half = math.floor(size.rows / 2)
         pty:scroll_viewport(half)
+        local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
+        state.copy_mode.search.viewport_top = math.min(max_top, state.copy_mode.search.viewport_top + half)
         update_copy_mode_selection()
+        sync_search_highlights(pty, state.copy_mode.search.matches)
         prise.request_frame()
         return true
     end
@@ -2944,28 +3434,60 @@ local function handle_copy_mode_key(key_data)
     -- Full-page scroll: Ctrl+b (up), Ctrl+f (down)
     if k == "b" and ctrl then
         pty:scroll_viewport(-size.rows)
+        state.copy_mode.search.viewport_top = math.max(0, state.copy_mode.search.viewport_top - size.rows)
         update_copy_mode_selection()
+        sync_search_highlights(pty, state.copy_mode.search.matches)
         prise.request_frame()
         return true
-    elseif k == "f" and ctrl then
+    end
+    if k == "f" and ctrl then
         pty:scroll_viewport(size.rows)
+        local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
+        state.copy_mode.search.viewport_top = math.min(max_top, state.copy_mode.search.viewport_top + size.rows)
+        update_copy_mode_selection()
+        sync_search_highlights(pty, state.copy_mode.search.matches)
+        prise.request_frame()
+        return true
+    end
+
+    -- g key: start pending g (for gg)
+    if k == "g" and not ctrl and not shift then
+        state.copy_mode.pending_g = true
+        return true
+    end
+
+    -- G: go to bottom
+    if k == "G" or (k == "g" and shift) then
+        pty:scroll_viewport("bottom")
+        local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
+        state.copy_mode.search.viewport_top = max_top
+        state.copy_mode.cursor_row = max_row
+        state.copy_mode.cursor_col = 0
+        update_copy_mode_selection()
+        sync_search_highlights(pty, state.copy_mode.search.matches)
+        prise.request_frame()
+        return true
+    end
+
+    -- H: top of screen
+    if k == "H" or (k == "h" and shift) then
+        state.copy_mode.cursor_row = 0
         update_copy_mode_selection()
         prise.request_frame()
         return true
     end
 
-    -- Jump to top/bottom: g/G
-    if k == "g" and not ctrl then
-        pty:scroll_viewport("top")
-        state.copy_mode.cursor_row = 0
-        state.copy_mode.cursor_col = 0
+    -- M: middle of screen
+    if k == "M" or (k == "m" and shift) then
+        state.copy_mode.cursor_row = math.floor(max_row / 2)
         update_copy_mode_selection()
         prise.request_frame()
         return true
-    elseif k == "G" or (k == "g" and shift) then
-        pty:scroll_viewport("bottom")
+    end
+
+    -- L: bottom of screen
+    if k == "L" or (k == "l" and shift) then
         state.copy_mode.cursor_row = max_row
-        state.copy_mode.cursor_col = 0
         update_copy_mode_selection()
         prise.request_frame()
         return true
@@ -3005,6 +3527,76 @@ local function handle_copy_mode_key(key_data)
             pty:copy_selection()
         end
         exit_copy_mode()
+        return true
+    end
+
+    -- Forward search: /
+    if k == "/" then
+        state.copy_mode.search.active = true
+        state.copy_mode.search.direction = "forward"
+        state.copy_mode.search.input = prise.create_text_input()
+        state.copy_mode.search.matches = {}
+        pty:clear_search_highlights()
+        prise.request_frame()
+        return true
+    end
+
+    -- Backward search: ?
+    if k == "?" then
+        state.copy_mode.search.active = true
+        state.copy_mode.search.direction = "backward"
+        state.copy_mode.search.input = prise.create_text_input()
+        state.copy_mode.search.matches = {}
+        pty:clear_search_highlights()
+        prise.request_frame()
+        return true
+    end
+
+    -- Next match: n
+    if k == "n" and not shift then
+        if #state.copy_mode.search.last_query > 0 then
+            -- Re-search if matches are empty
+            if #state.copy_mode.search.matches == 0 then
+                state.copy_mode.search.matches = search_scrollback(pty, state.copy_mode.search.last_query, max_row)
+            end
+            if #state.copy_mode.search.matches > 0 then
+                local abs_row, abs_col = get_absolute_cursor_position()
+                local find_fn = state.copy_mode.search.last_direction == "forward" and find_next_match
+                    or find_prev_match
+                state.copy_mode.search.match_index = find_fn(state.copy_mode.search.matches, abs_row, abs_col)
+                if state.copy_mode.search.match_index > 0 then
+                    local m = state.copy_mode.search.matches[state.copy_mode.search.match_index]
+                    navigate_to_match(pty, m)
+                end
+            end
+            sync_search_highlights(pty, state.copy_mode.search.matches)
+        end
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Previous match: N (reverse of n)
+    if k == "N" or (k == "n" and shift) then
+        if #state.copy_mode.search.last_query > 0 then
+            if #state.copy_mode.search.matches == 0 then
+                state.copy_mode.search.matches = search_scrollback(pty, state.copy_mode.search.last_query, max_row)
+            end
+            if #state.copy_mode.search.matches > 0 then
+                local abs_row, abs_col = get_absolute_cursor_position()
+                -- Reverse direction from last search
+                local find_fn = state.copy_mode.search.last_direction == "forward" and find_prev_match
+                    or find_next_match
+                state.copy_mode.search.match_index = find_fn(state.copy_mode.search.matches, abs_row, abs_col)
+                if state.copy_mode.search.match_index > 0 then
+                    local m = state.copy_mode.search.matches[state.copy_mode.search.match_index]
+                    navigate_to_match(pty, m)
+                end
+            end
+            sync_search_highlights(pty, state.copy_mode.search.matches)
+        end
+        update_copy_mode_selection()
+        prise.request_frame()
         return true
     end
 
@@ -3731,14 +4323,32 @@ function M.update(event)
         prise.request_frame()
         prise.save() -- Auto-save on cwd change
     elseif event.type == "capture_pane_complete" then
-        -- Pane content captured - emit to user's event handlers
-        -- User can handle this in their config to pipe to editor, fzf, clipboard, etc.
         local pty_id = event.data.pty_id
         local content = event.data.content
         prise.log.info("Pane content captured for pty " .. pty_id .. " (" .. #content .. " bytes)")
-        -- Call user's on_capture_pane_complete handler if defined
-        if M.on_capture_pane_complete then
-            M.on_capture_pane_complete(pty_id, content)
+
+        -- If copy mode is active and this is for our PTY, store scrollback lines for search
+        -- and do NOT forward to the user's handler (it was triggered internally)
+        if state.copy_mode.active and state.copy_mode.pty_id == pty_id then
+            local lines = {}
+            for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+                table.insert(lines, line)
+            end
+            state.copy_mode.search.scrollback_lines = lines
+            state.copy_mode.search.scrollback_total = #lines
+            -- The viewport bottom is at the end of scrollback when we enter copy mode,
+            -- so viewport_top = total_lines - viewport_rows
+            local pty = get_focused_pty()
+            if pty then
+                local size = pty:size()
+                state.copy_mode.search.viewport_top = math.max(0, #lines - size.rows)
+            end
+            prise.log.info("Copy mode scrollback captured: " .. #lines .. " lines")
+        else
+            -- Call user's on_capture_pane_complete handler if defined
+            if M.on_capture_pane_complete then
+                M.on_capture_pane_complete(pty_id, content)
+            end
         end
     end
 end
@@ -3749,7 +4359,10 @@ end
 ---@return table
 local function render_node(node, force_unfocused)
     if is_pane(node) then
-        local is_focused = (node.id == state.focused_id) and not (force_unfocused == true)
+        -- Hide the terminal cursor when copy mode is active so the copy mode cursor is visible
+        local is_focused = (node.id == state.focused_id)
+            and not (force_unfocused == true)
+            and not state.copy_mode.active
         prise.log.debug(
             "render_node: force_unfocused=" .. tostring(force_unfocused) .. " is_focused=" .. tostring(is_focused)
         )
@@ -4468,6 +5081,15 @@ local function build_status_bar()
         else
             mode_text = " COPY "
         end
+        -- Append search match info if we have matches
+        if #state.copy_mode.search.matches > 0 and state.copy_mode.search.match_index > 0 then
+            mode_text = mode_text
+                .. "["
+                .. state.copy_mode.search.match_index
+                .. "/"
+                .. #state.copy_mode.search.matches
+                .. "] "
+        end
     elseif state.pending_command then
         mode_color = THEME.mode_command
         mode_text = " CMD "
@@ -4608,6 +5230,31 @@ local function build_swap_with_index()
     })
 end
 
+---Build the copy mode search bar overlay
+---@return table?
+local function build_copy_mode_search()
+    if not state.copy_mode.active or not state.copy_mode.search.active or not state.copy_mode.search.input then
+        return nil
+    end
+
+    local prompt = state.copy_mode.search.direction == "forward" and "/" or "?"
+    local search_style = { bg = THEME.bg1, fg = THEME.fg_bright }
+    local prompt_style = { bg = THEME.bg1, fg = THEME.yellow, bold = true }
+
+    return prise.Positioned({
+        anchor = "bottom_left",
+        child = prise.Row({
+            children = {
+                prise.Text({ text = prompt, style = prompt_style }),
+                prise.TextInput({
+                    input = state.copy_mode.search.input,
+                    style = search_style,
+                }),
+            },
+        }),
+    })
+end
+
 local function build_floating()
     local tab = get_active_tab()
     if
@@ -4675,7 +5322,7 @@ function M.view()
             local pane = path[#path]
             local terminal = prise.Terminal({
                 pty = pane.pty,
-                focus = not overlay_visible,
+                focus = not overlay_visible and not state.copy_mode.active,
             })
 
             -- Apply borders to zoomed pane if enabled and show_single_pane is true
@@ -4719,6 +5366,12 @@ function M.view()
         table.insert(overlay_children, floating)
     end
 
+    -- Copy mode search bar overlay
+    local copy_mode_search = build_copy_mode_search()
+    if copy_mode_search then
+        table.insert(overlay_children, copy_mode_search)
+    end
+
     local modal = palette or rename or rename_tab or swap_with_index or session_picker
     if modal then
         table.insert(overlay_children, modal)
@@ -4727,8 +5380,8 @@ function M.view()
         })
     end
 
-    -- If we only have floating pane (no modal), use Stack if floating exists
-    if floating then
+    -- If we have floating pane or search overlay (no modal), use Stack
+    if floating or copy_mode_search then
         return prise.Stack({
             children = overlay_children,
         })
