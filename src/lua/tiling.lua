@@ -92,6 +92,7 @@ local utils = require("utils")
 ---@field cursor_row integer Cursor row in viewport coordinates
 ---@field cursor_col integer Cursor column in viewport coordinates
 ---@field selecting boolean Whether visual selection is active
+---@field select_mode? "char"|"line" Visual selection mode (nil when not selecting)
 ---@field select_start_row? integer Start row of selection (viewport coords)
 ---@field select_start_col? integer Start col of selection (viewport coords)
 ---@field count_prefix integer Accumulated count prefix (0 means no count)
@@ -488,6 +489,7 @@ local state = {
         cursor_row = 0,
         cursor_col = 0,
         selecting = false,
+        select_mode = nil,
         select_start_row = nil,
         select_start_col = nil,
         count_prefix = 0,
@@ -2823,12 +2825,20 @@ local function update_copy_mode_selection()
     end
 
     if state.copy_mode.selecting and state.copy_mode.select_start_row then
-        pty:select_viewport(
-            state.copy_mode.select_start_row,
-            state.copy_mode.select_start_col,
-            state.copy_mode.cursor_row,
-            state.copy_mode.cursor_col
-        )
+        if state.copy_mode.select_mode == "line" then
+            -- Line-wise: select full rows from start to cursor
+            local size = pty:size()
+            local max_col = size.cols - 1
+            pty:select_viewport(state.copy_mode.select_start_row, 0, state.copy_mode.cursor_row, max_col)
+        else
+            -- Character-wise: select from start position to cursor position
+            pty:select_viewport(
+                state.copy_mode.select_start_row,
+                state.copy_mode.select_start_col,
+                state.copy_mode.cursor_row,
+                state.copy_mode.cursor_col
+            )
+        end
     else
         -- Highlight just the cursor cell as a single-cell selection
         pty:select_viewport(
@@ -2856,6 +2866,7 @@ enter_copy_mode = function()
         cursor_row = start_row,
         cursor_col = start_col,
         selecting = false,
+        select_mode = nil,
         select_start_row = nil,
         select_start_col = nil,
         count_prefix = 0,
@@ -2898,6 +2909,7 @@ local function exit_copy_mode()
         cursor_row = 0,
         cursor_col = 0,
         selecting = false,
+        select_mode = nil,
         select_start_row = nil,
         select_start_col = nil,
         count_prefix = 0,
@@ -3493,20 +3505,44 @@ local function handle_copy_mode_key(key_data)
         return true
     end
 
-    -- Visual selection toggle: v
-    if k == "v" and not ctrl then
-        if state.copy_mode.selecting then
+    -- Visual character-wise selection toggle: v
+    if k == "v" and not ctrl and not shift then
+        if state.copy_mode.selecting and state.copy_mode.select_mode == "char" then
             -- Cancel selection
             state.copy_mode.selecting = false
+            state.copy_mode.select_mode = nil
             state.copy_mode.select_start_row = nil
             state.copy_mode.select_start_col = nil
             pty:clear_selection()
         else
-            -- Start selection at current cursor position
+            -- Start (or switch to) character-wise selection
             state.copy_mode.selecting = true
+            state.copy_mode.select_mode = "char"
             state.copy_mode.select_start_row = state.copy_mode.cursor_row
             state.copy_mode.select_start_col = state.copy_mode.cursor_col
         end
+        update_copy_mode_selection()
+        prise.request_frame()
+        return true
+    end
+
+    -- Visual line-wise selection toggle: V (Shift+v)
+    if k == "V" or (k == "v" and shift) then
+        if state.copy_mode.selecting and state.copy_mode.select_mode == "line" then
+            -- Cancel selection
+            state.copy_mode.selecting = false
+            state.copy_mode.select_mode = nil
+            state.copy_mode.select_start_row = nil
+            state.copy_mode.select_start_col = nil
+            pty:clear_selection()
+        else
+            -- Start (or switch to) line-wise selection
+            state.copy_mode.selecting = true
+            state.copy_mode.select_mode = "line"
+            state.copy_mode.select_start_row = state.copy_mode.cursor_row
+            state.copy_mode.select_start_col = 0
+        end
+        update_copy_mode_selection()
         prise.request_frame()
         return true
     end
@@ -5076,7 +5112,9 @@ local function build_status_bar()
     local mode_text
     if state.copy_mode.active then
         mode_color = THEME.yellow
-        if state.copy_mode.selecting then
+        if state.copy_mode.selecting and state.copy_mode.select_mode == "line" then
+            mode_text = " V-LINE "
+        elseif state.copy_mode.selecting then
             mode_text = " VISUAL "
         else
             mode_text = " COPY "
