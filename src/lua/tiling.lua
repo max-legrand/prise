@@ -2827,9 +2827,15 @@ local function update_copy_mode_selection()
     if state.copy_mode.selecting and state.copy_mode.select_start_row then
         if state.copy_mode.select_mode == "line" then
             -- Line-wise: select full rows from start to cursor
+            -- Order rows so start gets col 0 and end gets max_col, because
+            -- isCellSelected uses start_col for the top row and end_col for the bottom row
             local size = pty:size()
             local max_col = size.cols - 1
-            pty:select_viewport(state.copy_mode.select_start_row, 0, state.copy_mode.cursor_row, max_col)
+            ---@type integer
+            local start_row = state.copy_mode.select_start_row
+            local top_row = math.min(start_row, state.copy_mode.cursor_row)
+            local bot_row = math.max(start_row, state.copy_mode.cursor_row)
+            pty:select_viewport(top_row, 0, bot_row, max_col)
         else
             -- Character-wise: select from start position to cursor position
             pty:select_viewport(
