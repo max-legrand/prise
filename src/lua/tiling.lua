@@ -234,6 +234,7 @@ local POWERLINE_SYMBOLS = {
 ---@class PriseStatusBarConfig
 ---@field enabled? boolean Show the status bar (default: true)
 ---@field custom_segments? StatusSegment[] Custom segments to display on the right side
+---@field segment_separator_color? string Foreground color for the thin separator between adjacent segments with the same background (hex string, default: theme.fg_dim)
 
 ---Tab info passed to custom render function
 ---@class TabInfo
@@ -5171,10 +5172,24 @@ local function build_status_bar()
             if output and #output > 0 then
                 -- Default styling
                 local seg_style = segment.style or { bg = THEME.bg4, fg = THEME.fg_bright }
-                local sep_style = segment.separator_style or { fg = last_bg, bg = seg_style.bg }
+
+                -- Pick separator character and style based on whether backgrounds match.
+                -- Thin separator (same bg): fg is customizable per-segment or globally.
+                -- Solid arrow (different bg): fg must be last_bg for the powerline effect.
+                local sep_style, sep_char
+                if last_bg == seg_style.bg then
+                    local sep_fg = (segment.separator_style and segment.separator_style.fg)
+                        or config.status_bar.segment_separator_color
+                        or THEME.fg_dim
+                    sep_style = { fg = sep_fg, bg = seg_style.bg }
+                    sep_char = POWERLINE_SYMBOLS.right_thin
+                else
+                    sep_style = { fg = last_bg, bg = seg_style.bg }
+                    sep_char = POWERLINE_SYMBOLS.right_solid
+                end
 
                 -- Add separator
-                table.insert(segments, { text = POWERLINE_SYMBOLS.right_solid, style = sep_style })
+                table.insert(segments, { text = sep_char, style = sep_style })
                 left_width = left_width + 1
                 -- Add segment content
                 local seg_text = " " .. output .. " "
