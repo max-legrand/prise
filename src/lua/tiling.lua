@@ -2816,6 +2816,18 @@ end
 
 -- --- Copy Mode ---
 
+---Adjust the selection start position when the viewport scrolls.
+---When we scroll by `delta` rows (positive = down, negative = up), the viewport
+---moves relative to the buffer, so viewport-relative coordinates must be shifted
+---by the opposite amount to stay pinned to the same absolute buffer position.
+---@param delta integer Scroll delta (positive = viewport moved down)
+local function adjust_selection_for_scroll(delta)
+    if not state.copy_mode.selecting or not state.copy_mode.select_start_row then
+        return
+    end
+    state.copy_mode.select_start_row = state.copy_mode.select_start_row - delta
+end
+
 ---Update the terminal selection to match copy mode cursor state.
 ---When not selecting, highlights just the cursor cell.
 ---When selecting, highlights from selection start to cursor.
@@ -2825,23 +2837,40 @@ local function update_copy_mode_selection()
         return
     end
 
+    local size = pty:size()
+    local max_row = size.rows - 1
+    local max_col = size.cols - 1
+
     if state.copy_mode.selecting and state.copy_mode.select_start_row then
+        -- Clamp selection start to visible viewport range for rendering.
+        -- The raw select_start_row may be outside the viewport after scrolling,
+        -- but the anchor remains pinned at its absolute buffer position.
+        local clamped_start_row = math.max(0, math.min(max_row, state.copy_mode.select_start_row))
+        local clamped_start_col = state.copy_mode.select_start_col or 0
+
+        -- When the selection anchor is above the viewport, the visible selection
+        -- should start at the top-left of the viewport (row 0, col 0).
+        if state.copy_mode.select_start_row < 0 then
+            clamped_start_col = 0
+        end
+        -- When the selection anchor is below the viewport, the visible selection
+        -- should extend to the bottom-right of the viewport.
+        if state.copy_mode.select_start_row > max_row then
+            clamped_start_col = max_col
+        end
+
         if state.copy_mode.select_mode == "line" then
             -- Line-wise: select full rows from start to cursor
             -- Order rows so start gets col 0 and end gets max_col, because
             -- isCellSelected uses start_col for the top row and end_col for the bottom row
-            local size = pty:size()
-            local max_col = size.cols - 1
-            ---@type integer
-            local start_row = state.copy_mode.select_start_row
-            local top_row = math.min(start_row, state.copy_mode.cursor_row)
-            local bot_row = math.max(start_row, state.copy_mode.cursor_row)
+            local top_row = math.min(clamped_start_row, state.copy_mode.cursor_row)
+            local bot_row = math.max(clamped_start_row, state.copy_mode.cursor_row)
             pty:select_viewport(top_row, 0, bot_row, max_col)
         else
             -- Character-wise: select from start position to cursor position
             pty:select_viewport(
-                state.copy_mode.select_start_row,
-                state.copy_mode.select_start_col,
+                clamped_start_row,
+                clamped_start_col,
                 state.copy_mode.cursor_row,
                 state.copy_mode.cursor_col
             )
@@ -3162,6 +3191,8 @@ local function navigate_to_match(pty, match)
         local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
         target_top = math.min(target_top, max_top)
 
+        local old_top = state.copy_mode.search.viewport_top
+
         -- Scroll to the target position: go to top first, then scroll down
         pty:scroll_viewport("top")
         if target_top > 0 then
@@ -3169,6 +3200,7 @@ local function navigate_to_match(pty, match)
         end
 
         state.copy_mode.search.viewport_top = target_top
+        adjust_selection_for_scroll(target_top - old_top)
         state.copy_mode.cursor_row = match.row - target_top
         state.copy_mode.cursor_col = match.col
     else
@@ -3289,8 +3321,11 @@ local function handle_copy_mode_key(key_data)
         state.copy_mode.pending_g = false
         if k == "g" then
             -- gg = go to top
+            local old_top = state.copy_mode.search.viewport_top
             pty:scroll_viewport("top")
             state.copy_mode.search.viewport_top = 0
+            local actual_delta = 0 - old_top
+            adjust_selection_for_scroll(actual_delta)
             state.copy_mode.cursor_row = 0
             state.copy_mode.cursor_col = 0
             state.copy_mode.count_prefix = 0
@@ -3350,6 +3385,7 @@ local function handle_copy_mode_key(key_data)
             else
                 pty:scroll_viewport(1)
                 state.copy_mode.search.viewport_top = math.min(max_top, state.copy_mode.search.viewport_top + 1)
+                adjust_selection_for_scroll(1)
             end
         end
         update_copy_mode_selection()
@@ -3366,6 +3402,7 @@ local function handle_copy_mode_key(key_data)
             else
                 pty:scroll_viewport(-1)
                 state.copy_mode.search.viewport_top = math.max(0, state.copy_mode.search.viewport_top - 1)
+                adjust_selection_for_scroll(-1)
             end
         end
         update_copy_mode_selection()
@@ -3432,8 +3469,11 @@ local function handle_copy_mode_key(key_data)
     -- Half-page scroll: Ctrl+u (up), Ctrl+d (down)
     if k == "u" and ctrl then
         local half = math.floor(size.rows / 2)
+        local old_top = state.copy_mode.search.viewport_top
         pty:scroll_viewport(-half)
         state.copy_mode.search.viewport_top = math.max(0, state.copy_mode.search.viewport_top - half)
+        local actual_delta = state.copy_mode.search.viewport_top - old_top
+        adjust_selection_for_scroll(actual_delta)
         update_copy_mode_selection()
         sync_search_highlights(pty, state.copy_mode.search.matches)
         prise.request_frame()
@@ -3441,9 +3481,12 @@ local function handle_copy_mode_key(key_data)
     end
     if k == "d" and ctrl then
         local half = math.floor(size.rows / 2)
+        local old_top = state.copy_mode.search.viewport_top
         pty:scroll_viewport(half)
         local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
         state.copy_mode.search.viewport_top = math.min(max_top, state.copy_mode.search.viewport_top + half)
+        local actual_delta = state.copy_mode.search.viewport_top - old_top
+        adjust_selection_for_scroll(actual_delta)
         update_copy_mode_selection()
         sync_search_highlights(pty, state.copy_mode.search.matches)
         prise.request_frame()
@@ -3452,17 +3495,23 @@ local function handle_copy_mode_key(key_data)
 
     -- Full-page scroll: Ctrl+b (up), Ctrl+f (down)
     if k == "b" and ctrl then
+        local old_top = state.copy_mode.search.viewport_top
         pty:scroll_viewport(-size.rows)
         state.copy_mode.search.viewport_top = math.max(0, state.copy_mode.search.viewport_top - size.rows)
+        local actual_delta = state.copy_mode.search.viewport_top - old_top
+        adjust_selection_for_scroll(actual_delta)
         update_copy_mode_selection()
         sync_search_highlights(pty, state.copy_mode.search.matches)
         prise.request_frame()
         return true
     end
     if k == "f" and ctrl then
+        local old_top = state.copy_mode.search.viewport_top
         pty:scroll_viewport(size.rows)
         local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
         state.copy_mode.search.viewport_top = math.min(max_top, state.copy_mode.search.viewport_top + size.rows)
+        local actual_delta = state.copy_mode.search.viewport_top - old_top
+        adjust_selection_for_scroll(actual_delta)
         update_copy_mode_selection()
         sync_search_highlights(pty, state.copy_mode.search.matches)
         prise.request_frame()
@@ -3477,9 +3526,12 @@ local function handle_copy_mode_key(key_data)
 
     -- G: go to bottom
     if k == "G" or (k == "g" and shift) then
+        local old_top = state.copy_mode.search.viewport_top
         pty:scroll_viewport("bottom")
         local max_top = math.max(0, state.copy_mode.search.scrollback_total - size.rows)
         state.copy_mode.search.viewport_top = max_top
+        local actual_delta = max_top - old_top
+        adjust_selection_for_scroll(actual_delta)
         state.copy_mode.cursor_row = max_row
         state.copy_mode.cursor_col = 0
         update_copy_mode_selection()
