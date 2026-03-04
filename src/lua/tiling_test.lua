@@ -21,6 +21,7 @@ local function mock_pty(id)
         set_focus = function() end,
         close = function() end,
         copy_selection = function() end,
+        select_screen = function() end,
     }
 end
 

@@ -25,6 +25,7 @@ local function mock_pty()
         copy_selection = function() end,
         capture_pane = function() end,
         select_viewport = function() end,
+        select_screen = function() end,
         scroll_viewport = function() end,
         clear_selection = function() end,
         get_viewport_text = function()

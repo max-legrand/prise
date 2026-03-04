@@ -32,6 +32,7 @@ pub const PtyAttachInfo = struct {
     cell_size_fn: *const fn (app: *anyopaque) CellSize,
     scroll_viewport_fn: *const fn (app: *anyopaque, id: u32, delta: ScrollDelta) anyerror!void,
     select_viewport_fn: *const fn (app: *anyopaque, id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void,
+    select_screen_fn: *const fn (app: *anyopaque, id: u32, start_row: u32, start_col: u16, end_row: u32, end_col: u16) anyerror!void,
     clear_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
 };
 
@@ -158,6 +159,7 @@ fn pushPtyAttachEvent(lua: *ziglua.Lua, info: PtyAttachInfo) void {
         .cell_size_fn = info.cell_size_fn,
         .scroll_viewport_fn = info.scroll_viewport_fn,
         .select_viewport_fn = info.select_viewport_fn,
+        .select_screen_fn = info.select_screen_fn,
         .clear_selection_fn = info.clear_selection_fn,
     };
 
@@ -427,6 +429,7 @@ const PtyHandle = struct {
     cell_size_fn: *const fn (app: *anyopaque) CellSize,
     scroll_viewport_fn: *const fn (app: *anyopaque, id: u32, delta: ScrollDelta) anyerror!void,
     select_viewport_fn: *const fn (app: *anyopaque, id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void,
+    select_screen_fn: *const fn (app: *anyopaque, id: u32, start_row: u32, start_col: u16, end_row: u32, end_col: u16) anyerror!void,
     clear_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
 };
 
@@ -482,6 +485,10 @@ fn ptyIndex(lua: *ziglua.Lua) i32 {
     }
     if (std.mem.eql(u8, key, "select_viewport")) {
         lua.pushFunction(ziglua.wrap(ptySelectViewport));
+        return 1;
+    }
+    if (std.mem.eql(u8, key, "select_screen")) {
+        lua.pushFunction(ziglua.wrap(ptySelectScreen));
         return 1;
     }
     if (std.mem.eql(u8, key, "clear_selection")) {
@@ -594,6 +601,22 @@ fn ptySelectViewport(lua: *ziglua.Lua) i32 {
 
     pty.select_viewport_fn(pty.app, pty.id, start_row, start_col, end_row, end_col) catch |err| {
         log.err("Failed to select viewport: {}", .{err});
+    };
+    return 0;
+}
+
+/// pty:select_screen(start_row, start_col, end_row, end_col)
+/// Like select_viewport but uses absolute screen coordinates (from top of
+/// scrollback) so the selection can span beyond the current viewport.
+fn ptySelectScreen(lua: *ziglua.Lua) i32 {
+    const pty = lua.checkUserdata(PtyHandle, 1, "PrisePty");
+    const start_row: u32 = @intCast(lua.checkInteger(2));
+    const start_col: u16 = @intCast(lua.checkInteger(3));
+    const end_row: u32 = @intCast(lua.checkInteger(4));
+    const end_col: u16 = @intCast(lua.checkInteger(5));
+
+    pty.select_screen_fn(pty.app, pty.id, start_row, start_col, end_row, end_col) catch |err| {
+        log.err("Failed to select screen: {}", .{err});
     };
     return 0;
 }
@@ -960,6 +983,7 @@ pub fn pushPtyUserdata(
     cell_size_fn: *const fn (app: *anyopaque) CellSize,
     scroll_viewport_fn: *const fn (app: *anyopaque, id: u32, delta: ScrollDelta) anyerror!void,
     select_viewport_fn: *const fn (app: *anyopaque, id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void,
+    select_screen_fn: *const fn (app: *anyopaque, id: u32, start_row: u32, start_col: u16, end_row: u32, end_col: u16) anyerror!void,
     clear_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
 ) !void {
     const pty = lua.newUserdata(PtyHandle, @sizeOf(PtyHandle));
@@ -978,6 +1002,7 @@ pub fn pushPtyUserdata(
         .cell_size_fn = cell_size_fn,
         .scroll_viewport_fn = scroll_viewport_fn,
         .select_viewport_fn = select_viewport_fn,
+        .select_screen_fn = select_screen_fn,
         .clear_selection_fn = clear_selection_fn,
     };
 

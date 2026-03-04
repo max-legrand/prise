@@ -1355,6 +1355,8 @@ const Client = struct {
             try self.handleScrollViewport(notif);
         } else if (std.mem.eql(u8, notif.method, "select_viewport")) {
             try self.handleSelectViewport(notif);
+        } else if (std.mem.eql(u8, notif.method, "select_screen")) {
+            try self.handleSelectScreen(notif);
         } else if (std.mem.eql(u8, notif.method, "clear_selection_notify")) {
             try self.handleClearSelectionNotify(notif);
         }
@@ -1817,6 +1819,53 @@ const Client = struct {
         _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
     }
 
+    /// Set selection on a PTY by absolute screen coordinates.
+    /// Uses screen-space coordinates (from top of scrollback) so the
+    /// selection can span beyond the current viewport.
+    /// Params: [pty_id, start_row, start_col, end_row, end_col]
+    fn handleSelectScreen(self: *Client, notif: rpc.Notification) !void {
+        if (notif.params != .array or notif.params.array.len < 5) {
+            log.warn("select_screen notification: invalid params", .{});
+            return;
+        }
+
+        const pty_id = parsePtyId(notif.params.array[0]) orelse {
+            log.warn("select_screen notification: invalid pty_id type", .{});
+            return;
+        };
+
+        const pty_instance = self.server.ptys.get(pty_id) orelse {
+            log.warn("select_screen notification: PTY {} not found", .{pty_id});
+            return;
+        };
+
+        const start_row = parseU32(notif.params.array[1]) orelse return;
+        const start_col = parseU16(notif.params.array[2]) orelse return;
+        const end_row = parseU32(notif.params.array[3]) orelse return;
+        const end_col = parseU16(notif.params.array[4]) orelse return;
+
+        pty_instance.terminal_mutex.lock();
+        defer pty_instance.terminal_mutex.unlock();
+
+        const screen = pty_instance.terminal.screens.active;
+        const clamped_start_col = @min(start_col, pty_instance.terminal.cols -| 1);
+        const clamped_end_col = @min(end_col, pty_instance.terminal.cols -| 1);
+
+        const start_pin = screen.pages.pin(.{ .screen = .{
+            .x = clamped_start_col,
+            .y = start_row,
+        } }) orelse return;
+
+        const end_pin = screen.pages.pin(.{ .screen = .{
+            .x = clamped_end_col,
+            .y = end_row,
+        } }) orelse return;
+
+        const sel = ghostty_vt.Selection.init(start_pin, end_pin, false);
+        screen.select(sel) catch {};
+        _ = posix.write(pty_instance.pipe_fds[1], "x") catch {};
+    }
+
     /// Clear selection on a PTY (notification variant).
     fn handleClearSelectionNotify(self: *Client, notif: rpc.Notification) !void {
         if (notif.params != .array or notif.params.array.len < 1) {
@@ -2129,6 +2178,14 @@ const Client = struct {
 
     /// Parse u16 from msgpack value, returns null if invalid type.
     fn parseU16(val: msgpack.Value) ?u16 {
+        return switch (val) {
+            .unsigned => |u| @intCast(u),
+            .integer => |i| @intCast(i),
+            else => null,
+        };
+    }
+
+    fn parseU32(val: msgpack.Value) ?u32 {
         return switch (val) {
             .unsigned => |u| @intCast(u),
             .integer => |i| @intCast(i),

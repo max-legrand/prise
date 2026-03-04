@@ -2831,6 +2831,9 @@ end
 ---Update the terminal selection to match copy mode cursor state.
 ---When not selecting, highlights just the cursor cell.
 ---When selecting, highlights from selection start to cursor.
+---Uses absolute screen coordinates (via select_screen) so the selection covers
+---the full range even when it extends beyond the current viewport.  Falls back
+---to viewport-relative coordinates before scrollback has been captured.
 local function update_copy_mode_selection()
     local pty = get_focused_pty()
     if not pty then
@@ -2841,48 +2844,66 @@ local function update_copy_mode_selection()
     local max_row = size.rows - 1
     local max_col = size.cols - 1
 
+    -- Once scrollback has been captured we know the absolute viewport_top and
+    -- can use screen-absolute coordinates which survive viewport scrolling.
+    local has_scrollback = state.copy_mode.search.scrollback_lines ~= nil
+    local viewport_top = state.copy_mode.search.viewport_top
+
     if state.copy_mode.selecting and state.copy_mode.select_start_row then
-        -- Clamp selection start to visible viewport range for rendering.
-        -- The raw select_start_row may be outside the viewport after scrolling,
-        -- but the anchor remains pinned at its absolute buffer position.
-        local clamped_start_row = math.max(0, math.min(max_row, state.copy_mode.select_start_row))
-        local clamped_start_col = state.copy_mode.select_start_col or 0
+        if has_scrollback then
+            -- Convert viewport-relative coordinates to absolute screen coordinates.
+            -- select_start_row is viewport-relative (can be negative after scrolling),
+            -- so we add viewport_top to get the absolute screen row.
+            local abs_start_row = viewport_top + state.copy_mode.select_start_row
+            local abs_cursor_row = viewport_top + state.copy_mode.cursor_row
+            local start_col = state.copy_mode.select_start_col or 0
 
-        -- When the selection anchor is above the viewport, the visible selection
-        -- should start at the top-left of the viewport (row 0, col 0).
-        if state.copy_mode.select_start_row < 0 then
-            clamped_start_col = 0
-        end
-        -- When the selection anchor is below the viewport, the visible selection
-        -- should extend to the bottom-right of the viewport.
-        if state.copy_mode.select_start_row > max_row then
-            clamped_start_col = max_col
-        end
-
-        if state.copy_mode.select_mode == "line" then
-            -- Line-wise: select full rows from start to cursor
-            -- Order rows so start gets col 0 and end gets max_col, because
-            -- isCellSelected uses start_col for the top row and end_col for the bottom row
-            local top_row = math.min(clamped_start_row, state.copy_mode.cursor_row)
-            local bot_row = math.max(clamped_start_row, state.copy_mode.cursor_row)
-            pty:select_viewport(top_row, 0, bot_row, max_col)
+            if state.copy_mode.select_mode == "line" then
+                local top_row = math.min(abs_start_row, abs_cursor_row)
+                local bot_row = math.max(abs_start_row, abs_cursor_row)
+                pty:select_screen(top_row, 0, bot_row, max_col)
+            else
+                pty:select_screen(abs_start_row, start_col, abs_cursor_row, state.copy_mode.cursor_col)
+            end
         else
-            -- Character-wise: select from start position to cursor position
+            -- Scrollback not yet captured; use viewport-relative coordinates.
+            -- Clamp selection start to visible viewport range for rendering.
+            local clamped_start_row = math.max(0, math.min(max_row, state.copy_mode.select_start_row))
+            local clamped_start_col = state.copy_mode.select_start_col or 0
+
+            if state.copy_mode.select_start_row < 0 then
+                clamped_start_col = 0
+            end
+            if state.copy_mode.select_start_row > max_row then
+                clamped_start_col = max_col
+            end
+
+            if state.copy_mode.select_mode == "line" then
+                local top_row = math.min(clamped_start_row, state.copy_mode.cursor_row)
+                local bot_row = math.max(clamped_start_row, state.copy_mode.cursor_row)
+                pty:select_viewport(top_row, 0, bot_row, max_col)
+            else
+                pty:select_viewport(
+                    clamped_start_row,
+                    clamped_start_col,
+                    state.copy_mode.cursor_row,
+                    state.copy_mode.cursor_col
+                )
+            end
+        end
+    else
+        if has_scrollback then
+            local abs_cursor_row = viewport_top + state.copy_mode.cursor_row
+            pty:select_screen(abs_cursor_row, state.copy_mode.cursor_col, abs_cursor_row, state.copy_mode.cursor_col)
+        else
+            -- Highlight just the cursor cell as a single-cell selection
             pty:select_viewport(
-                clamped_start_row,
-                clamped_start_col,
+                state.copy_mode.cursor_row,
+                state.copy_mode.cursor_col,
                 state.copy_mode.cursor_row,
                 state.copy_mode.cursor_col
             )
         end
-    else
-        -- Highlight just the cursor cell as a single-cell selection
-        pty:select_viewport(
-            state.copy_mode.cursor_row,
-            state.copy_mode.cursor_col,
-            state.copy_mode.cursor_row,
-            state.copy_mode.cursor_col
-        )
     end
 end
 
@@ -3097,6 +3118,124 @@ local function find_word_end(pty, row, col, max_row)
     end
 
     return row, math.max(0, pos - 2) -- 0-based, point to last char of word
+end
+
+---Bracket pairs for matching (opening -> closing)
+local BRACKETS = {
+    ["("] = ")",
+    ["["] = "]",
+    ["{"] = "}",
+    ["<"] = ">",
+    [")"] = "(",
+    ["]"] = "[",
+    ["}"] = "{",
+    [">"] = "<",
+}
+
+---Get a line of text by absolute row, using scrollback_lines if available,
+---otherwise falling back to viewport.
+---@param pty Pty
+---@param abs_row integer Absolute row (0-based)
+---@param scrollback_lines? string[]
+---@return string
+local function get_line(pty, abs_row, scrollback_lines)
+    if scrollback_lines then
+        local line = scrollback_lines[abs_row + 1] -- 1-based table index
+        return line or ""
+    end
+    return get_viewport_line(pty, abs_row)
+end
+
+---Find the matching bracket for the character at the given absolute row/col.
+---When scrollback_lines is provided, searches the full scrollback buffer using
+---absolute coordinates.  Otherwise searches only the visible viewport.
+---@param pty Pty
+---@param abs_row integer Current row (absolute when scrollback provided, viewport otherwise)
+---@param col integer Current column (0-based)
+---@param max_abs_row integer Maximum searchable row (absolute or viewport)
+---@param scrollback_lines? string[] Full scrollback lines (1-based table)
+---@return integer row, integer col  Matching position in the same coordinate space as input
+local function find_matching_bracket(pty, abs_row, col, max_abs_row, scrollback_lines)
+    local line = get_line(pty, abs_row, scrollback_lines)
+    local char = ""
+    local match_char = nil
+
+    -- If cursor is beyond line length, search the entire line for a bracket
+    if col < #line then
+        char = line:sub(col + 1, col + 1) -- 1-based string index
+        match_char = BRACKETS[char]
+    end
+
+    -- If no bracket at cursor, search forward on current line
+    if not match_char then
+        for i = 1, #line do
+            local c = line:sub(i, i)
+            if BRACKETS[c] then
+                char = c
+                match_char = BRACKETS[c]
+                col = i - 1 -- 0-based
+                break
+            end
+        end
+        if not match_char then
+            return abs_row, col -- No bracket found
+        end
+    end
+
+    local is_opening = char == "(" or char == "[" or char == "{" or char == "<"
+    local depth = 1
+
+    if is_opening then
+        -- Search forward
+        local search_col = col + 2 -- Start after current char (1-based)
+        local search_row = abs_row
+
+        while search_row <= max_abs_row do
+            local search_line = get_line(pty, search_row, scrollback_lines)
+            while search_col <= #search_line do
+                local c = search_line:sub(search_col, search_col)
+                if c == char then
+                    depth = depth + 1
+                elseif c == match_char then
+                    depth = depth - 1
+                    if depth == 0 then
+                        return search_row, search_col - 1 -- 0-based
+                    end
+                end
+                search_col = search_col + 1
+            end
+            search_row = search_row + 1
+            search_col = 1
+        end
+    else
+        -- Search backward
+        local search_col = col - 1 -- Start before current char (0-based)
+        local search_row = abs_row
+
+        while search_row >= 0 do
+            local search_line = get_line(pty, search_row, scrollback_lines)
+            while search_col >= 0 do
+                local c = search_line:sub(search_col + 1, search_col + 1) -- 1-based
+                if c == char then
+                    depth = depth + 1
+                elseif c == match_char then
+                    depth = depth - 1
+                    if depth == 0 then
+                        return search_row, search_col -- 0-based
+                    end
+                end
+                search_col = search_col - 1
+            end
+            search_row = search_row - 1
+            if search_row >= 0 then
+                local prev_line = get_line(pty, search_row, scrollback_lines)
+                search_col = #prev_line > 0 and (#prev_line - 1) or 0
+            end
+        end
+    end
+
+    -- No matching bracket found
+    return abs_row, col
 end
 
 ---Search for pattern across all scrollback lines (if available) or fall back to viewport
@@ -3338,6 +3477,53 @@ local function handle_copy_mode_key(key_data)
         state.copy_mode.count_prefix = 0
     end
 
+    -- Find matching bracket: % (Shift+5)
+    -- Must be before digit count prefix check which would consume "5" with shift
+    if k == "%" or (k == "5" and shift) then
+        local scrollback = state.copy_mode.search.scrollback_lines
+        local viewport_top = state.copy_mode.search.viewport_top
+
+        if scrollback then
+            -- Use absolute coordinates so bracket search spans full scrollback
+            local abs_row = viewport_top + state.copy_mode.cursor_row
+            local max_abs_row = #scrollback - 1
+            local match_row, match_col =
+                find_matching_bracket(pty, abs_row, state.copy_mode.cursor_col, max_abs_row, scrollback)
+
+            -- Scroll viewport if the match is off-screen
+            local viewport_bottom = viewport_top + max_row
+            if match_row < viewport_top or match_row > viewport_bottom then
+                local half = math.floor(size.rows / 2)
+                local target_top = math.max(0, match_row - half)
+                local max_top = math.max(0, #scrollback - size.rows)
+                target_top = math.min(target_top, max_top)
+
+                local old_top = viewport_top
+                pty:scroll_viewport("top")
+                if target_top > 0 then
+                    pty:scroll_viewport(target_top)
+                end
+                state.copy_mode.search.viewport_top = target_top
+                adjust_selection_for_scroll(target_top - old_top)
+                state.copy_mode.cursor_row = match_row - target_top
+            else
+                state.copy_mode.cursor_row = match_row - viewport_top
+            end
+            state.copy_mode.cursor_col = match_col
+        else
+            -- No scrollback captured yet; search viewport only
+            local new_row, new_col =
+                find_matching_bracket(pty, state.copy_mode.cursor_row, state.copy_mode.cursor_col, max_row)
+            state.copy_mode.cursor_row = new_row
+            state.copy_mode.cursor_col = new_col
+        end
+
+        update_copy_mode_selection()
+        sync_search_highlights(pty, state.copy_mode.search.matches)
+        prise.request_frame()
+        return true
+    end
+
     -- Accumulate count prefix (digits)
     -- '0' is special: if we already have a count, it's part of the number; otherwise it's line-start
     if k:match("^%d$") then
@@ -3383,9 +3569,12 @@ local function handle_copy_mode_key(key_data)
             if state.copy_mode.cursor_row < max_row then
                 state.copy_mode.cursor_row = state.copy_mode.cursor_row + 1
             else
+                local old_top = state.copy_mode.search.viewport_top
                 pty:scroll_viewport(1)
                 state.copy_mode.search.viewport_top = math.min(max_top, state.copy_mode.search.viewport_top + 1)
-                adjust_selection_for_scroll(1)
+                if state.copy_mode.search.viewport_top ~= old_top then
+                    adjust_selection_for_scroll(1)
+                end
             end
         end
         update_copy_mode_selection()
@@ -3400,9 +3589,12 @@ local function handle_copy_mode_key(key_data)
             if state.copy_mode.cursor_row > 0 then
                 state.copy_mode.cursor_row = state.copy_mode.cursor_row - 1
             else
+                local old_top = state.copy_mode.search.viewport_top
                 pty:scroll_viewport(-1)
                 state.copy_mode.search.viewport_top = math.max(0, state.copy_mode.search.viewport_top - 1)
-                adjust_selection_for_scroll(-1)
+                if state.copy_mode.search.viewport_top ~= old_top then
+                    adjust_selection_for_scroll(-1)
+                end
             end
         end
         update_copy_mode_selection()
@@ -3540,9 +3732,11 @@ local function handle_copy_mode_key(key_data)
         return true
     end
 
-    -- H: top of screen
+    -- H: first non-blank character of line (like vim's g^)
     if k == "H" or (k == "h" and shift) then
-        state.copy_mode.cursor_row = 0
+        local line = get_viewport_line(pty, state.copy_mode.cursor_row)
+        local first_non_blank = line:find("%S")
+        state.copy_mode.cursor_col = first_non_blank and (first_non_blank - 1) or 0
         update_copy_mode_selection()
         prise.request_frame()
         return true
@@ -3556,9 +3750,16 @@ local function handle_copy_mode_key(key_data)
         return true
     end
 
-    -- L: bottom of screen
+    -- L: last non-blank character of line (like vim's g$)
     if k == "L" or (k == "l" and shift) then
-        state.copy_mode.cursor_row = max_row
+        local line = get_viewport_line(pty, state.copy_mode.cursor_row)
+        -- Find last non-blank character
+        local last_non_blank = line:find("%s*$")
+        if last_non_blank and last_non_blank > 1 then
+            state.copy_mode.cursor_col = last_non_blank - 2 -- Position before trailing whitespace
+        else
+            state.copy_mode.cursor_col = #line > 0 and (#line - 1) or 0
+        end
         update_copy_mode_selection()
         prise.request_frame()
         return true

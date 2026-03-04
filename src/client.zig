@@ -2356,6 +2356,12 @@ pub const App = struct {
                                                         try self.selectViewport(id, start_row, start_col, end_row, end_col);
                                                     }
                                                 }.appSelectViewport,
+                                                .select_screen_fn = struct {
+                                                    fn appSelectScreen(ctx: *anyopaque, id: u32, start_row: u32, start_col: u16, end_row: u32, end_col: u16) anyerror!void {
+                                                        const self: *App = @ptrCast(@alignCast(ctx));
+                                                        try self.selectScreen(id, start_row, start_col, end_row, end_col);
+                                                    }
+                                                }.appSelectScreen,
                                                 .clear_selection_fn = struct {
                                                     fn appClearSelection(ctx: *anyopaque, id: u32) anyerror!void {
                                                         const self: *App = @ptrCast(@alignCast(ctx));
@@ -2721,6 +2727,30 @@ pub const App = struct {
         defer self.allocator.free(arr);
         arr[0] = .{ .unsigned = 2 }; // notification
         arr[1] = .{ .string = "select_viewport" };
+        arr[2] = .{ .array = params };
+
+        const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
+        defer self.allocator.free(encoded_msg);
+
+        try self.sendDirect(encoded_msg);
+    }
+
+    /// Send a select_screen notification to the server.
+    /// Uses absolute screen coordinates (from top of scrollback) so the
+    /// selection can span beyond the current viewport.
+    pub fn selectScreen(self: *App, pty_id: u32, start_row: u32, start_col: u16, end_row: u32, end_col: u16) !void {
+        var params = try self.allocator.alloc(msgpack.Value, 5);
+        defer self.allocator.free(params);
+        params[0] = .{ .unsigned = pty_id };
+        params[1] = .{ .unsigned = start_row };
+        params[2] = .{ .unsigned = start_col };
+        params[3] = .{ .unsigned = end_row };
+        params[4] = .{ .unsigned = end_col };
+
+        var arr = try self.allocator.alloc(msgpack.Value, 3);
+        defer self.allocator.free(arr);
+        arr[0] = .{ .unsigned = 2 }; // notification
+        arr[1] = .{ .string = "select_screen" };
         arr[2] = .{ .array = params };
 
         const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
@@ -3348,6 +3378,12 @@ pub const App = struct {
                     try app.selectViewport(pty_id, start_row, start_col, end_row, end_col);
                 }
             }.selectViewport,
+            .select_screen_fn = struct {
+                fn selectScreen(app_ctx: *anyopaque, pty_id: u32, start_row: u32, start_col: u16, end_row: u32, end_col: u16) anyerror!void {
+                    const app: *App = @ptrCast(@alignCast(app_ctx));
+                    try app.selectScreen(pty_id, start_row, start_col, end_row, end_col);
+                }
+            }.selectScreen,
             .clear_selection_fn = struct {
                 fn clearSelection(app_ctx: *anyopaque, pty_id: u32) anyerror!void {
                     const app: *App = @ptrCast(@alignCast(app_ctx));

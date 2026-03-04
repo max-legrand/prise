@@ -83,6 +83,16 @@ function Pty:scroll_viewport(delta) end
 ---@param end_col integer
 function Pty:select_viewport(start_row, start_col, end_row, end_col) end
 
+---Set selection by absolute screen coordinates (from top of scrollback).
+---Unlike select_viewport, this allows the selection to span beyond the
+---current viewport, which is needed for copying selections that extend
+---into scrollback history.
+---@param start_row integer
+---@param start_col integer
+---@param end_row integer
+---@param end_col integer
+function Pty:select_screen(start_row, start_col, end_row, end_col) end
+
 ---Clear the current selection
 function Pty:clear_selection() end
 

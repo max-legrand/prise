@@ -1253,6 +1253,7 @@ pub const UI = struct {
         cell_size_fn: *const fn (app: *anyopaque) lua_event.CellSize,
         scroll_viewport_fn: *const fn (app: *anyopaque, id: u32, delta: lua_event.ScrollDelta) anyerror!void,
         select_viewport_fn: *const fn (app: *anyopaque, id: u32, start_row: u16, start_col: u16, end_row: u16, end_col: u16) anyerror!void,
+        select_screen_fn: *const fn (app: *anyopaque, id: u32, start_row: u32, start_col: u16, end_row: u32, end_col: u16) anyerror!void,
         clear_selection_fn: *const fn (app: *anyopaque, id: u32) anyerror!void,
     };
 
@@ -1302,7 +1303,7 @@ pub const UI = struct {
         const result = lookup_ctx.lookup_fn(lookup_ctx.ctx, id);
 
         if (result) |r| {
-            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.set_focus_fn, r.close_fn, r.cwd_fn, r.copy_selection_fn, r.capture_pane_fn, r.cell_size_fn, r.scroll_viewport_fn, r.select_viewport_fn, r.clear_selection_fn) catch {
+            lua_event.pushPtyUserdata(lua, id, r.surface, r.app, r.send_key_fn, r.send_mouse_fn, r.send_paste_fn, r.set_focus_fn, r.close_fn, r.cwd_fn, r.copy_selection_fn, r.capture_pane_fn, r.cell_size_fn, r.scroll_viewport_fn, r.select_viewport_fn, r.select_screen_fn, r.clear_selection_fn) catch {
                 lua.pushNil();
             };
         } else {
