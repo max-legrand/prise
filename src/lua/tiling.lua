@@ -4640,6 +4640,11 @@ function M.update(event)
                 state.copy_mode.search.viewport_top = math.max(0, #lines - size.rows)
             end
             prise.log.info("Copy mode scrollback captured: " .. #lines .. " lines")
+            -- Re-render selection using screen-absolute coordinates now that
+            -- viewport_top is known, so the first k/j press doesn't cause a
+            -- visual jump from the stale viewport-relative selection.
+            update_copy_mode_selection()
+            prise.request_frame()
         else
             -- Call user's on_capture_pane_complete handler if defined
             if M.on_capture_pane_complete then
