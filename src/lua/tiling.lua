@@ -5809,6 +5809,12 @@ function M.set_state(saved, pty_lookup)
     prise.request_frame()
 end
 
+---Get the currently focused PTY (or floating pane PTY if visible)
+---@return Pty?
+function M.focused_pty()
+    return get_visible_floating_pty() or get_focused_pty()
+end
+
 ---Queue a spawn for deferred execution (safe to call from event callbacks)
 ---@param opts { command: string[], cwd?: string, new_tab?: boolean, return_to_tab?: boolean }
 function M.spawn_deferred(opts)
