@@ -506,7 +506,12 @@ const Pty = struct {
         };
 
         while (self.running.load(.seq_cst)) {
-            // Tight loop: drain PTY buffer
+            // Tight loop: drain all available PTY output before signalling dirty.
+            // Signalling once after the full drain (rather than after each read)
+            // prevents rendering a partial update where the shell has erased the
+            // prompt line but not yet redrawn it — which causes a visible blank
+            // prompt on split create/close.
+            var should_signal = false;
             while (true) {
                 const n = posix.read(self.process.master, &buffer) catch |err| {
                     if (err == error.WouldBlock) break; // Buffer empty, time to poll
@@ -522,26 +527,27 @@ const Pty = struct {
 
                 // Lock mutex and update terminal state
                 self.terminal_mutex.lock();
+
                 // Parse the data through ghostty-vt to update terminal state
                 stream.nextSlice(buffer[0..n]) catch |err| {
                     log.err("Failed to parse VT sequences: {}", .{err});
                 };
-                // Check synchronized_output while still holding the mutex
-                const should_signal = !self.terminal.modes.get(.synchronized_output);
-                self.terminal_mutex.unlock();
-
-                // Notify main thread by writing to pipe
-                // Ignore EAGAIN (pipe full means already dirty)
-                // Skip signaling during synchronized_output mode (DEC mode 2026) because
-                // the application is in the middle of an atomic update. We'll render when
-                // the mode is cleared, avoiding partial/flickering frames.
-                if (should_signal) {
-                    _ = posix.write(self.pipe_fds[1], "x") catch |err| {
-                        if (err != error.WouldBlock) {
-                            log.err("Failed to signal dirty: {}", .{err});
-                        }
-                    };
+                // Skip signaling during synchronized_output mode (DEC mode 2026)
+                // because the application is in the middle of an atomic update.
+                // We'll render when the mode is cleared, avoiding partial frames.
+                if (!self.terminal.modes.get(.synchronized_output)) {
+                    should_signal = true;
                 }
+                self.terminal_mutex.unlock();
+            }
+
+            // Signal dirty once after draining all available data.
+            if (should_signal) {
+                _ = posix.write(self.pipe_fds[1], "x") catch |err| {
+                    if (err != error.WouldBlock) {
+                        log.err("Failed to signal dirty: {}", .{err});
+                    }
+                };
             }
 
             if (!self.running.load(.seq_cst)) break;
@@ -1942,6 +1948,13 @@ const Client = struct {
                     cols,
                     rows,
                 });
+                // Temporarily disable shell_redraws_prompt to prevent
+                // clearPrompt() from blanking the current line during resize.
+                // In prise's async rendering model the client would render the
+                // cleared state before the shell redraws, showing a blank prompt.
+                // Ghostty's synchronous renderer doesn't have this issue.
+                const saved = pty_instance.terminal.flags.shell_redraws_prompt;
+                pty_instance.terminal.flags.shell_redraws_prompt = false;
                 pty_instance.terminal.resize(
                     pty_instance.allocator,
                     cols,
@@ -1949,6 +1962,7 @@ const Client = struct {
                 ) catch |err| {
                     log.err("Resize terminal failed: {}", .{err});
                 };
+                pty_instance.terminal.flags.shell_redraws_prompt = saved;
                 pty_instance.terminal.screens.active.select(null) catch {};
             }
             // Update pixel dimensions for mouse encoding
@@ -1973,18 +1987,6 @@ const Client = struct {
             }
 
             pty_instance.terminal_mutex.unlock();
-
-            // Send full redraw to client so the resized terminal content is visible
-            // immediately, without waiting for the child process to produce output
-            const msg = buildRedrawMessageFromPty(self.server.allocator, pty_instance, .full) catch |err| {
-                log.warn("resize_pty: failed to build redraw message: {}", .{err});
-                return;
-            };
-            defer self.server.allocator.free(msg);
-
-            self.server.sendRedraw(self.server.loop, pty_instance, msg, self) catch |err| {
-                log.warn("resize_pty: failed to send redraw: {}", .{err});
-            };
 
             log.info("resize_pty: completed for pty={}", .{pty_id});
         } else {
@@ -2590,6 +2592,7 @@ const Server = struct {
     }
 
     fn handleResizePty(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
+        _ = client;
         const args = parseResizePtyParams(params) catch {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
         };
@@ -2631,9 +2634,12 @@ const Server = struct {
                 args.cols,
                 args.rows,
             });
+            const saved = pty_instance.terminal.flags.shell_redraws_prompt;
+            pty_instance.terminal.flags.shell_redraws_prompt = false;
             pty_instance.terminal.resize(pty_instance.allocator, args.cols, args.rows) catch |err| {
                 log.err("Resize terminal failed: {}", .{err});
             };
+            pty_instance.terminal.flags.shell_redraws_prompt = saved;
         }
 
         pty_instance.terminal.width_px = args.x_pixel;
@@ -2656,18 +2662,6 @@ const Server = struct {
         }
 
         pty_instance.terminal_mutex.unlock();
-
-        // Send full redraw to client so the resized terminal content is visible
-        // immediately, without waiting for the child process to produce output
-        const msg = buildRedrawMessageFromPty(self.allocator, pty_instance, .full) catch |err| {
-            log.warn("resize_pty request: failed to build redraw message: {}", .{err});
-            return msgpack.Value.nil;
-        };
-        defer self.allocator.free(msg);
-
-        self.sendRedraw(self.loop, pty_instance, msg, client) catch |err| {
-            log.warn("resize_pty request: failed to send redraw: {}", .{err});
-        };
 
         log.info("Resized PTY {} to {}x{} ({}x{}px)", .{ args.id, args.cols, args.rows, args.x_pixel, args.y_pixel });
         return msgpack.Value.nil;

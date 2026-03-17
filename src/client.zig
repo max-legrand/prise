@@ -680,6 +680,18 @@ pub const App = struct {
     // Auto-save timer for debouncing
     autosave_timer: ?io.Task = null,
 
+    // Focus events queued during a Lua update to be sent after resize
+    // notifications are dispatched in the next render frame. This prevents
+    // the blank-prompt-line bug where a shell receives FocusIn/FocusOut
+    // before the accompanying SIGWINCH, causing a double-redraw at the
+    // wrong terminal size.
+    pending_focus_events: std.ArrayList(PendingFocusEvent) = .empty,
+
+    pub const PendingFocusEvent = struct {
+        pty_id: u32,
+        focused: bool,
+    };
+
     pub const PendingColorQuery = struct {
         pty_id: u32,
         target: ServerAction.ColorQueryTarget.Target,
@@ -817,6 +829,7 @@ pub const App = struct {
         self.pending_attach_cwd.deinit();
         self.pty_id_remap.deinit();
         self.pending_color_queries.deinit(self.allocator);
+        self.pending_focus_events.deinit(self.allocator);
         if (self.current_session_name) |name| {
             self.allocator.free(name);
         }
@@ -1350,6 +1363,20 @@ pub const App = struct {
             .cap_da1 => {
                 self.vx.queries_done.store(true, .unordered);
                 try self.vx.enableDetectedFeatures(self.tty.writer());
+                // Force-enable kitty keyboard if vaxis didn't detect it. Some terminals
+                // (e.g. WezTerm) respond to the CSI ? u capability query with a sequence
+                // that the current vaxis parser misidentifies, so cap_kitty_keyboard is
+                // never fired. Sending the push unconditionally is safe: terminals that
+                // don't support it simply ignore it, and we need it to disambiguate
+                // Ctrl+H from Backspace and to report Ctrl+punctuation sequences.
+                if (!self.vx.state.kitty_keyboard) {
+                    const flags = self.vx.opts.kitty_keyboard_flags;
+                    const flag_int: u5 = @bitCast(flags);
+                    try self.tty.writer().print("\x1b[>{d}u", .{flag_int});
+                    try self.tty.tty_writer.interface.flush();
+                    self.vx.state.kitty_keyboard = true;
+                    log.info("kitty keyboard force-enabled (flags={})", .{flag_int});
+                }
                 // Enable mouse mode (uses pixel coordinates if supported)
                 try self.vx.setMouseMode(self.tty.writer(), true);
                 // Enable bracketed paste mode
@@ -1435,6 +1462,40 @@ pub const App = struct {
 
         try self.sendDirect(msg);
         log.info("Sent resize request id={} for pty={} to {}x{} ({}x{}px)", .{ msgid, pty_id, cols, rows, width_px, height_px });
+    }
+
+    /// Send all queued focus events to the server. Called from render() after
+    /// all resize notifications have been dispatched so the shell receives
+    /// SIGWINCH before FocusIn/FocusOut, preventing a blank prompt line.
+    fn flushPendingFocusEvents(self: *App) void {
+        for (self.pending_focus_events.items) |ev| {
+            var params = self.allocator.alloc(msgpack.Value, 2) catch continue;
+            params[0] = .{ .unsigned = @intCast(ev.pty_id) };
+            params[1] = .{ .boolean = ev.focused };
+
+            var arr = self.allocator.alloc(msgpack.Value, 3) catch {
+                self.allocator.free(params);
+                continue;
+            };
+            arr[0] = .{ .unsigned = 2 };
+            arr[1] = .{ .string = "focus_event" };
+            arr[2] = .{ .array = params };
+
+            const encoded_msg = msgpack.encodeFromValue(self.allocator, .{ .array = arr }) catch {
+                self.allocator.free(arr);
+                self.allocator.free(params);
+                continue;
+            };
+            defer self.allocator.free(encoded_msg);
+            self.allocator.free(arr);
+            self.allocator.free(params);
+
+            self.sendDirect(encoded_msg) catch |err| {
+                log.err("Failed to send focus_event: {}", .{err});
+            };
+            log.debug("Sent focus_event: {} to pty {}", .{ ev.focused, ev.pty_id });
+        }
+        self.pending_focus_events.clearRetainingCapacity();
     }
 
     fn handleColorQuery(self: *App, query: ServerAction.ColorQueryTarget) !void {
@@ -1811,6 +1872,10 @@ pub const App = struct {
                 log.err("Failed to send resize: {}", .{err});
             };
         }
+
+        // Send queued focus events after resizes so shells receive SIGWINCH
+        // before FocusIn/FocusOut, preventing a blank current-line on split changes.
+        self.flushPendingFocusEvents();
 
         try self.renderWidget(w, win);
 
@@ -2290,24 +2355,14 @@ pub const App = struct {
                                                 .set_focus_fn = struct {
                                                     fn appSendFocus(ctx: *anyopaque, id: u32, focused: bool) anyerror!void {
                                                         const self: *App = @ptrCast(@alignCast(ctx));
-
-                                                        var params = try self.allocator.alloc(msgpack.Value, 2);
-                                                        params[0] = .{ .unsigned = @intCast(id) };
-                                                        params[1] = .{ .boolean = focused };
-
-                                                        var arr = try self.allocator.alloc(msgpack.Value, 3);
-                                                        arr[0] = .{ .unsigned = 2 }; // notification
-                                                        arr[1] = .{ .string = "focus_event" };
-                                                        arr[2] = .{ .array = params };
-
-                                                        const encoded_msg = try msgpack.encodeFromValue(self.allocator, .{ .array = arr });
-                                                        defer self.allocator.free(encoded_msg);
-
-                                                        self.allocator.free(arr);
-                                                        self.allocator.free(params);
-
-                                                        try self.sendDirect(encoded_msg);
-                                                        log.debug("Sent focus_event: {} to pty {}", .{ focused, id });
+                                                        // Queue the focus event to be sent after resize notifications
+                                                        // in the next render frame, so the shell receives SIGWINCH
+                                                        // before FocusIn/FocusOut and avoids a blank prompt line.
+                                                        try self.pending_focus_events.append(self.allocator, .{
+                                                            .pty_id = id,
+                                                            .focused = focused,
+                                                        });
+                                                        log.debug("Queued focus_event: {} for pty {}", .{ focused, id });
                                                     }
                                                 }.appSendFocus,
                                                 .close_fn = struct {
@@ -3308,24 +3363,14 @@ pub const App = struct {
             .set_focus_fn = struct {
                 fn sendFocus(app_ctx: *anyopaque, pty_id: u32, focused: bool) anyerror!void {
                     const app: *App = @ptrCast(@alignCast(app_ctx));
-
-                    var params = try app.allocator.alloc(msgpack.Value, 2);
-                    params[0] = .{ .unsigned = @intCast(pty_id) };
-                    params[1] = .{ .boolean = focused };
-
-                    var arr = try app.allocator.alloc(msgpack.Value, 3);
-                    arr[0] = .{ .unsigned = 2 }; // notification
-                    arr[1] = .{ .string = "focus_event" };
-                    arr[2] = .{ .array = params };
-
-                    const encoded_msg = try msgpack.encodeFromValue(app.allocator, .{ .array = arr });
-                    defer app.allocator.free(encoded_msg);
-
-                    app.allocator.free(arr);
-                    app.allocator.free(params);
-
-                    try app.sendDirect(encoded_msg);
-                    log.debug("Sent focus_event: {} to pty {}", .{ focused, pty_id });
+                    // Queue the focus event to be sent after resize notifications
+                    // in the next render frame, so the shell receives SIGWINCH
+                    // before FocusIn/FocusOut and avoids a blank prompt line.
+                    try app.pending_focus_events.append(app.allocator, .{
+                        .pty_id = pty_id,
+                        .focused = focused,
+                    });
+                    log.debug("Queued focus_event: {} for pty {}", .{ focused, pty_id });
                 }
             }.sendFocus,
             .close_fn = struct {

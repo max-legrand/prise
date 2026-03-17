@@ -14,11 +14,14 @@ pub const KeyStrings = struct {
 pub fn vaxisKeyToStrings(allocator: std.mem.Allocator, key: vaxis.Key) !KeyStrings {
     const code = try codepointToCode(allocator, key.codepoint);
 
-    // "key" is the produced text, or the code name for non-printable keys
-    const key_str = if (key.text) |text|
-        try allocator.dupe(u8, text)
-    else if (isNamedKey(key.codepoint))
+    // "key" is the canonical name for named keys (Enter, Space, Backspace, etc.),
+    // the produced text for printable keys, or the code name as fallback.
+    // Named keys take priority over key.text to ensure consistent matching:
+    // e.g. Ctrl+Space has text=" " but must match as "Space" in keybinds.
+    const key_str = if (isNamedKey(key.codepoint))
         try allocator.dupe(u8, code)
+    else if (key.text) |text|
+        try allocator.dupe(u8, text)
     else blk: {
         // Encode codepoint as UTF-8
         var buf: [4]u8 = undefined;
@@ -33,6 +36,8 @@ pub fn vaxisKeyToStrings(allocator: std.mem.Allocator, key: vaxis.Key) !KeyStrin
 fn isNamedKey(codepoint: u21) bool {
     const Key = vaxis.Key;
     return switch (codepoint) {
+        // Codepoint 0 is how kitty keyboard protocol encodes Ctrl+Space (NUL).
+        0,
         Key.enter,
         Key.tab,
         Key.backspace,
@@ -89,6 +94,9 @@ fn codepointToCode(allocator: std.mem.Allocator, codepoint: u21) ![]const u8 {
 fn specialKeyCode(codepoint: u21) ?[]const u8 {
     const Key = vaxis.Key;
     return switch (codepoint) {
+        // Codepoint 0 is how kitty keyboard protocol encodes Ctrl+Space (NUL).
+        // Map it to "Space" so that <C-Space> keybinds match correctly.
+        0 => "Space",
         Key.enter => "Enter",
         Key.tab => "Tab",
         Key.backspace => "Backspace",
