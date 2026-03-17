@@ -1988,6 +1988,19 @@ const Client = struct {
 
             pty_instance.terminal_mutex.unlock();
 
+            // Send a full redraw so the client sees the current terminal content
+            // immediately (important on attach/session-swap when the PTY is idle).
+            // This is safe because clearPrompt() has been suppressed above.
+            const msg = buildRedrawMessageFromPty(self.server.allocator, pty_instance, .full) catch |err| {
+                log.warn("resize_pty: failed to build redraw message: {}", .{err});
+                return;
+            };
+            defer self.server.allocator.free(msg);
+
+            self.server.sendRedraw(self.server.loop, pty_instance, msg, self) catch |err| {
+                log.warn("resize_pty: failed to send redraw: {}", .{err});
+            };
+
             log.info("resize_pty: completed for pty={}", .{pty_id});
         } else {
             log.warn("resize_pty notification: PTY {} not found", .{pty_id});
@@ -2592,7 +2605,6 @@ const Server = struct {
     }
 
     fn handleResizePty(self: *Server, client: *Client, params: msgpack.Value) !msgpack.Value {
-        _ = client;
         const args = parseResizePtyParams(params) catch {
             return msgpack.Value{ .string = try self.allocator.dupe(u8, "invalid params") };
         };
@@ -2662,6 +2674,18 @@ const Server = struct {
         }
 
         pty_instance.terminal_mutex.unlock();
+
+        // Send a full redraw so the client sees the current terminal content
+        // immediately (important on attach/session-swap when the PTY is idle).
+        const msg = buildRedrawMessageFromPty(self.allocator, pty_instance, .full) catch |err| {
+            log.warn("resize_pty request: failed to build redraw message: {}", .{err});
+            return msgpack.Value.nil;
+        };
+        defer self.allocator.free(msg);
+
+        self.sendRedraw(self.loop, pty_instance, msg, client) catch |err| {
+            log.warn("resize_pty request: failed to send redraw: {}", .{err});
+        };
 
         log.info("Resized PTY {} to {}x{} ({}x{}px)", .{ args.id, args.cols, args.rows, args.x_pixel, args.y_pixel });
         return msgpack.Value.nil;

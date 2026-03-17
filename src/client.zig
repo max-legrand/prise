@@ -18,6 +18,17 @@ const log = std.log.scoped(.client);
 
 const MAX_PASTE_SIZE = 10 * 1024 * 1024; // 10 MiB
 
+// Global fd used by the SIGWINCH signal handler (async-signal-safe write).
+var global_sigwinch_write_fd: posix.fd_t = -1;
+
+fn sigwinchCallback(_: *anyopaque) void {
+    // Write a byte to the signal pipe to wake the event loop.
+    // write() is async-signal-safe.
+    if (global_sigwinch_write_fd >= 0) {
+        _ = posix.write(global_sigwinch_write_fd, "W") catch {};
+    }
+}
+
 pub const MsgId = enum(u16) {
     spawn_pty = 1,
     attach_pty = 2,
@@ -661,6 +672,13 @@ pub const App = struct {
     parser: vaxis.Parser = undefined,
     pipe_buf: std.ArrayList(u8),
     pipe_recv_buffer: [4096]u8 = undefined,
+
+    // SIGWINCH signal pipe — the signal handler writes a byte here to
+    // wake the event loop, which then queries the new terminal size.
+    sigwinch_read_fd: posix.fd_t = undefined,
+    sigwinch_write_fd: posix.fd_t = undefined,
+    sigwinch_recv_buf: [1]u8 = undefined,
+    sigwinch_task: ?io.Task = null,
     colors: Surface.TerminalColors = .{},
 
     pending_attach_ids: ?[]u32 = null,
@@ -755,6 +773,13 @@ pub const App = struct {
         app.pipe_write_fd = fds[1];
         log.info("Pipe created: read_fd={} write_fd={}", .{ app.pipe_read_fd, app.pipe_write_fd });
 
+        // Create SIGWINCH signal pipe
+        const sig_fds = posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true }) catch |err| {
+            return .{ .err = .{ .err = err, .lua_msg = null } };
+        };
+        app.sigwinch_read_fd = sig_fds[0];
+        app.sigwinch_write_fd = sig_fds[1];
+
         return .{ .ok = app };
     }
 
@@ -840,6 +865,9 @@ pub const App = struct {
 
         posix.close(self.pipe_read_fd);
         posix.close(self.pipe_write_fd);
+        global_sigwinch_write_fd = -1;
+        posix.close(self.sigwinch_read_fd);
+        posix.close(self.sigwinch_write_fd);
     }
 
     pub fn setup(self: *App, loop: *io.Loop) !void {
@@ -878,6 +906,10 @@ pub const App = struct {
                     if (app.io_loop) |l| task.cancel(l) catch {};
                     app.send_task = null;
                 }
+                if (app.sigwinch_task) |*task| {
+                    if (app.io_loop) |l| task.cancel(l) catch {};
+                    app.sigwinch_task = null;
+                }
                 // Wake up TTY thread so it can exit
                 app.vx.deviceStatusReport(app.tty.writer()) catch {};
             }
@@ -898,6 +930,21 @@ pub const App = struct {
         log.info("Spawning TTY thread...", .{});
         self.tty_thread = try std.Thread.spawn(.{}, ttyThreadFn, .{self});
         log.info("TTY thread spawned", .{});
+
+        // Register SIGWINCH handler so the event loop is woken on terminal resize
+        global_sigwinch_write_fd = self.sigwinch_write_fd;
+        vaxis.Tty.notifyWinsize(.{
+            .context = undefined,
+            .callback = sigwinchCallback,
+        }) catch |err| {
+            log.err("Failed to register SIGWINCH handler: {}", .{err});
+        };
+
+        // Arm a read on the signal pipe to detect SIGWINCH
+        self.sigwinch_task = try loop.read(self.sigwinch_read_fd, &self.sigwinch_recv_buf, .{
+            .ptr = self,
+            .cb = onSigwinch,
+        });
 
         // Send terminal queries to detect capabilities
         try self.vx.queryTerminalSend(self.tty.writer());
@@ -1044,6 +1091,36 @@ pub const App = struct {
                 return err;
             };
             index += n;
+        }
+    }
+
+    fn onSigwinch(l: *io.Loop, completion: io.Completion) anyerror!void {
+        const app = completion.userdataCast(@This());
+        switch (completion.result) {
+            .read => |bytes_read| {
+                if (bytes_read == 0) return;
+
+                // Drain any extra signal bytes
+                var drain: [16]u8 = undefined;
+                while (true) {
+                    _ = posix.read(app.sigwinch_read_fd, &drain) catch break;
+                }
+
+                // Query current terminal size and forward as a winsize event
+                const ws = try vaxis.Tty.getWinsize(app.tty.fd);
+                log.info("SIGWINCH: new size {}x{}", .{ ws.cols, ws.rows });
+                try app.handleVaxisEvent(.{ .winsize = ws });
+
+                // Re-arm
+                app.sigwinch_task = try l.read(app.sigwinch_read_fd, &app.sigwinch_recv_buf, .{
+                    .ptr = app,
+                    .cb = onSigwinch,
+                });
+            },
+            .err => |err| {
+                log.err("SIGWINCH pipe error: {}", .{err});
+            },
+            else => {},
         }
     }
 
@@ -2582,6 +2659,10 @@ pub const App = struct {
                                 if (app.send_task) |*task| {
                                     task.cancel(l) catch {};
                                     app.send_task = null;
+                                }
+                                if (app.sigwinch_task) |*task| {
+                                    task.cancel(l) catch {};
+                                    app.sigwinch_task = null;
                                 }
 
                                 log.info("Closing connection", .{});
