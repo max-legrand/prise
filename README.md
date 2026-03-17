@@ -285,6 +285,133 @@ return ui
 
 See `prise(5)` for the full key string syntax.
 
+## Layouts
+
+Prise supports **layouts** (similar to tmuxinator/tmux layouts) - pre-defined workspace configurations with tabs, splits, and commands that run automatically when you start a session.
+
+### Layout Files
+
+Layouts are Lua files stored in `~/.config/prise/layouts/`. Each file returns a table describing the workspace structure.
+
+### Example Layout
+
+```lua
+-- ~/.config/prise/layouts/dev.lua
+return {
+    tabs = {
+        {
+            title = "editor",
+            root = {
+                direction = "row",
+                children = {
+                    -- Left pane: editor (60% width)
+                    { command = "nvim .", ratio = 0.6 },
+                    -- Right pane: vertical split
+                    {
+                        direction = "col",
+                        children = {
+                            -- Top: build/test
+                            { command = "cargo watch" },
+                            -- Bottom: shell
+                            {},
+                        },
+                    },
+                },
+            },
+        },
+        {
+            title = "server",
+            root = { command = "cargo run" },
+        },
+        {
+            title = "logs",
+            root = { command = "tail -f /var/log/system.log" },
+        },
+    },
+}
+```
+
+### Shorthand Syntax
+
+For simple single-tab layouts, you can omit the `tabs` wrapper:
+
+```lua
+-- ~/.config/prise/layouts/horizontal-split.lua
+return {
+    direction = "row",
+    children = {
+        { command = "htop", ratio = 0.3 },
+        {},
+    },
+}
+```
+
+### Layout Specification
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tabs` | `table` | Array of tab specifications (see below) |
+| `direction` | `string` | Split direction: `"row"` (horizontal) or `"col"` (vertical) |
+| `children` | `table` | Array of child pane/split specs |
+| `ratio` | `number` | Width/height ratio (0.0-1.0) for this split or pane |
+| `command` | `string\|string[]` | Command to run in the pane |
+| `cwd` | `string` | Working directory for the pane |
+
+**Tab spec:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `title` | `string` | Tab title (optional) |
+| `root` | `table` | Root pane or split for this tab |
+
+**Pane spec:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `command` | `string\|string[]` | Command to run (optional, defaults to shell) |
+| `cwd` | `string` | Working directory (optional, defaults to current dir) |
+| `ratio` | `number` | Split ratio (0.0-1.0) |
+
+### Using Layouts
+
+**From the command line:**
+
+```bash
+# Start with a layout
+prise -l dev
+
+# Named session with layout
+prise -s myproject -l dev
+```
+
+**Interactively:**
+
+- Press `Super+k p` to open the command palette
+- Select "Apply Layout" to choose from available layouts
+
+**Via keybind:**
+
+Add a keybind for quick access:
+
+```lua
+local ui = require("prise").tiling()
+
+ui.setup({
+    keybinds = {
+        ["<leader>L"] = "layout_picker",  -- Opens layout picker
+    },
+})
+
+return ui
+```
+
+### Fallback Working Directory
+
+When using `-l <layout>`, panes that don't specify an explicit `cwd` will use the directory where you invoked `prise`. For example:
+
+```bash
+cd /path/to/project
+prise -l dev   # All panes without explicit cwd will start in /path/to/project
+```
+
 ## Lua LSP Setup
 
 Prise installs type definitions to `<prefix>/share/prise/lua/`. To get autocomplete and type checking in your editor, add this path to your Lua language server configuration.

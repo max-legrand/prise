@@ -71,6 +71,9 @@ pub const Action = union(enum) {
     // Copy mode (vim-style scrolling and selection)
     enter_copy_mode,
 
+    // Layouts (tmuxinator-style workspace presets)
+    layout_picker,
+
     // Lua function reference (registry ref)
     lua_function: i32,
 
@@ -146,6 +149,7 @@ pub const Action = union(enum) {
             .floating_increase_size => "Floating Pane: Increase Size",
             .floating_decrease_size => "Floating Pane: Decrease Size",
             .enter_copy_mode => "Enter Copy Mode",
+            .layout_picker => "Layout Picker",
             .lua_function => null,
         };
     }

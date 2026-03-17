@@ -636,6 +636,8 @@ pub const App = struct {
     /// User-specified session name for new session (passed via `prise -s <name>`)
     new_session_name: ?[]const u8 = null,
     initial_cwd: ?[]const u8 = null,
+    /// Layout name to apply after first PTY is spawned (from --layout flag)
+    layout_name: ?[]const u8 = null,
     last_render_time: i64 = 0,
     render_timer: ?io.Task = null,
 
@@ -1883,12 +1885,28 @@ pub const App = struct {
             // User specified a name for new session
             self.current_session_name = try self.allocator.dupe(u8, name);
             log.info("Starting new session with user-specified name: {s}", .{name});
-            try self.spawnInitialPty();
+            if (self.layout_name) |layout| {
+                log.info("Applying layout: {s}", .{layout});
+                if (!self.ui.applyLayout(layout, self.initial_cwd)) {
+                    log.warn("Layout failed, falling back to default spawn", .{});
+                    try self.spawnInitialPty();
+                }
+            } else {
+                try self.spawnInitialPty();
+            }
         } else {
             // Generate a new session name for fresh launch
             self.current_session_name = try self.ui.getNextSessionName();
             log.info("Starting new session: {s}", .{self.current_session_name.?});
-            try self.spawnInitialPty();
+            if (self.layout_name) |layout| {
+                log.info("Applying layout: {s}", .{layout});
+                if (!self.ui.applyLayout(layout, self.initial_cwd)) {
+                    log.warn("Layout failed, falling back to default spawn", .{});
+                    try self.spawnInitialPty();
+                }
+            } else {
+                try self.spawnInitialPty();
+            }
         }
     }
 

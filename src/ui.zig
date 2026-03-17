@@ -1164,6 +1164,44 @@ pub const UI = struct {
         return .{ r, g, b };
     }
 
+    /// Apply a named layout by calling the Lua UI's apply_layout function.
+    /// The cwd parameter provides the fallback working directory for panes
+    /// that don't specify one explicitly in the layout file.
+    /// Returns true if the layout was applied successfully.
+    pub fn applyLayout(self: *UI, name: []const u8, cwd: ?[]const u8) bool {
+        _ = self.lua.getField(ziglua.registry_index, "prise_ui");
+        defer self.lua.pop(1);
+
+        _ = self.lua.getField(-1, "apply_layout");
+        if (self.lua.typeOf(-1) != .function) {
+            self.lua.pop(1);
+            log.err("UI module does not have apply_layout function", .{});
+            return false;
+        }
+
+        _ = self.lua.pushString(name);
+        if (cwd) |c| {
+            _ = self.lua.pushString(c);
+        } else {
+            self.lua.pushNil();
+        }
+        self.lua.protectedCall(.{ .args = 2, .results = 2, .msg_handler = 0 }) catch {
+            const err_msg = self.lua.toString(-1) catch "unknown error";
+            log.err("apply_layout error: {s}", .{err_msg});
+            self.lua.pop(1);
+            return false;
+        };
+
+        // Results: [success: bool, error_msg?: string]
+        const success = self.lua.toBoolean(-2);
+        if (!success) {
+            const err_msg = self.lua.toString(-1) catch "unknown error";
+            log.err("Failed to apply layout '{s}': {s}", .{ name, err_msg });
+        }
+        self.lua.pop(2);
+        return success;
+    }
+
     pub fn update(self: *UI, event: lua_event.Event) !void {
         _ = self.lua.getField(ziglua.registry_index, "prise_ui");
         defer self.lua.pop(1);
